@@ -31,7 +31,7 @@ To be explicit: this is deliberate, not a shortcut. The site ships as one asset 
 ## Running it
 
 ```
-git clone <this-repo>
+git clone https://github.com/thisisfed/random-diptychs
 open index.html
 ```
 
