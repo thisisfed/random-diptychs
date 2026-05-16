@@ -1,0 +1,2475 @@
+<!DOCTYPE html>
+<html lang="en" class="gated">
+<head>
+  <meta charset="UTF-8">
+  <link rel="icon" type="image/x-icon" href="/favicon.ico">
+  <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+  <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+  <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+  <meta name="theme-color" content="#ffffff">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+
+  <!-- ═══════════════════════════════════════════════
+       THEME — SUNRISE / SUNSET
+
+       Sets `html.night` BEFORE first paint so the splash
+       doesn't flash white when the user is on a black
+       site (or vice versa). Sunrise/sunset are computed
+       from a longitude derived from the timezone offset
+       and a latitude estimated from the IANA zone region
+       — no geolocation prompt, no third-party calls. The
+       same logic re-runs every minute to flip the theme
+       live as the threshold is crossed.
+  ═══════════════════════════════════════════════ -->
+  <script>
+    (function () {
+      function standardOffsetMin() {
+        /* getTimezoneOffset on a current date reflects whatever DST is in
+           effect right now, which is wrong for estimating geographic
+           longitude — BST visitors would be placed at 15°E instead of 0°,
+           shifting sunset an hour earlier. The STANDARD (non-DST) offset
+           for any zone is reliably the larger of January's and July's
+           offsets, since DST always advances the clock (= more negative
+           offset). This holds in both hemispheres. */
+        var y   = new Date().getFullYear();
+        var jan = new Date(y, 0, 1).getTimezoneOffset();
+        var jul = new Date(y, 6, 1).getTimezoneOffset();
+        return Math.max(jan, jul);
+      }
+
+      function estimateLatLng() {
+        /* Longitude from the STANDARD timezone offset: each hour west of
+           UTC ≈ 15° west. Using getTimezoneOffset() on a current Date
+           would fold DST into the result and place BST visitors at the
+           wrong longitude — see standardOffsetMin above. */
+        var lng = -standardOffsetMin() / 4;
+        var lat = 40;
+        try {
+          var tz = Intl.DateTimeFormat().resolvedOptions().timeZone || '';
+          if      (/^Europe\//.test(tz))    lat = 50;
+          else if (/^Asia\//.test(tz))      lat = 30;
+          else if (/^Africa\//.test(tz))    lat = 5;
+          else if (/^Australia\//.test(tz)) lat = -30;
+          else if (/^Pacific\//.test(tz))   lat = -15;
+          else if (/^Antarctica\//.test(tz)) lat = -75;
+          /* Southern-hemisphere Americas — without this they'd inherit the
+             40°N default and have sunrise/sunset offset by a season. */
+          else if (/^America\/(Argent|Sao_Paulo|Santiago|Buenos|Asunc|Caracas|La_Paz|Lima|Bogota|Guayaquil|Quito|Cayenne|Paramaribo|Montevideo|Punta_Arenas|Fortaleza|Recife|Manaus|Rio_Branco|Belem|Bahia)/.test(tz)) lat = -20;
+        } catch (e) {}
+        return { lat: lat, lng: lng };
+      }
+
+      function computeSun(date, lat, lng) {
+        /* Standard solar-calculator formulas. -0.83° altitude is the civil
+           sunrise/sunset definition (atmospheric refraction + sun's disc).
+           Returns sunrise/sunset as Unix-ms numbers; polar regions return
+           a flag instead of times. */
+        var rad = Math.PI / 180;
+        var jd  = date.getTime() / 86400000 + 2440587.5;
+        /* Math.round, not floor: Julian Dates roll over at noon UTC, so
+           before noon UTC `jd - 2451545.0` has a fractional part that
+           floor discards — picking yesterday's n. That gave London at
+           09:00 BST (08:00 UTC) the previous day's sunset and stuck the
+           theme in night through the entire morning. Rounding to the
+           nearest integer gives the correct day-number for whichever
+           UTC day contains the current moment. */
+        var n   = Math.round(jd - 2451545.0 + 0.0008);
+        var J   = n - lng / 360;
+        var M   = (357.5291 + 0.98560028 * J) % 360;
+        var C   = 1.9148 * Math.sin(M * rad)
+                + 0.0200 * Math.sin(2 * M * rad)
+                + 0.0003 * Math.sin(3 * M * rad);
+        var lam = (M + C + 180 + 102.9372) % 360;
+        var Jt  = 2451545.0 + J
+                + 0.0053 * Math.sin(M * rad)
+                - 0.0069 * Math.sin(2 * lam * rad);
+        var del = Math.asin(Math.sin(lam * rad) * Math.sin(23.44 * rad));
+        /* -6° = civil twilight. The traditional sunrise/sunset altitude
+           of -0.83° (sun's disc tangent to horizon, accounting for
+           atmospheric refraction) is technically correct but visually
+           wrong for this site: at -0.83° the algorithm flips to night
+           the moment the sun's disc disappears, but there's still
+           plenty of natural light — sky is bright, "the sun is out"
+           from a user's perspective. -6° is the civil-twilight threshold,
+           the point at which the sky is dim enough that artificial
+           light becomes necessary. Extends the "day" window by roughly
+           30 minutes on each side of geometric sunrise/sunset, which
+           matches the visual feel of the daylight period. */
+        var co  = (Math.sin(-6 * rad) - Math.sin(lat * rad) * Math.sin(del))
+                / (Math.cos(lat * rad) * Math.cos(del));
+        if (co < -1) return { polar: 'day' };
+        if (co >  1) return { polar: 'night' };
+        var w = Math.acos(co) / rad;
+        return {
+          sunrise: (Jt - w / 360 - 2440587.5) * 86400000,
+          sunset:  (Jt + w / 360 - 2440587.5) * 86400000
+        };
+      }
+
+      function isNight(sun) {
+        if (sun.polar === 'day')   return false;
+        if (sun.polar === 'night') return true;
+        var now = Date.now();
+        return now < sun.sunrise || now >= sun.sunset;
+      }
+
+      var coords = estimateLatLng();
+      var meta   = null;
+
+      function apply() {
+        var sun   = computeSun(new Date(), coords.lat, coords.lng);
+        var night = isNight(sun);
+        document.documentElement.classList.toggle('night', night);
+        /* Update theme-color so iOS/Android status-bar matches the page.
+           Meta lookup is deferred until the tag has been parsed. */
+        if (!meta) meta = document.querySelector('meta[name="theme-color"]');
+        if (meta) meta.setAttribute('content', night ? '#000000' : '#ffffff');
+      }
+
+      apply();
+
+      /* Enable CSS transitions only after first paint so the initial
+         render lands in the correct palette without a fade-from-wrong. */
+      if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', function () {
+          document.documentElement.classList.add('theme-ready');
+        }, { once: true });
+      } else {
+        document.documentElement.classList.add('theme-ready');
+      }
+
+      /* Re-evaluate every minute so the transition fires live when the
+         user is on the page at sunset/sunrise. Recomputing each tick also
+         handles midnight rollover for long sessions without extra logic. */
+      setInterval(apply, 60000);
+    })();
+  </script>
+
+  <!-- ═══════════════════════════════════════════════
+       SEO — scoped to this subdomain only.
+  ═══════════════════════════════════════════════ -->
+  <title>Federico Ferrari – Random Diptychs</title>
+  <meta name="description" content="Random Diptychs — an interactive pairing project by London-based fashion and editorial photographer Federico Ferrari. A fresh diptych on every click, drawn from work for Prada, AnOther Magazine, Grazia, Il Sole 24 Ore and Max Mara.">
+  <meta name="keywords" content="Random Diptychs, Federico Ferrari, photography pairings, fashion photography, editorial photography, interactive portfolio, diptych, photographer London">
+  <meta name="author" content="Federico Ferrari">
+  <meta name="robots" content="index, follow">
+  <link rel="canonical" href="https://random.thisisfed.xyz/">
+
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://random.thisisfed.xyz/">
+  <meta property="og:title" content="Federico Ferrari – Random Diptychs">
+  <meta property="og:description" content="An interactive pairing project from fashion and editorial photographer Federico Ferrari. A fresh diptych on every click.">
+  <meta property="og:image" content="images/jpg/ff23.jpg">
+  <meta property="og:image:alt" content="A diptych by Federico Ferrari">
+  <meta property="og:locale" content="en_GB">
+  <meta property="og:site_name" content="Federico Ferrari — Random Diptychs">
+
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="Federico Ferrari – Random Diptychs">
+  <meta name="twitter:description" content="An interactive pairing project from fashion and editorial photographer Federico Ferrari. A fresh diptych on every click.">
+  <meta name="twitter:image" content="images/jpg/ff23.jpg">
+
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "WebSite",
+    "name": "Federico Ferrari — Random Diptychs",
+    "url": "https://random.thisisfed.xyz/",
+    "description": "An interactive pairing project from fashion and editorial photographer Federico Ferrari. A fresh diptych on every click.",
+    "inLanguage": "en-GB",
+    "author": {
+      "@type": "Person",
+      "name": "Federico Ferrari",
+      "jobTitle": "Photographer",
+      "email": "ciao@thisisfed.xyz",
+      "telephone": "+44 (0) 7547 02 63 00",
+      "image": "images/jpg/ff23.jpg"
+    }
+  }
+  </script>
+
+  <style>
+    /* Theme tokens. Day = white/black; night = black/white; lime stays
+       lime in both because it reads cleanly on either background and is
+       the site's signature accent. The `night` class flips them; the
+       `theme-ready` class enables transitions only AFTER the first paint
+       so the initial render lands in the correct palette without a fade. */
+    :root {
+      --bg: #fff;
+      --fg: #000;
+      --accent: lime;
+
+      /* Shared timing for the two main visual transitions — the image
+         swap on the panels and the interlude show/hide. Same duration,
+         same curve, same single property (opacity) so the experience
+         feels like one consistent gesture whether moving image-to-image,
+         image-to-text-page, or text-page-to-image.
+
+         Curve is cubic-bezier(0.25, 1, 0.5, 1) — easeOutQuart. Fast
+         initial commitment that decelerates into a soft landing: the
+         change happens decisively at the start, then settles. Reads as
+         confident-but-not-snappy, which suits photography pacing. */
+      --fade-duration: 0.85s;
+      --fade-curve: cubic-bezier(0.25, 1, 0.5, 1);
+    }
+    html.night {
+      --bg: #000;
+      --fg: #fff;
+    }
+    /* Theme transitions — fade colors when sunrise/sunset flips the
+       palette, applied AFTER first paint so the initial render doesn't
+       animate from the wrong colors.
+
+       Each element that already has its own opacity transition must
+       restate it here, because the `transition` shorthand replaces the
+       full transition list (not just the color parts) and `html.theme-ready X`
+       has higher specificity than `X` alone. Without this, the splash,
+       interludes, and privacy slide would snap in/out instead of fading. */
+    html.theme-ready body,
+    html.theme-ready .panel {
+      transition: background-color 1.2s ease, color 1.2s ease;
+    }
+    html.theme-ready #splash {
+      transition: opacity var(--fade-duration) var(--fade-curve),
+                  background-color 1.2s ease, color 1.2s ease;
+    }
+    html.theme-ready .interlude {
+      transition: opacity var(--fade-duration) var(--fade-curve),
+                  background-color 1.2s ease, color 1.2s ease;
+    }
+    html.theme-ready #privacy {
+      transition: opacity 0.4s ease,
+                  background-color 1.2s ease, color 1.2s ease;
+    }
+
+    html, body {
+      margin: 0;
+      padding: 0;
+      height: 100%;
+      overflow: hidden;
+    }
+    body {
+      font-family: system-ui, sans-serif;
+      font-size: 1.8vw;
+      line-height: 1em;
+      background: var(--bg);
+      color: var(--fg);
+    }
+    h1 { font-size: inherit; font-weight: inherit; margin: 0; color: var(--fg); }
+
+    /* Default link scheme: lime accent, fg on hover.
+       Contact-slide links override this (see #contact a below). */
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { color: var(--fg) !important; }
+
+    #diptych, .interlude, #privacy { cursor: pointer; }
+
+    /* Initial gate. Hides the diptych from first paint until the last
+       gate card (welcome, or analytics on first-time visits) starts
+       fading out. Without this, during the cross-fade between gate
+       cards — splash → welcome, welcome → analytics — both cards sit
+       at partial opacity simultaneously; each has its own opaque
+       background but two stacked 50%-opaque layers only block 75% of
+       what's behind, leaving the first diptych pair faintly visible
+       through the transition. The class is added in HTML so it's
+       effective from the very first paint, and removed once by
+       liftGate() at the moment the final dismiss begins, so the
+       diptych is smoothly revealed underneath as the last card fades.
+       visibility:hidden, not display:none — keeps the layer fade-in
+       transitions running in the background so the layers are at
+       opacity 1 when the gate lifts, no popping. */
+    html.gated #diptych { visibility: hidden; }
+
+    /* Vertical alignment of the welcome → consent transition. Welcome's
+       content is 4 lines (concept + copyright + spacer + CTA) = 4em
+       tall; consent is naturally 2 lines (Analytics + button row) =
+       2em tall. Both cards are flex-centered, so without this rule the
+       first line of consent ends up ~1em LOWER on screen than the
+       first line of welcome was — during the 0.85s cross-fade the eye
+       perceives the text dropping. min-height: 4em pads the consent
+       inner to match welcome's content height; consent's content stays
+       block-stacked at the top of the (now 4em) inner, so the first
+       line "Analytics" lands at the exact same Y position welcome's
+       first line was at. Visually, the text swaps in place — no
+       vertical motion during the fade. */
+    #consent .inner { min-height: 4em; }
+
+    /* Splash: full-screen white card with the title and the gallery
+       count on top, and a smooth "Loading… X%" counter that fills
+       0→100 over the duration of image preloading. There's no click
+       or keyboard skip — the splash dismisses on its own when loading
+       completes, or when the SPLASH_MAX_WAIT_MS safety cap fires. */
+    #splash {
+      position: fixed;
+      inset: 0;
+      z-index: 300;
+      /* Same iPhone centering treatment as .interlude — see the
+         comment block on .interlude for why. Without this, the splash
+         text and the welcome card text don't sit at the same vertical
+         position on iPhone, creating a visible jump on the splash →
+         welcome transition. */
+      height: 100dvh;
+      box-sizing: border-box;
+      padding-top: env(safe-area-inset-top);
+      padding-bottom: env(safe-area-inset-bottom);
+      background: var(--bg);
+      color: var(--fg);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      text-align: center;
+      /* Same curve as the image/interlude transitions so the whole
+         site shares one easing language. Duration tracks SPLASH_FADE_MS
+         in the script — change in both places if retiming. The longer
+         fade (vs the 0.85s used elsewhere) reads as "the gallery is
+         ready" rather than "the intro is over". */
+      transition: opacity 1.8s var(--fade-curve);
+    }
+    #splash.hidden {
+      opacity: 0;
+      pointer-events: none;
+    }
+    #splash .line  { display: block; }
+    /* Visual gap between the gallery count and the loading line, so
+       "Loading… X%" reads as a separate piece of information rather
+       than another title sub-line. 1em ≈ one full line of breathing
+       room at the splash's font-size. */
+    #splash .line.loading { margin-top: 1em; }
+
+    /* Diptych: two panels side by side, images pinned to the centerline.
+       Image height = 75vh leaves a 12.5vh margin top and bottom. Panels
+       touch directly down the middle — no centre gutter. */
+    #diptych {
+      display: flex;
+      width: 100vw;
+      height: 100vh;
+    }
+    .panel {
+      flex: 1 1 50%;
+      width: 50vw;
+      height: 100vh;
+      position: relative;
+      overflow: hidden;
+      background: var(--bg);
+    }
+    .panel .layer {
+      position: absolute;
+      inset: 0;
+      display: block;
+      opacity: 0;
+      /* Pure opacity, same as the interlude — keeping the two
+         transitions identical in property, duration, and curve is
+         what makes moving between images and text pages feel like
+         one coherent gesture rather than two different mechanisms. */
+      transition: opacity var(--fade-duration) var(--fade-curve);
+      pointer-events: none;
+    }
+    .panel .layer.loaded { opacity: 1; }
+    .panel .layer img,
+    .panel .layer video {
+      position: absolute;
+      top: 50%;
+      left: 0;
+      transform: translateY(-50%);
+      width: 50vw;
+      height: 50vh;
+      object-fit: contain;
+      display: block;
+    }
+    .panel.left  .layer img,
+    .panel.left  .layer video { object-position: 100% 50%; }
+    .panel.right .layer img,
+    .panel.right .layer video { object-position: 0%   50%; }
+
+    @media (orientation: landscape) and (max-height: 600px) {
+      .panel .layer img,
+      .panel .layer video { height: 100vh; }
+    }
+
+    /* Interlude slides: full-screen white cards shown every CONTACT_EVERY
+       clicks. Three variants — contact, share, and a list of related
+       sites — rotate in random order, never repeating back-to-back.
+       The #welcome card reuses the same .interlude styling and dismiss
+       machinery but sits outside the rotation: shown once between the
+       splash and the first diptych, then never again. */
+    .interlude {
+      position: fixed;
+      inset: 0;
+      /* iPhone vertical centering fix. Two things go wrong on iOS
+         without these:
+
+         1. `inset: 0` should track the visual viewport on modern iOS,
+            but on older iOS and inside in-app browsers (Instagram,
+            Twitter, etc.) the fixed box can drift behind the address
+            bar. 100dvh explicitly tracks the dynamic visual viewport
+            so the element resizes as Safari's chrome shows/hides.
+
+         2. iPhones with notch + home indicator have asymmetric safe
+            areas (top inset > bottom inset). Centering in the full
+            viewport places content closer to the top safe edge than
+            the bottom, reading as visually off-centre. Padding the
+            safe-area insets shifts the flex centre into the visually
+            balanced safe zone. box-sizing: border-box keeps the
+            element's overall size at 100dvh including the padding,
+            so the background still fills edge-to-edge — only the
+            centered content is inset. */
+      height: 100dvh;
+      box-sizing: border-box;
+      padding-top: env(safe-area-inset-top);
+      padding-bottom: env(safe-area-inset-bottom);
+      background: var(--bg);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      text-align: center;
+      z-index: 50;
+      opacity: 0;
+      pointer-events: none;
+      /* Same timing as the image swap (see :root --fade-* tokens) so
+         entering and leaving a text page reads as part of the same
+         visual rhythm rather than a separate UI overlay. */
+      transition: opacity var(--fade-duration) var(--fade-curve);
+    }
+    .interlude.visible {
+      opacity: 1;
+      pointer-events: auto;
+    }
+    .interlude .line  { display: block; }
+    .interlude a       { color: var(--fg); }
+    .interlude a:hover { color: var(--accent) !important; }
+    /* Keyboard focus — the default browser ring is hard to see in
+       night mode against black, and unreliable across browsers in
+       day mode too. Use :focus-visible so mouse clicks don't trigger
+       it, and reuse the hover color so the visual vocabulary stays
+       consistent with what hover already teaches. */
+    .interlude a:focus-visible {
+      color: var(--accent) !important;
+      outline: 2px solid var(--accent);
+      outline-offset: 4px;
+    }
+
+    /* Privacy slide: appears when the user clicks "Why?" on the consent
+       card. Same visual treatment as the contact slide — full white,
+       click outside the buttons to dismiss back to the consent card.
+       Buttons inside complete the consent flow (Accept / Decline)
+       without re-showing the consent card.
+       Font-size and line-height inherit from body for uniformity. */
+    #privacy {
+      position: fixed;
+      inset: 0;
+      /* Same iPhone centering treatment as .interlude / #splash — see
+         the comment block on .interlude for why. Without these,
+         #privacy centers in the full layout viewport and drifts off
+         the visual centre on iPhones with notch + home indicator,
+         making it the only card that doesn't sit where every other
+         card does. */
+      height: 100dvh;
+      box-sizing: border-box;
+      padding-top: env(safe-area-inset-top);
+      padding-bottom: env(safe-area-inset-bottom);
+      background: var(--bg);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      text-align: center;
+      z-index: 250;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.4s ease;
+    }
+    #privacy.visible {
+      opacity: 1;
+      pointer-events: auto;
+    }
+    #privacy .inner {
+      max-width: 600px;
+      padding: 0 30px;
+    }
+    #privacy .privacy-text {
+      margin: 0 0 1em 0;
+      color: var(--fg);
+    }
+    #privacy .privacy-actions {
+      margin: 0;
+    }
+    #privacy button {
+      background: none;
+      border: 0;
+      padding: 0 4px;
+      cursor: pointer;
+      color: var(--fg);
+      font: inherit;
+    }
+    @media (hover: hover) {
+      #privacy button:hover { color: var(--accent); }
+    }
+
+    /* Bottom banner styling used to live here for the consent prompt;
+       removed when consent was converted to an interlude-style card so
+       it sits in the centre of the screen like every other text page. */
+
+    @media (max-width: 1000px) {
+      body { font-size: 18px; }
+    }
+  </style>
+</head>
+<body>
+
+<div id="splash">
+  <div class="inner">
+    <h1>
+      <span class="line">Federico Ferrari</span>
+      <!-- Subtitle is static — JS updates it to the real pair total
+           after discovery (TARGET = min(TOP_PAIRS_POOL, n×(n-1)/2) × 2)
+           but if discovery turns out to match the placeholder, no
+           update is needed. Change the "200" here if you change
+           TOP_PAIRS_POOL so the first paint isn't visibly wrong. -->
+      <span class="line subtitle">200 Random Diptychs</span>
+      <!-- Loading progress. Starts as plain "Loading…" with no
+           percentage — the rAF loop in start() appends "X%" only once
+           displayPct has climbed above 0, so a warm-cache visit never
+           shows the counter frozen at 0% during discovery. -->
+      <span class="line loading">Loading…</span>
+    </h1>
+  </div>
+</div>
+
+<div id="diptych">
+  <div class="panel left">
+    <div class="layer">
+      <picture>
+        <source type="image/avif" srcset="" sizes="50vw">
+        <source type="image/webp" srcset="" sizes="50vw">
+        <img alt="" sizes="50vw">
+      </picture>
+    </div>
+    <div class="layer">
+      <picture>
+        <source type="image/avif" srcset="" sizes="50vw">
+        <source type="image/webp" srcset="" sizes="50vw">
+        <img alt="" sizes="50vw">
+      </picture>
+    </div>
+  </div>
+  <div class="panel right">
+    <div class="layer">
+      <picture>
+        <source type="image/avif" srcset="" sizes="50vw">
+        <source type="image/webp" srcset="" sizes="50vw">
+        <img alt="" sizes="50vw">
+      </picture>
+    </div>
+    <div class="layer">
+      <picture>
+        <source type="image/avif" srcset="" sizes="50vw">
+        <source type="image/webp" srcset="" sizes="50vw">
+        <img alt="" sizes="50vw">
+      </picture>
+    </div>
+  </div>
+</div>
+
+<div id="contact" class="interlude" aria-hidden="true">
+  <div class="inner">
+    <a class="line" id="contact-email" rel="nofollow"></a>
+    <a class="line" id="contact-phone" rel="nofollow"></a>
+  </div>
+</div>
+
+<div id="share" class="interlude" aria-hidden="true">
+  <div class="inner">
+    <span class="line">Like this pairing?</span>
+    <span class="line"><a id="share-trigger" role="button">Share it</a> / <a id="share-email">Email it</a></span>
+  </div>
+</div>
+
+<div id="site" class="interlude" aria-hidden="true">
+  <div class="inner">
+    <a class="line" href="https://thisisfed.xyz" target="_blank" rel="noopener">thisisfed.xyz</a>
+    <a class="line" href="https://ladivinacommedia.thisisfed.xyz" target="_blank" rel="noopener">ladivinacommedia.thisisfed.xyz</a>
+    <a class="line" href="https://boredom.thisisfed.xyz" target="_blank" rel="noopener">boredom.thisisfed.xyz</a>
+  </div>
+</div>
+
+<div id="welcome" class="interlude" aria-hidden="true">
+  <div class="inner">
+    <span class="line">A concept entirely shot on iPhone</span>
+    <span class="line">© 2026 — All rights reserved</span>
+    <span class="line">&nbsp;</span>
+    <span class="line welcome-cta">Click anywhere to begin</span>
+  </div>
+</div>
+
+<div id="privacy" aria-hidden="true">
+  <div class="inner">
+    <p class="privacy-text">This site uses Google Analytics with anonymised IP addresses to understand how the diptychs are explored. No personal data, no cross-site tracking, no advertising profiles. Your choice is remembered locally on your device.</p>
+    <p class="privacy-actions">
+      <button id="privacy-accept">Accept</button>
+      /
+      <button id="privacy-decline">Decline</button>
+    </p>
+  </div>
+</div>
+
+<div id="consent" class="interlude" aria-hidden="true">
+  <div class="inner">
+    <span class="line">Analytics</span>
+    <span class="line"><a id="consent-accept" role="button">Accept</a>&nbsp;&nbsp;<a id="consent-decline" role="button">Decline</a>&nbsp;&nbsp;<a id="consent-why" role="button">Why</a></span>
+  </div>
+</div>
+
+<script>
+  /* ─────────────────────────────────────────────────────────────────────────
+     CONFIG
+     ───────────────────────────────────────────────────────────────────────── */
+
+  /* Root path for all image files. Both `jpg` and `avif` subfolders are
+     expected to live inside this directory, each containing the
+     ff{number}.{ext} files. Change in one place if the layout moves. */
+  const IMAGES_BASE = 'images';
+
+  /* Root path for video files. Looks for `${VIDEO_BASE}/ff{n}.mp4`
+     starting from 1, same batched discovery as images. Videos coexist
+     with images in the rotation — pairs can be photo+photo, photo+video,
+     or video+video, scored by the same colour-analysis on a single
+     representative frame extracted from each clip. */
+  const VIDEO_BASE = 'videos';
+
+  /* Image formats in preference order. The <picture> element auto-picks
+     the first format the browser supports; if no AVIF support, the JPG
+     fallback in <img> is used. loadOne tries the same order during
+     analysis so the cache is shared between analysis and display. */
+  const FORMATS       = ['avif', 'jpg'];
+  /* Responsive widths. The browser uses these together with `sizes="50vw"`
+     on each <picture> source/img to pick the smallest variant that still
+     covers `50vw × devicePixelRatio` device pixels. A 3× DPR phone at
+     430 CSS px wide needs ~645 device px for 50vw → grabs the 600w (and
+     looks fine, since AVIF compresses gracefully when slightly under
+     target). A retina laptop or large monitor reaches for 1000 or 1500.
+     Without this array `srcset` collapses to a single URL and every
+     visitor downloads the largest file regardless of screen size.
+     Must be sorted ascending — loadOne uses SIZES[0] as the analysis
+     variant assuming it's the smallest. Variants must exist on disk
+     at `images/{format}/ff{n}-{width}.{ext}` — see build-variants.mjs. */
+  const SIZES         = [600, 1000, 1500];
+  const CONTACT_EVERY = 10;
+
+  /* After an image appears in a diptych, block it from re-appearing for
+     this many clicks. Each click shows two images, so internally we keep
+     a buffer of the last 2 × RECENT_CLICKS_BLOCK image references. At
+     15, ~30 images stay off-limits at any time. Higher values stretch
+     out how often the same pair (or its swapped-orientation twin) can
+     re-appear, which matters when the pool is small and the quality-
+     bias concentrates picks at the top — without this, the top ~10
+     pairs cycle through fast and feel repetitive within a session. */
+  const RECENT_CLICKS_BLOCK = 20;
+
+  /* Sibling groups — declare images that should be treated as the
+     same image for recent-block purposes. When any image in a group
+     appears, all its siblings get marked recently-shown too, so they
+     can't appear together or in close succession. Use this for
+     near-duplicates from the same shoot, sequence shots, or any
+     pairing that's visually too similar for the colour algorithm
+     to catch. Format: each inner array is a group; entries are bare
+     numbers for images, 'v'-prefixed for videos (e.g. ['97','98']
+     or ['12','v3']). Group size is unlimited — you can chain three
+     or more siblings together. */
+  const SIBLING_GROUPS = [
+    ['97', '98'],
+  ];
+
+  /* Splash timing.
+
+     PROGRESS_RATE_PER_SEC caps how fast the "Loading… X%" counter can
+     climb. Whole numbers tick up at this rate when actual loading is
+     instantaneous (warm cache), and rise in real time when actual
+     loading is slower than the cap. 60%/s gives a minimum splash
+     duration of ~1.7s — enough to register the title and the count.
+
+     SPLASH_FADE_MS is the opacity transition. The CSS `#splash` rule
+     must match this value; change in both places if retiming.
+
+     SPLASH_MAX_WAIT_MS is a safety cap. On a stuck or extremely slow
+     connection the splash would otherwise wait forever for image
+     loads to complete. After this many ms the splash fades anyway and
+     the gallery starts with whatever has loaded so far — pair scoring
+     gracefully degrades when fewer images have signatures. */
+  const PROGRESS_RATE_PER_SEC = 60;
+  const SPLASH_FADE_MS        = 1800;
+  const SPLASH_MAX_WAIT_MS    = 30000;
+
+  /* Welcome auto-dismiss. If the user doesn't click within this many
+     ms after the welcome card appears, dismiss it automatically — the
+     copyright/concept lines are short enough to read in a few seconds,
+     and a patient reader shouldn't be stuck on the card. 7000ms covers
+     the 0.85s fade-in plus comfortable reading time. The auto-dismiss
+     simulates a click on the welcome element, so it follows the exact
+     same path a manual click would (welcome → consent on first visit,
+     or welcome → diptych on return visits). Doesn't apply to the
+     analytics consent card — that one requires a deliberate choice. */
+  const WELCOME_AUTO_DISMISS_MS = 7000;
+
+  /* Video load timeouts. Both paths (analysis and display) await media
+     events that can simply never fire — corrupt MP4, misconfigured
+     server, connection dropping between TCP handshake and data, etc.
+     Without these, the UI would silently hang forever. On timeout, we
+     resolve gracefully: the video is skipped for analysis (signature
+     never registered), or the display panel resolves with whatever
+     frame state the element has reached. */
+  const VIDEO_DISPLAY_TIMEOUT_MS  = 8000;
+  const VIDEO_ANALYSIS_TIMEOUT_MS = 10000;
+
+  /* Image decode timeout. img.decode() can stop progressing indefinitely
+     when the page is suspended mid-load — phone screen locking, OS
+     suspending an idle tab, iOS Safari freezing a backgrounded page —
+     and may fail to resume cleanly when the page wakes up. Without a
+     timeout the entire load promise hangs, leaving loadingDiptych true
+     forever and silently disabling every subsequent click. The setTimeout
+     fires when the page is foregrounded again (browsers run overdue
+     timers shortly after restoring visibility), so recovery is automatic
+     from the user's perspective — the diptych just becomes responsive
+     again on the next click rather than appearing to be broken. */
+  const IMAGE_DECODE_TIMEOUT_MS   = 5000;
+
+  /* Image discovery: probe in parallel batches of this size; stop after a
+     batch returns nothing. Tolerates gaps in numbering up to this size.
+     Always probes the JPG path since that's the universal fallback —
+     every image is expected to have a JPG copy even if it also has AVIF. */
+  const DISCOVER_BATCH = 20;
+
+  /* Pair ranking. Of all the possible pairs (sorted by quality), the
+     picker chooses from the top N unordered pairs using a quality-biased
+     random (see pickPair). Each can appear in either left/right
+     orientation, so the visible catalogue ends up at TOP_PAIRS_POOL × 2
+     distinct diptychs. A hard floor: pairs ranked worse than N can
+     never surface, no matter what the random roll does — so use this
+     to set the worst-case quality you're willing to accept. */
+  const TOP_PAIRS_POOL   = 100;
+
+  /* ─── RANKING WEIGHTS ───
+     The ranker rewards two kinds of contrast that must BOTH be
+     present: palette contrast (different dominant colours) and
+     compositional density contrast (busy + uniform). Crucially,
+     density contrast is multiplied by palette contrast in pairScore
+     — a pair with strong density difference but a shared palette
+     gets little reward, because that's where "fake contrast"
+     pairings come from (e.g. two pale-blue-dominated images, one
+     busier than the other).
+
+     Tonal cohesion is kept as a faint tiebreaker, deliberately low.
+     It directly conflicts with what the eye values here (contrast
+     over cohesion), so we don't want it competing with the contrast
+     signals — but a small weight stops perfectly tonal-similar
+     pairs from being penalised for that alone. Sum ≈ 1.0. */
+  const TONAL_WEIGHT    = 0.05;
+  const PALETTE_WEIGHT  = 0.50;
+  const DENSITY_WEIGHT  = 0.40;
+  const SAT_WEIGHT      = 0.05;
+
+  /* How hard to penalise pairs whose dominant colour matches (whether
+     that's a saturated palette[0] sharing a hue family, or a blank-canvas
+     neutral background). 0 disables; 0.9 is firm enough to push
+     two-brick / two-blue / two-red pairs out of the top pool without
+     being so aggressive that all analogous compositions vanish; 1.0
+     nearly excludes. */
+  const REPETITION_PENALTY = 0.9;
+
+  /* How hard to penalise pairs where BOTH images are overall low in
+     saturation. The diptych wants colour life from at least one panel;
+     two muted/greyscale frames together feel monotonous even when their
+     palettes technically differ. Fires only when the MAX of the two
+     avgSats is below 0.25 — one colourful side is enough to keep the
+     pair alive (so a B&W can still pair with a vibrant shot). 0 disables. */
+  const JOINT_DESAT_PENALTY = 0.5;
+
+  /* Video pacing — probabilistic, with a minimum gap between videos so
+     they never appear back-to-back. VIDEO_RATE is the per-click chance
+     once eligible; VIDEO_MIN_GAP is how many photo-only clicks must
+     follow a video before another can land. Average gap with the
+     defaults is ~1 + 1/0.35 ≈ 3.9 clicks, so videos feel "every few
+     duos" without being mechanical and without ever clustering. Set
+     VIDEO_RATE = 0 to disable videos entirely. */
+  const VIDEO_RATE    = 0.35;
+  const VIDEO_MIN_GAP = 1;
+
+  /* Per-image guarantee. With this probability per click, the picker
+     draws from a per-image-best list (each image's highest-scored pair)
+     instead of the global top-N. Inside the guarantee branch the pick
+     is staleness-weighted, so images that haven't appeared in a while
+     dominate over those just shown — converting the guarantee from a
+     coin flip into an active long-term rotation engine.
+
+     At 0.35, roughly 1 in 3 clicks rotates the catalogue while the
+     remaining ~2 in 3 follow the quality-biased top-100 selection.
+     Higher values surface rare images faster at the cost of pulling
+     more weight from the quality-ranked main pool. */
+  const GUARANTEE_RATE = 0.35;
+
+  /* Colour analysis. COLOR_SAMPLE_SIZE is the side length of the
+     downsampled canvas each image is drawn to before histogram /
+     palette / saturation extraction. Larger = more accurate (small
+     subjects represented by more pixels, palette filter sees finer
+     colour distinctions), but quadratic in cost. 64 was the original
+     compromise; 128 quadruples the pixel count (4,096 → 16,384) with
+     analysis still running comfortably under 20ms per image and a
+     noticeable improvement in catching small-area dominant colours.
+     Going to 256+ is diminishing returns for top-4 palette extraction. */
+  const COLOR_SAMPLE_SIZE = 128;
+  const PALETTE_SIZE      = 4;
+  const HIST_BINS         = 7;
+
+  function altFor(num) {
+    return `Federico Ferrari — Random Diptych ${num}`;
+  }
+
+  /* ─────────────────────────────────────────────────────────────────────────
+     STATE
+     ───────────────────────────────────────────────────────────────────────── */
+
+  let   images          = [];
+  const validImages     = [];
+  const colorSignatures = new Map();    // src → { histogram, palette, avgSat }
+  let   topPairs        = [];           // globally-ranked pair list (best first)
+  let   imageBests      = [];           // per-image first-best pair (kept for debugging)
+  let   bestsPerImage   = new Map();    // src → top K best pairs, used by pickPair guarantee branch
+  let   lastShown       = new Map();    // src → clickCount when last appeared; drives staleness weighting
+  let   recent          = new Map();    // src → clickCount when last marked recent; checked via isRecent()
+  let   clickCount       = 0;
+  let   clicksSinceVideo = Infinity;  // gap counter for VIDEO_MIN_GAP
+  let   interludePreload = null;
+  let   currentInterlude = null;
+  let   lastInterlude    = null;
+  let   pendingShareURL  = null;
+
+  /* ─────────────────────────────────────────────────────────────────────────
+     PATH HELPERS
+     ───────────────────────────────────────────────────────────────────────── */
+
+  function path(num, format, width) {
+    return width
+      ? `${IMAGES_BASE}/${format}/ff${num}-${width}.${format}`
+      : `${IMAGES_BASE}/${format}/ff${num}.${format}`;
+  }
+  function srcset(num, format) {
+    if (!SIZES.length) return path(num, format);
+    return SIZES.map(w => `${path(num, format, w)} ${w}w`).join(', ');
+  }
+  /* Pick the variant width this device will most likely display. The
+     image renders at most 50vw wide (`object-fit: contain` in a
+     50vw × 50vh box). devicePixelRatio converts CSS px to device px.
+     Returning the smallest variant ≥ that target matches what the
+     browser's own srcset algorithm picks given `sizes="50vw"`, so the
+     startup preload warms the SAME URL the <picture> element will
+     later fetch — no wasted bandwidth, no second download on first
+     display. If nothing covers the need, fall back to the largest
+     available. Returns null when SIZES is empty (single-size mode). */
+  function pickDisplayVariant() {
+    if (!SIZES.length) return null;
+    const dpr    = window.devicePixelRatio || 1;
+    const needed = (window.innerWidth * 0.5) * dpr;
+    return SIZES.find(w => w >= needed) || SIZES[SIZES.length - 1];
+  }
+  function srcToNum(src) { const m = src && src.match(/ff(\d+)\.jpg$/i); return m ? m[1] : null; }
+  function numToSrc(n)   { return `${IMAGES_BASE}/jpg/ff${n}.jpg`; }
+
+  /* Video helpers. Videos live at `${VIDEO_BASE}/ff{n}.mp4` and share
+     no numeric namespace with images (ff1.mp4 is a different asset
+     than ff1.jpg). The hash uses a 'v' prefix to distinguish — e.g.
+     `#5,v12` means image 5 paired with video 12. Bare-number hashes
+     still parse as images, so existing share links keep working. */
+  function isVideo(src)     { return /\.mp4$/i.test(src); }
+  function videoNumToSrc(n) { return `${VIDEO_BASE}/ff${n}.mp4`; }
+  function srcToId(src) {
+    if (isVideo(src)) {
+      const m = src.match(/ff(\d+)\.mp4$/i);
+      return m ? 'v' + m[1] : null;
+    }
+    return srcToNum(src);
+  }
+  function idToSrc(id) {
+    if (!id) return null;
+    return id[0] === 'v' ? videoNumToSrc(id.slice(1)) : numToSrc(id);
+  }
+
+  /* SIBLINGS — flat src → [sibling srcs] lookup derived from
+     SIBLING_GROUPS. Built once at script init since the groups are
+     static config. Used in markPairRecent() to extend the recent[]
+     block to every sibling of an image when its pair is shown. */
+  const SIBLINGS = new Map();
+  for (const group of SIBLING_GROUPS) {
+    const srcs = group.map(idToSrc).filter(Boolean);
+    for (const s of srcs) {
+      SIBLINGS.set(s, srcs.filter(x => x !== s));
+    }
+  }
+
+  /* ─────────────────────────────────────────────────────────────────────────
+     IMAGE DISCOVERY
+     ───────────────────────────────────────────────────────────────────────── */
+
+  async function discoverImages() {
+    const found = [];
+    let start = 1;
+    while (true) {
+      const batch = Array.from({ length: DISCOVER_BATCH }, (_, i) => start + i);
+      const results = await Promise.all(
+        batch.map(n =>
+          fetch(`${IMAGES_BASE}/jpg/ff${n}.jpg`, { method: 'HEAD' })
+            .then(r => (r.ok ? n : null))
+            .catch(() => null)
+        )
+      );
+      const present = results.filter(n => n !== null);
+      found.push(...present);
+      if (present.length === 0) break;
+
+      /* Partial-hit batch usually means we've crossed the end of the
+         catalogue, but it could also be a hole (e.g. ff100 deleted,
+         ff101-ff147 still present). Probe one item far ahead to tell
+         the two apart. If the far probe also 404s, we're at the end
+         and break — saves the ~20 wasted HEADs the old logic spent
+         on a confirming full batch. If it hits, there's genuinely a
+         hole; continue normal batched probing. Trade-off: a hole
+         exactly between this batch and the far probe would fool us,
+         but that's a contrived pattern; in practice catalogues are
+         contiguous or have small isolated gaps. */
+      if (present.length < batch.length) {
+        const farN = start + DISCOVER_BATCH * 2;
+        const farExists = await fetch(`${IMAGES_BASE}/jpg/ff${farN}.jpg`, { method: 'HEAD' })
+          .then(r => r.ok).catch(() => false);
+        if (!farExists) break;
+      }
+
+      start += DISCOVER_BATCH;
+    }
+    return found.sort((a, b) => a - b);
+  }
+
+  /* Parallel discovery for videos under VIDEO_BASE. Same batched HEAD
+     probing as images — silently returns an empty list if the folder
+     doesn't exist or contains nothing, so the site keeps working as
+     stills-only when no videos are uploaded. */
+  async function discoverVideos() {
+    const found = [];
+    let start = 1;
+    while (true) {
+      const batch = Array.from({ length: DISCOVER_BATCH }, (_, i) => start + i);
+      const results = await Promise.all(
+        batch.map(n =>
+          fetch(`${VIDEO_BASE}/ff${n}.mp4`, { method: 'HEAD' })
+            .then(r => (r.ok ? n : null))
+            .catch(() => null)
+        )
+      );
+      const present = results.filter(n => n !== null);
+      found.push(...present);
+      if (present.length === 0) break;
+
+      if (present.length < batch.length) {
+        const farN = start + DISCOVER_BATCH * 2;
+        const farExists = await fetch(`${VIDEO_BASE}/ff${farN}.mp4`, { method: 'HEAD' })
+          .then(r => r.ok).catch(() => false);
+        if (!farExists) break;
+      }
+
+      start += DISCOVER_BATCH;
+    }
+    return found.sort((a, b) => a - b);
+  }
+
+  /* ─────────────────────────────────────────────────────────────────────────
+     COLOUR ANALYSIS
+     Per image: a normalised lightness histogram, a small filtered palette,
+     and the average saturation. These three signals feed pairScore.
+     ───────────────────────────────────────────────────────────────────────── */
+
+  function rgbToHsl(r, g, b) {
+    r /= 255; g /= 255; b /= 255;
+    const max = Math.max(r, g, b), min = Math.min(r, g, b);
+    const l = (max + min) / 2;
+    if (max === min) return { h: 0, s: 0, l };
+    const d = max - min;
+    const s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+    let h;
+    switch (max) {
+      case r: h = ((g - b) / d + (g < b ? 6 : 0)); break;
+      case g: h = ((b - r) / d + 2);               break;
+      default: h = ((r - g) / d + 4);
+    }
+    return { h: h * 60, s, l };
+  }
+
+  function analyzeImage(img) {
+    try {
+      const N = COLOR_SAMPLE_SIZE;
+      const canvas = document.createElement('canvas');
+      canvas.width = N; canvas.height = N;
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(img, 0, 0, N, N);
+      const data = ctx.getImageData(0, 0, N, N).data;
+
+      const histogram = new Array(HIST_BINS).fill(0);
+      const buckets   = new Map();
+      let pixels = 0, satSum = 0;
+
+      for (let i = 0; i < data.length; i += 4) {
+        const r = data[i], g = data[i + 1], b = data[i + 2];
+        pixels++;
+
+        const lum = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
+        histogram[Math.min(HIST_BINS - 1, Math.floor(lum * HIST_BINS))]++;
+
+        const key = (r >> 3) << 10 | (g >> 3) << 5 | (b >> 3);
+        buckets.set(key, (buckets.get(key) || 0) + 1);
+
+        const mx = Math.max(r, g, b), mn = Math.min(r, g, b);
+        const L = (mx + mn) / 510;
+        const sat = mx === mn ? 0 : (L > 0.5 ? (mx - mn) / (510 - mx - mn) : (mx - mn) / (mx + mn));
+        satSum += sat;
+      }
+      for (let i = 0; i < HIST_BINS; i++) histogram[i] /= pixels;
+      const avgSat = satSum / pixels;
+
+      const sorted  = [...buckets.entries()].sort((a, b) => b[1] - a[1]);
+      const palette = [];
+
+      for (const [key, count] of sorted) {
+        if (palette.length >= PALETTE_SIZE) break;
+        const r = ((key >> 10) & 31) << 3;
+        const g = ((key >>  5) & 31) << 3;
+        const b =  (key        & 31) << 3;
+        const hsl = rgbToHsl(r, g, b);
+
+        if (hsl.l < 0.06 || hsl.l > 0.94 || hsl.s < 0.08) continue;
+
+        let merged = false;
+        for (const p of palette) {
+          let hueDiff = Math.abs(p.hsl.h - hsl.h);
+          if (hueDiff > 180) hueDiff = 360 - hueDiff;
+          if (hueDiff < 18 && Math.abs(p.hsl.l - hsl.l) < 0.12) {
+            p.weight += count / pixels;
+            merged = true;
+            break;
+          }
+        }
+        if (!merged) palette.push({ hsl, weight: count / pixels });
+      }
+
+      if (palette.length === 0) {
+        let tr = 0, tg = 0, tb = 0;
+        for (let i = 0; i < data.length; i += 4) {
+          tr += data[i]; tg += data[i + 1]; tb += data[i + 2];
+        }
+        palette.push({
+          hsl: rgbToHsl(tr / pixels, tg / pixels, tb / pixels),
+          weight: 1
+        });
+      }
+      const wTotal = palette.reduce((s, p) => s + p.weight, 0);
+      palette.forEach(p => p.weight /= wTotal);
+
+      return { histogram, palette, avgSat };
+    } catch {
+      return null;
+    }
+  }
+
+  /* Pure similarity measure between two colours. 1 = effectively the same
+     colour, 0 = at opposite ends of the wheel. Hue contributes only when
+     both colours are saturated (greys have no meaningful hue); lightness
+     always contributes. */
+  function colorSimilarity(c1, c2) {
+    let hueDiff = Math.abs(c1.h - c2.h);
+    if (hueDiff > 180) hueDiff = 360 - hueDiff;
+
+    const satGate = Math.min(c1.s, c2.s);
+    const hueSim  = (1 - hueDiff / 180) * satGate;
+    const lightSim = 1 - Math.abs(c1.l - c2.l);
+
+    return hueSim * 0.6 + lightSim * 0.4;
+  }
+
+  /* Detects "blank canvas" repetition — both images are mostly dominated
+     by the same low-saturation tone (pale sky, white wall, grey backdrop),
+     with that tone often too desaturated for the palette filter to
+     register it as the dominant colour. Catches the case dominantRepetition
+     misses, where palette[0] ends up being a tiny accent colour while the
+     actual visual dominant is a neutral.
+
+     The saturation gate is SOFT — it scales linearly from full effect at
+     avgSat 0 down to no effect at avgSat 0.3 — so borderline cases
+     (knife photo with a small saturated handle on a pale wall, sky with
+     wispy clouds) still get caught when they share the same tonal cluster
+     with another image. A hard cutoff at 0.15 was missing these. */
+  function blankCanvasRepetition(a, b) {
+    const satGateA = Math.max(0, 1 - a.avgSat / 0.3);
+    const satGateB = Math.max(0, 1 - b.avgSat / 0.3);
+    const satGate  = Math.min(satGateA, satGateB);
+    if (satGate === 0) return 0;
+
+    /* Find each image's strongest 2-adjacent-bin slab and its position. */
+    const concentration = sig => {
+      let best = 0, bestIdx = 0;
+      for (let i = 0; i < HIST_BINS - 1; i++) {
+        const adjacent = sig.histogram[i] + sig.histogram[i + 1];
+        if (adjacent > best) { best = adjacent; bestIdx = i; }
+      }
+      return { val: best, idx: bestIdx };
+    };
+
+    const ca = concentration(a);
+    const cb = concentration(b);
+
+    /* Both must be heavily dominated by their neutral mass (>50% in two
+       adjacent bins) AND that mass must sit at roughly the same lightness. */
+    if (ca.val < 0.5 || cb.val < 0.5) return 0;
+    if (Math.abs(ca.idx - cb.idx) > 1) return 0;
+
+    return Math.min(ca.val, cb.val) * satGate;
+  }
+
+  /* Detects when both images share essentially the same predominant
+     colour. PART 1 catches saturated palette[0] matches by hue family —
+     a deep blue paired with a pale blue still counts as "two blues",
+     regardless of lightness difference. PART 2 catches blank-canvas
+     images where the dominant area is a neutral the palette filter
+     stripped out. */
+  function dominantRepetition(a, b) {
+    const cA = a.palette[0];
+    const cB = b.palette[0];
+
+    /* PART 1: palette[0] hue-family match */
+    let palRep = 0;
+    if (cA && cB) {
+      let hueDiff = Math.abs(cA.hsl.h - cB.hsl.h);
+      if (hueDiff > 180) hueDiff = 360 - hueDiff;
+
+      const satGate = Math.min(cA.hsl.s, cB.hsl.s);
+
+      /* Saturated dominants: same hue family (within 30°) = repetition,
+         regardless of lightness. Desaturated dominants (greys): fall
+         back to lightness proximity, since hue is meaningless. */
+      const closeness = satGate > 0.15
+        ? Math.max(0, 1 - hueDiff / 30)
+        : Math.max(0, 1 - Math.abs(cA.hsl.l - cB.hsl.l) / 0.15);
+
+      /* Weight by prominence — a tiny matching patch doesn't qualify. */
+      palRep = closeness * Math.min(cA.weight, cB.weight);
+    }
+
+    /* PART 2: blank-canvas neutral match */
+    const blankRep = blankCanvasRepetition(a, b);
+
+    return Math.max(palRep, blankRep);
+  }
+
+  /* Pair score: rewards palette contrast, compositional density
+     contrast (full-vs-empty pairings), tonal cohesion as a mild
+     signal, and saturation match as a tiebreaker. Minus penalties
+     for predominant-colour repetition and for pairs where neither
+     image carries colour weight. */
+  function pairScore(a, b) {
+    if (!a || !b) return 0;
+
+    /* Tonal cohesion via histogram cosine similarity. Kept as a low
+       weight — it directly conflicts with density contrast, since a
+       full scene and an empty sky have very different histograms. */
+    let dot = 0, magA = 0, magB = 0;
+    for (let i = 0; i < HIST_BINS; i++) {
+      dot  += a.histogram[i] * b.histogram[i];
+      magA += a.histogram[i] ** 2;
+      magB += b.histogram[i] ** 2;
+    }
+    const tonalScore = (magA && magB) ? dot / Math.sqrt(magA * magB) : 0;
+
+    /* Palette overlap: for each colour in A, find its best match in B
+       and weight by A's weight. Symmetric average over both directions. */
+    const directional = (pA, pB) => {
+      let total = 0;
+      for (const cA of pA) {
+        let best = 0;
+        for (const cB of pB) {
+          const s = colorSimilarity(cA.hsl, cB.hsl);
+          if (s > best) best = s;
+        }
+        total += best * cA.weight;
+      }
+      return total;
+    };
+    const paletteOverlap  = (directional(a.palette, b.palette) + directional(b.palette, a.palette)) / 2;
+    const paletteContrast = 1 - paletteOverlap;
+
+    /* Compositional density contrast: Shannon entropy of each image's
+       lightness histogram, normalised to [0, 1]. A uniform sky or
+       blank wall concentrates pixels in one or two bins → low entropy
+       → low density. A busy/varied scene spreads pixels across bins
+       → high entropy → high density. The score rewards the ABSOLUTE
+       DIFFERENCE — pairing one full and one empty image gets a strong
+       boost, while two-full or two-empty pairs contribute nothing
+       from this term. This is the missing dimension that surfaces the
+       editorial "full vs negative space" pairings the eye recognises
+       immediately but pure colour scoring keeps marking down. */
+    const densityContrast = Math.abs(densityOf(a) - densityOf(b));
+
+    const satMatch = 1 - Math.abs(a.avgSat - b.avgSat);
+
+    const repetition = dominantRepetition(a, b);
+
+    /* Joint-desaturation penalty: only fires when BOTH images are below
+       0.25 avgSat. One colourful side is enough to keep the pair alive. */
+    const maxSat    = Math.max(a.avgSat, b.avgSat);
+    const jointDesat = Math.max(0, 1 - maxSat / 0.25);
+
+    return tonalScore                          * TONAL_WEIGHT
+         + paletteContrast                     * PALETTE_WEIGHT
+         + paletteContrast * densityContrast   * DENSITY_WEIGHT
+         + satMatch                            * SAT_WEIGHT
+         - repetition                          * REPETITION_PENALTY
+         - jointDesat                          * JOINT_DESAT_PENALTY;
+  }
+
+  /* Compositional density via lightness-histogram entropy. Returns
+     [0, 1] — 0 = all pixels in one tonal bin (uniform / "empty"),
+     1 = pixels perfectly spread across all bins ("full" / busy).
+     Real photos fall roughly between 0.2 (sky / wall) and 0.85
+     (varied scene). Used by pairScore to reward density CONTRAST,
+     not density itself. */
+  function densityOf(sig) {
+    let H = 0;
+    for (const p of sig.histogram) {
+      if (p > 0) H -= p * Math.log2(p);
+    }
+    return H / Math.log2(HIST_BINS);
+  }
+
+  function computeTopPairs() {
+    if (validImages.length < 2) { topPairs = []; imageBests = []; bestsPerImage = new Map(); return; }
+    const arr   = validImages.filter(s => colorSignatures.has(s));
+    const pairs = [];
+    for (let i = 0; i < arr.length; i++) {
+      for (let j = i + 1; j < arr.length; j++) {
+        pairs.push({
+          a: arr[i],
+          b: arr[j],
+          score: pairScore(colorSignatures.get(arr[i]), colorSignatures.get(arr[j]))
+        });
+      }
+    }
+    pairs.sort((x, y) => y.score - x.score);
+    topPairs = pairs;
+
+    /* Per-image best pairs. Two parallel structures from one pass:
+       - bestsPerImage: Map<src, Pair[]> with each image's top
+         BESTS_PER_IMAGE highest-scoring partner-pairs. The guarantee
+         branch consults this so an image with a single popular best
+         partner (often in recent[]) still has fallback options. With
+         K=1 (the previous design), modest-scoring images whose top
+         partner was a heavy-hitter got systematically starved: their
+         single imageBests row was filtered out whenever the partner
+         appeared recently, and they weren't in the global top-N pool
+         either. K=5 means recent[] would need to block five separate
+         best-pairings before an image disappears from the guarantee
+         pool — much less common.
+       - imageBests: flat list of first-pair-per-image, kept purely
+         for debugging via window.__imageBests so existing console
+         workflows still work. Not consulted by pickPair anymore. */
+    const BESTS_PER_IMAGE = 5;
+    bestsPerImage = new Map();
+    for (const pair of pairs) {
+      for (const src of [pair.a, pair.b]) {
+        const list = bestsPerImage.get(src);
+        if (!list) bestsPerImage.set(src, [pair]);
+        else if (list.length < BESTS_PER_IMAGE) list.push(pair);
+      }
+    }
+
+    const seen  = new Set();
+    const bests = [];
+    for (const pair of pairs) {
+      if (!seen.has(pair.a) || !seen.has(pair.b)) {
+        bests.push(pair);
+        seen.add(pair.a);
+        seen.add(pair.b);
+      }
+      if (seen.size >= arr.length) break;
+    }
+    imageBests = bests;
+
+    window.__topPairs      = topPairs;
+    window.__imageBests    = imageBests;
+    window.__bestsPerImage = bestsPerImage;
+  }
+
+  /* Debounced wrapper. During initial parallel discovery, every image
+     that finishes loading would trigger a full O(N²) recompute — with
+     30 images that's 30 back-to-back recomputes of ~400 pair scores
+     each, all on the main thread. Coalescing into one recompute per
+     frame keeps the splash animation smooth without changing semantics:
+     pickPair only consults topPairs after the splash dismisses anyway. */
+  let topPairsPending = 0;
+  function scheduleTopPairs() {
+    if (topPairsPending) return;
+    topPairsPending = requestAnimationFrame(() => {
+      topPairsPending = 0;
+      computeTopPairs();
+    });
+  }
+
+  /* ─────────────────────────────────────────────────────────────────────────
+     SHAREABLE URL HASH
+     ───────────────────────────────────────────────────────────────────────── */
+
+  function pairToHash(p) { return '#' + p.map(srcToId).join(','); }
+  function hashToPair() {
+    const m = location.hash.match(/^#(v?\d+),(v?\d+)$/);
+    if (!m || m[1] === m[2]) return null;
+    const a = idToSrc(m[1]), b = idToSrc(m[2]);
+    return (validImages.includes(a) && validImages.includes(b)) ? [a, b] : null;
+  }
+
+  /* ─────────────────────────────────────────────────────────────────────────
+     IMAGE LOADING & SWAPPING
+     ───────────────────────────────────────────────────────────────────────── */
+
+  /* Staleness — how many clicks since an image last appeared. Never-shown
+     images return a large constant so they dominate any weighted selection
+     until they've appeared at least once. The picker uses this to weight
+     the guarantee branch toward images that haven't surfaced recently. */
+  function staleness(src) {
+    const last = lastShown.get(src);
+    return last === undefined ? clickCount + 1000 : clickCount - last;
+  }
+
+  /* Recent-block check. An image is considered "recent" if its last
+     marking was within RECENT_CLICKS_BLOCK clicks. Map-based lookup
+     replaces the previous array+slice approach so adding siblings to
+     the block doesn't shrink the effective window (each sibling-push
+     used to trim older entries early, making the block window expire
+     faster on clicks that happened to involve grouped images). */
+  function isRecent(src) {
+    const last = recent.get(src);
+    return last !== undefined && (clickCount - last) < RECENT_CLICKS_BLOCK;
+  }
+
+  /* Mark a pair as just-shown — and propagate the block to every
+     sibling declared in SIBLING_GROUPS. Without sibling propagation,
+     near-duplicates like ff97/ff98 (same shoot, near-identical
+     colour signature) could appear in adjacent clicks because the
+     scorer sees them as independent images. */
+  function markPairRecent(pair) {
+    for (const src of pair) {
+      recent.set(src, clickCount);
+      const sibs = SIBLINGS.get(src);
+      if (sibs) for (const s of sibs) recent.set(s, clickCount);
+    }
+  }
+
+  /* Weighted random pick from a list. Each item's chance of selection is
+     proportional to weightFn(item). Falls back to uniform if all weights
+     are zero (defensive). Used by the guarantee branch to favor rarely-
+     shown images, but generic enough to reuse elsewhere if needed. */
+  function weightedPick(items, weightFn) {
+    let total = 0;
+    const weights = new Array(items.length);
+    for (let i = 0; i < items.length; i++) {
+      weights[i] = Math.max(0, weightFn(items[i]));
+      total += weights[i];
+    }
+    if (total === 0) return items[Math.floor(Math.random() * items.length)];
+    let r = Math.random() * total;
+    for (let i = 0; i < items.length; i++) {
+      r -= weights[i];
+      if (r <= 0) return items[i];
+    }
+    return items[items.length - 1];
+  }
+
+  function pickPair(arr) {
+    if (topPairs.length === 0) {
+      const i = Math.floor(Math.random() * arr.length);
+      let   j = Math.floor(Math.random() * arr.length);
+      while (j === i && arr.length > 1) j = Math.floor(Math.random() * arr.length);
+      return [arr[i], arr[j]];
+    }
+
+    /* Per-image guarantee draw. With GUARANTEE_RATE probability, pick
+       via bestsPerImage — each image's top BESTS_PER_IMAGE highest-
+       scoring pairings, with weighted selection by staleness of the
+       source image. Previously this branch used `imageBests` (one
+       row per image, that image's single highest-scoring pair). The
+       failure mode was: a modest-score image's single best partner
+       was often a globally-popular image, which appeared often in
+       recent[]; the filter then removed the modest image's only row,
+       and since its global rank was below TOP_PAIRS_POOL, it didn't
+       appear in the main pool either — silently starved across
+       sessions. With K=5 best partners per image, we'd need recent[]
+       to be blocking all five before the image vanishes from the
+       guarantee pool. */
+    if (Math.random() < GUARANTEE_RATE && bestsPerImage.size > 0) {
+      /* Build per-image candidates: for each image not currently in
+         recent[], find its highest-scoring pair where neither side
+         is in recent[]. Iteration is over the Map's keys, so each
+         image contributes at most ONE candidate row, weighted by
+         that image's own staleness. */
+      const candidates = [];
+      for (const [src, pairList] of bestsPerImage) {
+        if (isRecent(src)) continue;
+        const avail = pairList.find(p =>
+          !isRecent(p.a) && !isRecent(p.b)
+        );
+        if (avail) candidates.push({ src, pair: avail });
+      }
+      if (candidates.length > 0) {
+        const gHasVideos = candidates.some(c => isVideo(c.pair.a) || isVideo(c.pair.b));
+        const gEligible  = clicksSinceVideo >= VIDEO_MIN_GAP;
+        const gWantVideo = gHasVideos && gEligible && Math.random() < VIDEO_RATE;
+        const gFiltered  = gWantVideo
+          ? candidates.filter(c =>  isVideo(c.pair.a) ||  isVideo(c.pair.b))
+          : candidates.filter(c => !isVideo(c.pair.a) && !isVideo(c.pair.b));
+        const gPool      = gFiltered.length > 0 ? gFiltered : candidates;
+        /* Weight by the source image's staleness — never-shown images
+           return very large staleness, so they dominate until they
+           surface, then normalize. Note: a pair (A,B) may appear as
+           a candidate twice (once with src=A, once with src=B) if
+           it's in both images' top K. That's intentional — pairs
+           where both sides are stale get effectively doubled weight. */
+        const chosen     = weightedPick(gPool, c => staleness(c.src));
+        const pair       = chosen.pair;
+        const drewVideo  = isVideo(pair.a) || isVideo(pair.b);
+        clicksSinceVideo = drewVideo ? 0 : clicksSinceVideo + 1;
+        return Math.random() < 0.5 ? [pair.a, pair.b] : [pair.b, pair.a];
+      }
+      /* Every image's K best partners blocked by recent[] AND every
+         image itself in recent[]. Vanishingly rare. Falls through. */
+    }
+
+    /* Filter out pairs containing any image shown in the last
+       RECENT_CLICKS_BLOCK clicks. If that filter empties the pool
+       (e.g. early in the session when fewer images have loaded), fall
+       back to the full ranked list rather than getting stuck. */
+    const available = topPairs.filter(p => !isRecent(p.a) && !isRecent(p.b));
+    const pool      = available.length > 0 ? available : topPairs;
+
+    /* Probabilistic video selection with a minimum-gap guard. The
+       gap check ensures videos never appear back-to-back; once past
+       the gap, VIDEO_RATE decides per click. Non-video clicks are
+       filtered to photo-only pairs so the rate is exact — without
+       this, videos could still slip in via the top-N pool. The
+       fallback to `pool` covers the (rare) case where filtering
+       leaves nothing, e.g. very early in the session. */
+    const hasVideos = pool.some(p => isVideo(p.a) || isVideo(p.b));
+    const eligible  = clicksSinceVideo >= VIDEO_MIN_GAP;
+    const wantVideo = hasVideos && eligible && Math.random() < VIDEO_RATE;
+    const drawPool  = wantVideo
+      ? pool.filter(p =>  isVideo(p.a) ||  isVideo(p.b))
+      : pool.filter(p => !isVideo(p.a) && !isVideo(p.b));
+    const finalPool = drawPool.length > 0 ? drawPool : pool;
+
+    /* Update the gap counter based on what we're actually going to
+       draw, not what we wanted — if drawPool collapsed and we fell
+       back to `pool`, the result may or may not include a video. */
+    const drawingVideo = finalPool === drawPool && wantVideo;
+    clicksSinceVideo   = drawingVideo ? 0 : clicksSinceVideo + 1;
+
+    const poolSize  = Math.min(TOP_PAIRS_POOL, finalPool.length);
+    /* Quality-biased pick: squaring Math.random() stretches the
+       distribution toward 0 so the highest-scored pairs dominate.
+       With the current pool of 150, the top 10% (15 pairs) receives
+       ~32% of picks and the bottom half receives ~29%. The hard
+       floor on quality comes from TOP_PAIRS_POOL itself (no pair
+       ranked worse than 150 ever appears); this bias just shifts
+       the rotation toward the very top within that pool. Bump to
+       ** 3 for stronger top-emphasis, ** 1 for uniform. */
+    const chosen    = finalPool[Math.floor(Math.random() ** 2 * poolSize)];
+
+    return Math.random() < 0.5 ? [chosen.a, chosen.b] : [chosen.b, chosen.a];
+  }
+
+  function preparePanel(panelEl, src) {
+    const layers = panelEl.querySelectorAll('.layer');
+    const active = panelEl.querySelector('.layer.loaded');
+    const back   = (active === layers[0]) ? layers[1] : layers[0];
+
+    if (isVideo(src)) {
+      /* Reuse a video element in the back layer if one's already there,
+         otherwise rebuild. The element gets `muted` + `playsinline` so
+         iOS won't go fullscreen and so autoplay isn't blocked. `autoplay`
+         attribute is belt-and-braces alongside the explicit play() call
+         — some iOS Safari versions prefer the attribute over the JS
+         call, others vice versa. Setting muted as both attribute AND
+         property defends against iOS quirks where the property can be
+         silently reset when src changes. */
+      let video = back.querySelector('video');
+      if (!video) {
+        back.innerHTML = '<video muted autoplay loop playsinline preload="auto"></video>';
+        video = back.querySelector('video');
+      }
+      /* Re-assert muted + playsinline state every time, because some
+         iOS versions reset these on src change. Cheap and harmless. */
+      video.muted       = true;
+      video.playsInline = true;
+      return new Promise(resolve => {
+        let settled = false;
+        const done = () => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          /* play() returns a Promise that rejects when autoplay is
+             blocked (iOS Low Power Mode, some Android battery saver
+             modes). Catch it explicitly — a sync try/catch wouldn't
+             catch the rejection. Resolved either way so the diptych
+             still appears, just with the first frame frozen until a
+             user gesture unblocks playback on the next click. */
+          video.play().catch(() => {});
+          resolve({ back, active });
+        };
+        /* Timeout safety net. If the video file is unreachable or
+           corrupt enough that loadeddata + error both never fire,
+           resolve anyway after VIDEO_DISPLAY_TIMEOUT_MS so the
+           gallery stays responsive. */
+        const timer = setTimeout(() => {
+          if (!settled) console.warn('Diptych: video load timeout', src);
+          done();
+        }, VIDEO_DISPLAY_TIMEOUT_MS);
+        video.addEventListener('loadeddata', done, { once: true });
+        video.addEventListener('error',      done, { once: true });
+        video.src = src;
+        video.load();
+      });
+    }
+
+    /* Image path — reuse the existing picture element if present,
+       otherwise rebuild it (the layer may currently hold a video). */
+    let picture = back.querySelector('picture');
+    if (!picture) {
+      /* If a video occupied this layer, stop its download / playback
+         before the markup is replaced. Without this, the previous video
+         can keep streaming bytes in the background while its DOM element
+         is destroyed, wasting bandwidth on slow connections. */
+      const oldVideo = back.querySelector('video');
+      if (oldVideo) {
+        try {
+          oldVideo.pause();
+          oldVideo.removeAttribute('src');
+          oldVideo.load();
+        } catch {}
+      }
+      back.innerHTML =
+        '<picture>' +
+          '<source type="image/avif" sizes="50vw">' +
+          '<source type="image/webp" sizes="50vw">' +
+          '<img alt="" sizes="50vw">' +
+        '</picture>';
+      picture = back.querySelector('picture');
+    }
+
+    const num     = srcToNum(src);
+    const avifSrc = picture.querySelector('source[type="image/avif"]');
+    const webpSrc = picture.querySelector('source[type="image/webp"]');
+    const img     = picture.querySelector('img');
+
+    avifSrc.srcset = FORMATS.includes('avif') ? srcset(num, 'avif') : '';
+    webpSrc.srcset = FORMATS.includes('webp') ? srcset(num, 'webp') : '';
+    img.srcset     = SIZES.length ? srcset(num, 'jpg') : '';
+    img.src        = path(num, 'jpg');
+    img.alt        = altFor(num);
+
+    /* Race decode against a timeout — see IMAGE_DECODE_TIMEOUT_MS for
+       the reasoning. The image still appears whenever decode actually
+       finishes (img.src is set independently and the browser paints it
+       on the next frame regardless of whether we awaited the promise);
+       the race just ensures the surrounding load flow never wedges. */
+    return Promise.race([
+      img.decode().catch(() => {}),
+      new Promise(r => setTimeout(r, IMAGE_DECODE_TIMEOUT_MS)),
+    ]).then(() => ({ back, active }));
+  }
+
+  async function loadDiptych(forcedPair) {
+    if (validImages.length < 2) return;
+    const pair = forcedPair || pickPair(validImages);
+    history.replaceState(null, '', pairToHash(pair));
+
+    const sides = await Promise.all([
+      preparePanel(document.querySelector('.panel.left'),  pair[0]),
+      preparePanel(document.querySelector('.panel.right'), pair[1])
+    ]);
+
+    requestAnimationFrame(() => {
+      sides.forEach(({ back, active }) => {
+        back.classList.add('loaded');
+        if (active && active !== back) {
+          active.classList.remove('loaded');
+          /* Pause any video in the layer that just became hidden so we
+             don't accumulate background playback as the user clicks
+             through. The video stays in the DOM ready to be reused on
+             its next turn. */
+          const oldVideo = active.querySelector('video');
+          if (oldVideo) { try { oldVideo.pause(); } catch {} }
+        }
+      });
+      /* Record the pair as "recently shown" only AFTER the swap commits.
+         Doing this earlier (before await) marked preloaded-but-hidden
+         interlude pairs as seen, thinning the candidate set unnecessarily.
+         markPairRecent also propagates the block to any declared siblings
+         (SIBLING_GROUPS). lastShown drives the staleness weighting in
+         the guarantee branch: the more clicks since an image last
+         appeared, the more likely the guarantee will pick a pair
+         containing it next time. */
+      markPairRecent(pair);
+      lastShown.set(pair[0], clickCount);
+      lastShown.set(pair[1], clickCount);
+    });
+
+    if (window.gaEnabled && typeof gtag !== 'undefined') {
+      gtag('event', 'diptych_view', { left: pair[0], right: pair[1] });
+    }
+  }
+
+  /* Load an image or video for analysis. Images: tries each format in
+     FORMATS until one succeeds, so the browser fetches AVIF first
+     (matching what <picture> will serve to AVIF-capable browsers) and
+     falls back to JPG on error. Videos: routed to a separate path that
+     loads the file, seeks to ~25% in, and extracts a representative
+     frame to feed to analyzeImage. In both cases the src arg is the
+     canonical identifier used in validImages and colorSignatures. */
+  function loadOne(src) {
+    if (isVideo(src)) return loadVideoForAnalysis(src);
+    return new Promise(resolve => {
+      const num = srcToNum(src);
+      let attemptIdx = 0;
+
+      const attempt = () => {
+        if (attemptIdx >= FORMATS.length) {
+          console.warn('Diptych: failed to load', src);
+          resolve(false);
+          return;
+        }
+        const format = FORMATS[attemptIdx++];
+        const img = new Image();
+        img.onload = () => {
+          if (!validImages.includes(src)) validImages.push(src);
+          const sig = analyzeImage(img);
+          if (sig) {
+            colorSignatures.set(src, sig);
+            scheduleTopPairs();
+          }
+          resolve(true);
+        };
+        img.onerror = () => attempt();
+        /* Use the variant this device will actually display, not the
+           smallest one. That makes a single fetch serve two purposes:
+           the analysis pass gets pixels for the colour histogram, and
+           the browser cache is warmed for when <picture> later renders
+           the same URL — so the splash's "loading" wait IS the display
+           preload. Falls back to the base path if SIZES is unset. */
+        img.src = SIZES.length ? path(num, format, pickDisplayVariant()) : path(num, format);
+      };
+
+      attempt();
+    });
+  }
+
+  /* Neutral fallback colour signature for videos that can't be analysed
+     (mostly iOS Safari, which refuses to load video data without user
+     gesture). Using a flat-uniform histogram and a mid-grey palette
+     means the pair scorer treats the video as neither strongly matching
+     nor strongly clashing with anything — pairing quality drops, but
+     the video appears in the rotation. Without this, videos that fail
+     analysis are silently dropped and never shown. */
+  function fallbackSignature() {
+    return {
+      histogram: new Array(HIST_BINS).fill(1 / HIST_BINS),
+      palette:   [{ hsl: { h: 0, s: 0, l: 0.5 }, weight: 1 }],
+      avgSat:    0.3
+    };
+  }
+
+  /* Frame extraction for video colour analysis. Creates a hidden
+     <video>, waits for loadeddata, seeks to a representative frame
+     (~25% in, capped at 1s for short clips), and passes the video
+     element to analyzeImage — canvas.drawImage accepts video elements
+     directly, so the same histogram/palette/saturation signature gets
+     computed without converting to an image first. The element is
+     attached to the DOM (offscreen) because iOS Safari refuses to
+     load video data on detached elements. If analysis fails or times
+     out (iOS still being awkward, corrupt file, etc.), the video is
+     registered with a neutral fallback signature so it still appears
+     in the rotation — the alternative would be the video silently
+     vanishing on iOS. */
+  function loadVideoForAnalysis(src) {
+    return new Promise(resolve => {
+      const v = document.createElement('video');
+      v.muted       = true;
+      v.playsInline = true;
+      v.preload     = 'auto';
+      /* Attach to DOM offscreen — iOS Safari won't load detached
+         <video> elements, so analysis silently failed on iPhone
+         without this. 1×1px, fully transparent, no pointer events. */
+      v.setAttribute('aria-hidden', 'true');
+      v.style.cssText = 'position:fixed;left:-9999px;top:-9999px;width:1px;height:1px;opacity:0;pointer-events:none;';
+      document.body.appendChild(v);
+
+      let settled = false;
+      const finish = (ok) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(watchdog);
+        try { v.pause(); } catch {}
+        v.removeAttribute('src');
+        v.load();
+        v.remove();
+        /* If analysis didn't produce a signature, register the video
+           with the fallback so it still appears in the rotation. The
+           file existence is already verified by discovery, so this is
+           safe even on failure. */
+        if (!colorSignatures.has(src)) {
+          if (!validImages.includes(src)) validImages.push(src);
+          colorSignatures.set(src, fallbackSignature());
+          scheduleTopPairs();
+        }
+        resolve(true);
+      };
+
+      const analyze = () => {
+        try {
+          if (!validImages.includes(src)) validImages.push(src);
+          const sig = analyzeImage(v);
+          if (sig) {
+            colorSignatures.set(src, sig);
+            scheduleTopPairs();
+          }
+          finish(true);
+        } catch {
+          finish(false);
+        }
+      };
+
+      /* Watchdog: if neither loadeddata nor error fires within the
+         timeout (iOS Safari off-DOM, corrupt file, network drop),
+         fall through to finish() which registers the video with a
+         fallback signature so it still shows up. */
+      const watchdog = setTimeout(() => {
+        console.warn('Diptych: video analysis timeout, using fallback signature', src);
+        finish(false);
+      }, VIDEO_ANALYSIS_TIMEOUT_MS);
+
+      v.addEventListener('loadeddata', () => {
+        if (v.duration && isFinite(v.duration) && v.duration > 0.5) {
+          v.addEventListener('seeked', analyze, { once: true });
+          v.currentTime = Math.min(v.duration * 0.25, 1);
+        } else {
+          analyze();
+        }
+      }, { once: true });
+
+      v.addEventListener('error', () => {
+        console.warn('Diptych: failed to load video, using fallback signature', src);
+        finish(false);
+      }, { once: true });
+
+      v.src = src;
+    });
+  }
+
+  /* ─────────────────────────────────────────────────────────────────────────
+     INTERLUDE SLIDES + WELCOME
+
+     Three full-screen white cards — contact, share, and a list of
+     related sites — rotate every CONTACT_EVERY clicks. The previous
+     slide is excluded from each pick, so the same one never appears
+     back-to-back. Clicking anywhere outside the tappable links
+     dismisses the slide and reveals the next diptych (preloaded while
+     the slide was visible). Adding another site is one extra <a> line
+     in the #site slide — no rotation changes needed.
+
+     The #welcome card reuses the same .interlude styling and the same
+     click / keyboard dismiss machinery, but sits outside the rotation.
+     It's shown once by start() between the splash dismissing and the
+     first diptych appearing, then never again for the rest of the
+     session — it isn't listed in INTERLUDES, so pickInterlude can't
+     select it.
+     ───────────────────────────────────────────────────────────────────────── */
+
+  const INTERLUDES = ['contact', 'share', 'site'];
+
+  (function buildContact() {
+    const u = 'ciao', d = ['thisisfed', 'xyz'].join('.');
+    const email = u + String.fromCharCode(64) + d;
+    const phoneTel     = '+' + '44' + '7547026300';
+    const phoneDisplay = '+44' + ' (0) ' + '7547 ' + '02 ' + '63 ' + '00';
+
+    const e = document.getElementById('contact-email');
+    e.setAttribute('href', 'mailto:' + email);
+    e.textContent = email;
+
+    const p = document.getElementById('contact-phone');
+    p.setAttribute('href', 'tel:' + phoneTel);
+    p.textContent = phoneDisplay;
+  })();
+
+  function pickInterlude() {
+    /* Random pick excluding the previous slide so the same one never
+       appears twice in a row. With three slides the user sees real
+       variety — two genuine candidates on each pick. */
+    const pool   = INTERLUDES.filter(s => s !== lastInterlude);
+    const choice = pool[Math.floor(Math.random() * pool.length)];
+    lastInterlude = choice;
+    return choice;
+  }
+
+  function showInterlude() {
+    const which = pickInterlude();
+    currentInterlude = document.getElementById(which);
+
+    /* Snapshot the current pair's URL BEFORE preloading the next one,
+       so the share slide always shares the diptych the user was just
+       looking at — not the one waiting behind the white card. */
+    pendingShareURL = location.href;
+
+    /* Refresh the email link's mailto target to match the current pair.
+       Subject gives context; body is just the URL so most email clients
+       handle it cleanly without truncation. */
+    if (which === 'share') {
+      const emailLink = document.getElementById('share-email');
+      if (emailLink) {
+        const subject = encodeURIComponent('Federico Ferrari — Random Diptychs');
+        const body    = encodeURIComponent(pendingShareURL);
+        emailLink.href = `mailto:?subject=${subject}&body=${body}`;
+      }
+    }
+
+    currentInterlude.classList.add('visible');
+    currentInterlude.setAttribute('aria-hidden', 'false');
+    interludePreload = loadDiptych();
+
+    if (window.gaEnabled && typeof gtag !== 'undefined') {
+      gtag('event', 'interlude_shown', { interlude: which });
+    }
+  }
+
+  /* Remove the initial gate that hides the diptych during the welcome
+     and (when needed) analytics cards. Called once, from whichever
+     dismissal is the last of the gate sequence — see hideInterlude
+     and dismissConsent. Idempotent: classList.remove is a no-op if
+     the class isn't present. */
+  function liftGate() {
+    document.documentElement.classList.remove('gated');
+  }
+
+  function hideInterlude() {
+    if (currentInterlude) {
+      /* Welcome: persist that the user has seen the "Click anywhere to
+         begin" prompt so it can be suppressed on return visits. The
+         copyright lines of the welcome card itself still show on every
+         visit — only the dismiss hint goes away. Set BEFORE clearing
+         currentInterlude so the id check still resolves. localStorage
+         throws in some private-mode browsers; failure means the CTA
+         shows again next session, which is harmless.
+
+         Same id-check decides whether to lift the initial gate. The
+         welcome → analytics chain calls hideInterlude with consentEl
+         still connected — gate stays up, dismissConsent will lift it.
+         If consent has already been chosen on a previous visit, the
+         consent element was .remove()'d at script init, so isConnected
+         is false here and we lift the gate ourselves. */
+      if (currentInterlude.id === 'welcome') {
+        try { localStorage.setItem(WELCOME_CTA_KEY, '1'); } catch {}
+        if (!consentEl || !consentEl.isConnected) {
+          liftGate();
+        }
+      }
+      currentInterlude.classList.remove('visible');
+      currentInterlude.setAttribute('aria-hidden', 'true');
+      currentInterlude = null;
+    }
+  }
+
+  /* localStorage key for "the welcome CTA has been seen". Separate from
+     CONSENT_KEY (analytics choice) and unrelated to the welcome card
+     itself, which always shows so the copyright line is reinforced on
+     every visit. Only the "Click anywhere to begin" hint is suppressed
+     after first dismissal — returning visitors recognise the dismiss
+     gesture from their first session and don't need the prompt. The
+     spacer above the CTA stays in place so the welcome's vertical
+     rhythm doesn't collapse on return visits. */
+  const WELCOME_CTA_KEY = 'ff-welcome-cta-seen';
+
+  /* The welcome card. Copyright + concept lines always show; the
+     "Click anywhere to begin" prompt is hidden on return visits via
+     WELCOME_CTA_KEY. Pattern matches showInterlude — sets
+     currentInterlude so the existing .interlude click handler and the
+     keyboard dismiss path both work without modification — but it sits
+     outside the rotation, so it can't be picked by pickInterlude. The
+     caller assigns the in-flight first loadDiptych to interludePreload
+     so dismiss (or the welcome→consent handoff) gates on the first
+     pair being decoded. */
+  function showWelcome() {
+    const el = document.getElementById('welcome');
+    if (!el) return;
+    const ctaEl = el.querySelector('.welcome-cta');
+    if (ctaEl) {
+      /* visibility:hidden, not display:none. Removing the line from
+         the flow shrinks the welcome card by ~0.5em and shifts the
+         flex-centered content upward relative to the splash, creating
+         the same misalignment that the iPhone centering fix was meant
+         to solve. visibility:hidden keeps the line's space occupied so
+         splash → welcome stays visually stable across first / return
+         visits — the user just doesn't see the prompt the second time. */
+      let seen = false;
+      try { seen = !!localStorage.getItem(WELCOME_CTA_KEY); } catch {}
+      ctaEl.style.visibility = seen ? 'hidden' : '';
+    }
+    currentInterlude = el;
+    el.classList.add('visible');
+    el.setAttribute('aria-hidden', 'false');
+
+    /* Auto-dismiss after WELCOME_AUTO_DISMISS_MS. Simulating a click
+       on the welcome element triggers the existing .interlude click
+       handler, which handles both branches correctly: chain to consent
+       if it's still needed (first visit), or await preload + lift the
+       gate + reveal the diptych (return visit). The currentInterlude
+       check before .click() guards the case where the user dismissed
+       manually first — by then currentInterlude is null or a different
+       element, and the timeout becomes a no-op. */
+    setTimeout(() => {
+      if (currentInterlude === el) el.click();
+    }, WELCOME_AUTO_DISMISS_MS);
+  }
+
+  /* Share trigger — tries the Web Share API first (native share sheet
+     on mobile, where most traffic is). Falls back to copying the URL
+     to the clipboard on desktop with a brief in-place confirmation so
+     the user knows it worked. Silent on cancel or unsupported. */
+  async function doShare() {
+    const url      = pendingShareURL || location.href;
+    const trigger  = document.getElementById('share-trigger');
+    const original = trigger.textContent;
+
+    if (navigator.share) {
+      try { await navigator.share({ title: 'Federico Ferrari — Random Diptychs', url }); }
+      catch { /* user cancelled — silent */ }
+    } else if (navigator.clipboard && navigator.clipboard.writeText) {
+      try {
+        await navigator.clipboard.writeText(url);
+        trigger.textContent = 'Link copied';
+        await new Promise(r => setTimeout(r, 900));
+        trigger.textContent = original;
+      } catch { /* silent */ }
+    }
+
+    if (window.gaEnabled && typeof gtag !== 'undefined') {
+      gtag('event', 'pair_shared', { url });
+    }
+  }
+
+  /* One delegated click handler per interlude. Anchors in the contact
+     slide (mailto:/tel:) navigate normally and don't dismiss. The
+     share trigger fires the share, then dismisses. Background clicks
+     dismiss for most interludes.
+
+     Two exceptions:
+     - #consent never dismisses on background click — the user must
+       explicitly Accept or Decline (those handlers run their own
+       dismiss path). Privacy regulations and basic UX both want a
+       deliberate choice rather than an accidental dismissal.
+     - #welcome dismisses normally but, if consent is still needed,
+       hands off to the analytics card instead of revealing the
+       diptych. The diptych keeps loading behind both cards; the
+       interludePreload await happens at the *final* card before the
+       diptych is shown (analytics if consent is needed, welcome
+       otherwise). */
+  document.querySelectorAll('.interlude').forEach(el => {
+    el.addEventListener('click', async (e) => {
+      if (el.id === 'consent') return;
+
+      if (e.target.closest('#share-trigger')) {
+        e.preventDefault();
+        await doShare();
+        /* fall through to dismiss */
+      } else if (e.target.closest('a')) {
+        return; /* let mailto: / tel: links fire without dismissing */
+      }
+
+      /* Welcome → analytics chain. Dismiss the welcome immediately so
+         the swap reads as a single transition; analytics shows in the
+         same centre position with the same fade timing. The preload
+         continues in the background and will be awaited when analytics
+         dismisses. */
+      if (el.id === 'welcome' && consentEl && consentEl.isConnected) {
+        hideInterlude();
+        showAnalytics();
+        return;
+      }
+
+      if (interludePreload) await interludePreload;
+      hideInterlude();
+    });
+  });
+
+  /* ─────────────────────────────────────────────────────────────────────────
+     SPLASH + IMAGE PRELOAD
+
+     Three static lines (title, gallery count, loading percentage), with
+     the percentage animating 0 → 100 to reflect real image-load progress.
+     A rAF loop drives the percentage display: actual progress increases
+     in chunks each time an image completes, but the rendered number rises
+     at a steady rate (PROGRESS_RATE_PER_SEC) so a warm-cache visit still
+     shows a smooth climb rather than a flicker from 0% to 100%. The
+     splash dismisses the moment the displayed number reaches 100% — so
+     visual completion and gallery-ready always coincide.
+
+     Videos are NOT preloaded; they get a neutral colour signature so the
+     pair scorer keeps them in rotation, and the actual file fetch happens
+     lazily in preparePanel when their pair is selected. There is no
+     click or keyboard skip; the safety cap SPLASH_MAX_WAIT_MS bounds the
+     worst case so the gallery never gets stranded behind a stuck splash.
+     ───────────────────────────────────────────────────────────────────────── */
+
+  (async function start() {
+    const splashEl   = document.getElementById('splash');
+    const subtitleEl = splashEl.querySelector('.subtitle');
+    const loadingEl  = splashEl.querySelector('.loading');
+
+    let target            = 200;
+    let imageSrcs         = null;
+    let splashFinished    = false;
+    let splashSafetyTimer = null;
+
+    /* Idempotent dismissal. Called from two places: the progress
+       animation (when the displayed % reaches 100), and the safety
+       timer (when MAX_WAIT_MS elapses without loading completing).
+       The splashFinished flag makes subsequent calls no-ops. There
+       is intentionally no click or keyboard path here — once the
+       splash is on screen, only loading completion or the safety
+       cap will dismiss it. */
+    const finishSplash = () => {
+      if (splashFinished) return;
+      splashFinished = true;
+      clearTimeout(splashSafetyTimer);
+      splashEl.classList.add('hidden');
+      setTimeout(() => splashEl.remove(), SPLASH_FADE_MS + 50);
+    };
+
+    splashSafetyTimer = setTimeout(finishSplash, SPLASH_MAX_WAIT_MS);
+
+    const [imageIndices, videoIndices] = await Promise.all([
+      discoverImages(),
+      discoverVideos()
+    ]);
+    const totalCount = imageIndices.length + videoIndices.length;
+    if (totalCount < 2) {
+      subtitleEl.textContent = 'No media could be loaded.';
+      loadingEl.textContent  = '';
+      return;
+    }
+    images = imageIndices.map(numToSrc).concat(videoIndices.map(videoNumToSrc));
+
+    /* Register every video with a neutral signature up front — without
+       loading the file. That keeps videos eligible for pickPair (they
+       end up in validImages and colorSignatures from the start) while
+       deferring the actual byte fetch to preparePanel's video path,
+       which runs only when a pair containing the video is selected.
+       The neutral signature means pair quality is slightly degraded
+       for video-containing pairs, but the gallery feels lazy-on-demand
+       rather than waiting for tens of megabytes of MP4s up front. */
+    for (const videoSrc of videoIndices.map(videoNumToSrc)) {
+      if (!validImages.includes(videoSrc)) validImages.push(videoSrc);
+      if (!colorSignatures.has(videoSrc)) colorSignatures.set(videoSrc, fallbackSignature());
+    }
+
+    /* Update the static subtitle to the real pair count if discovery
+       reveals a different total than the HTML's placeholder "200". */
+    const unorderedPairs = totalCount * (totalCount - 1) / 2;
+    const realTotal      = Math.min(TOP_PAIRS_POOL, unorderedPairs) * 2;
+    if (realTotal !== target) {
+      target = realTotal;
+      subtitleEl.textContent = `${target} Random Diptychs`;
+    }
+
+    /* Hash-driven entry loads JUST the deep-linked pair (which may
+       include a video) and dismisses the splash immediately — the
+       linked diptych is the whole point of that URL and shouldn't
+       wait on the full image catalogue. The 0→100 progress animation
+       only runs in the no-hash branch below. */
+    const hashMatch = location.hash.match(/^#(v?\d+),(v?\d+)$/);
+
+    if (hashMatch && hashMatch[1] !== hashMatch[2]) {
+      const firstPair = [idToSrc(hashMatch[1]), idToSrc(hashMatch[2])];
+      const results = await Promise.all(firstPair.map(loadOne));
+      if (!results.every(Boolean)) {
+        /* Hash points to a missing/corrupt item — walk until 2 valid. */
+        for (const src of images) {
+          if (validImages.length >= 2) break;
+          if (!validImages.includes(src)) await loadOne(src);
+        }
+      }
+      if (validImages.length < 2) {
+        subtitleEl.textContent = 'No media could be loaded.';
+        loadingEl.textContent  = '';
+        return;
+      }
+      /* Background-fill the rest of the IMAGES (videos stay lazy). */
+      Promise.all(
+        imageIndices.map(numToSrc)
+          .filter(src => !validImages.includes(src))
+          .map(loadOne)
+      );
+      const startPair = firstPair.every(s => validImages.includes(s)) ? firstPair : null;
+      finishSplash();
+      /* Welcome on top, first pair decoding behind. Dismiss is gated
+         on interludePreload (see the .interlude click handler) so the
+         click that closes the card never beats the decode. */
+      showWelcome();
+      interludePreload = loadDiptych(startPair);
+      return;
+    }
+
+    /* No hash — preload every image at the device's display variant
+       size, animate the "Loading… X%" counter, and dismiss when the
+       displayed number hits 100. */
+    imageSrcs = imageIndices.map(numToSrc);
+    /* Count ATTEMPTS (success or failure), not just successful loads.
+       loadOne resolves either way — success pushes to validImages,
+       failure quietly returns false — and counting both means a 404
+       on one image doesn't permanently strand the percentage at 99
+       waiting for a load that will never happen. Stragglers that
+       genuinely complete after this counter ticks are still added
+       to validImages and become available for selection normally. */
+    let imageLoadsAttempted = 0;
+    imageSrcs.forEach(src => {
+      loadOne(src).finally(() => { imageLoadsAttempted++; });
+    });
+
+    /* Smooth progress animation. displayPct chases an "effective"
+       load fraction that snaps to 100 once real progress is within a
+       hair of complete — that absorbs the last 1-2 stragglers without
+       holding the splash, and any that's picked for the first pair
+       before it's actually ready will fall through preparePanel's
+       decode-timeout safety net. The rate cap keeps the climb legible
+       even on a warm cache where every image is already in memory.
+
+       The dt cap (100ms) is a guard against the browser deferring rAF
+       during a tab switch — without it, the first frame after returning
+       focus would advance displayPct by the full elapsed delta and look
+       like a jump. */
+    let displayPct = 0;
+    let lastTickMs = performance.now();
+
+    await new Promise(resolve => {
+      const tick = () => {
+        if (splashFinished) { resolve(); return; }
+
+        const now = performance.now();
+        const dt  = Math.min(0.1, (now - lastTickMs) / 1000);
+        lastTickMs = now;
+
+        const total           = imageSrcs.length;
+        const actualPct       = total > 0 ? (imageLoadsAttempted / total) * 100 : 0;
+        const effectiveActual = actualPct >= 99 ? 100 : actualPct;
+
+        if (effectiveActual > displayPct) {
+          displayPct = Math.min(effectiveActual, displayPct + PROGRESS_RATE_PER_SEC * dt);
+        }
+
+        /* Only show "X%" once the counter has actually started moving.
+           Frozen "Loading… 0%" during the initial discovery phase reads
+           as a stuck splash on warm-cache visits — the hardcoded HTML
+           value sits there for ~100-500ms while discoverImages probes,
+           then jumps from 0 to 1 to 2 …. Showing plain "Loading…" until
+           there's real progress to display avoids that. */
+        const shown = Math.floor(displayPct);
+        loadingEl.textContent = shown > 0 ? `Loading… ${shown}%` : 'Loading…';
+
+        if (displayPct >= 100) {
+          loadingEl.textContent = 'Loading… 100%';
+          resolve();
+        } else {
+          requestAnimationFrame(tick);
+        }
+      };
+      requestAnimationFrame(tick);
+    });
+
+    if (validImages.length < 2) {
+      subtitleEl.textContent = 'No media could be loaded.';
+      loadingEl.textContent  = '';
+      return;
+    }
+
+    /* Loading complete (or safety-capped). Trigger the fade now so the
+       gallery transition begins immediately, before computeTopPairs
+       and pickPair do their work — those run in milliseconds and
+       finish well within the 1.8s fade. */
+    finishSplash();
+
+    /* scheduleTopPairs is rAF-debounced, so the latest analyses may
+       not yet be reflected. Force a sync compute before picking. */
+    computeTopPairs();
+
+    /* Same selection logic as every other click — bias toward
+       top-scoring pairs, with the per-image guarantee mixing in.
+       recent[] is empty on first paint, so no filtering to dodge. */
+    const firstPair = pickPair(validImages);
+    /* Welcome on top, first pair decoding behind. Dismiss is gated
+       on interludePreload (see the .interlude click handler) so the
+       click that closes the card never beats the decode. */
+    showWelcome();
+    interludePreload = loadDiptych(firstPair);
+  })();
+
+  /* ─────────────────────────────────────────────────────────────────────────
+     CLICK / TAP HANDLING
+     ───────────────────────────────────────────────────────────────────────── */
+
+  /* In-flight guard for loadDiptych. Without this, a click landing while
+     a previous load is still awaiting img.decode would overwrite the
+     in-flight image's src and call history.replaceState twice with
+     potentially mismatched pairs — observable as flicker or a hash that
+     disagrees with what's painted. */
+  let loadingDiptych = false;
+
+  /* Shared advance step — used by both the diptych click handler and
+     the keyboard nav listener. Same in-flight guard, same interlude
+     gating logic; defining it once keeps the two input paths in sync. */
+  async function advance() {
+    if (loadingDiptych) return;
+    clickCount++;
+    if (CONTACT_EVERY > 0 && clickCount % CONTACT_EVERY === 0) {
+      showInterlude();
+    } else {
+      loadingDiptych = true;
+      try { await loadDiptych(); } finally { loadingDiptych = false; }
+    }
+  }
+
+  document.getElementById('diptych').addEventListener('click', () => {
+    if (matchMedia('(hover: none) and (orientation: landscape)').matches
+        && !document.fullscreenElement
+        && document.documentElement.requestFullscreen) {
+      document.documentElement.requestFullscreen().catch(() => {});
+    }
+    advance();
+  });
+
+  /* ─────────────────────────────────────────────────────────────────────────
+     KEYBOARD NAVIGATION
+
+     Space / Enter / Right-arrow advance the diptych or dismiss whatever
+     overlay is currently on top; Escape dismisses overlays only. The
+     handler is delegated to document so it works regardless of focus,
+     but it bails when the user is typing in an input or holding a
+     modifier (so Ctrl+R, Cmd+L and friends still work as expected).
+
+     Priority order matches z-index: splash → privacy → interlude →
+     diptych. Whichever is currently visible consumes the key.
+     ───────────────────────────────────────────────────────────────────────── */
+
+  document.addEventListener('keydown', async (e) => {
+    const t = e.target;
+    if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+
+    const isAdvance = (e.key === ' ' || e.key === 'Enter' || e.key === 'ArrowRight');
+    const isEscape  = (e.key === 'Escape');
+    if (!isAdvance && !isEscape) return;
+
+    /* Splash still on screen — absorb the keypress so it doesn't leak
+       through to the diptych underneath, but DO NOT dismiss. The splash
+       has no skip path anymore; it dismisses on loading completion or
+       the SPLASH_MAX_WAIT_MS safety cap. Re-querying the element rather
+       than capturing once at script parse: finishSplash removes it from
+       the DOM after the fade, so a stale reference would never read as
+       "not hidden" again. */
+    const splashEl = document.getElementById('splash');
+    if (splashEl && !splashEl.classList.contains('hidden')) {
+      e.preventDefault();
+      return;
+    }
+
+    /* Privacy modal — Escape only; the Accept/Decline buttons handle
+       their own keyboard activation since they're focusable. */
+    if (privacyEl && privacyEl.classList.contains('visible')) {
+      if (isEscape) { e.preventDefault(); hidePrivacy(); }
+      return;
+    }
+
+    /* Consent card — like the privacy slide, requires an explicit
+       Accept or Decline choice. Absorb the keypress so it doesn't
+       leak through to anything underneath, but don't dismiss. */
+    if (currentInterlude && currentInterlude.id === 'consent') {
+      e.preventDefault();
+      return;
+    }
+
+    /* Interlude visible — any handled key dismisses, mirroring the
+       click-anywhere-to-dismiss behavior. Await the preloaded next
+       pair so the photo behind is ready when the card fades out.
+
+       Welcome → analytics chain mirrors the click handler: if the
+       welcome is on screen and consent is still needed, dismiss the
+       welcome and bring up the consent card instead of awaiting the
+       preload and revealing the diptych. */
+    if (currentInterlude) {
+      e.preventDefault();
+      if (currentInterlude.id === 'welcome' && consentEl && consentEl.isConnected) {
+        hideInterlude();
+        showAnalytics();
+        return;
+      }
+      if (interludePreload) await interludePreload;
+      hideInterlude();
+      return;
+    }
+
+    /* Diptych on screen — advance on advance keys; Escape is a no-op
+       (there's nothing to dismiss). */
+    if (isAdvance) {
+      e.preventDefault();
+      advance();
+    }
+  });
+
+  /* ─────────────────────────────────────────────────────────────────────────
+     ANALYTICS CONSENT GATE
+
+     Originally a bottom banner; now a centered interlude-style card
+     that's shown after the welcome dismisses (only when consent
+     isn't yet stored). Flow:
+
+       splash → welcome → [consent? if needed] → diptych
+
+     The welcome's click handler (above) chains into showAnalytics
+     when consent is still needed. Once the user picks Accept or
+     Decline (either on the consent card directly, or via the
+     privacy slide reached via "Why?"), the choice is saved and the
+     card dismisses — awaiting the first-diptych preload first so
+     the reveal lands on a ready image rather than a blank panel.
+     ───────────────────────────────────────────────────────────────────────── */
+
+  const GA_ID       = 'G-J2Q38DS42K';
+  const CONSENT_KEY = 'ff-analytics-consent';
+  const consentEl   = document.getElementById('consent');
+  const privacyEl   = document.getElementById('privacy');
+
+  function loadAnalytics() {
+    if (window.gaEnabled) return;
+    window.gaEnabled = true;
+    const s = document.createElement('script');
+    s.async = true;
+    s.src   = `https://www.googletagmanager.com/gtag/js?id=${GA_ID}`;
+    document.head.appendChild(s);
+    window.dataLayer = window.dataLayer || [];
+    window.gtag = function () { dataLayer.push(arguments); };
+    gtag('js', new Date());
+    gtag('config', GA_ID, { anonymize_ip: true });
+  }
+
+  /* Show the consent card as an interlude. Called by the welcome's
+     click handler when consent is still needed. Sets currentInterlude
+     so hideInterlude could dismiss it (though we don't use the
+     generic dismiss path for consent — see the click handler's early
+     return on el.id === 'consent'). The single-use removal of the
+     element from the DOM happens in dismissConsent after the fade. */
+  function showAnalytics() {
+    if (!consentEl) return;
+    currentInterlude = consentEl;
+    consentEl.classList.add('visible');
+    consentEl.setAttribute('aria-hidden', 'false');
+  }
+
+  /* Synchronous dismissal — fade out + DOM removal after the fade.
+     Callers await interludePreload BEFORE calling this so the diptych
+     is decoded and ready when the card disappears. The timeout (1s)
+     comfortably covers the .interlude fade-out (0.85s) plus a small
+     buffer; once removed, the gate's element references become stale
+     but no further code reads them. */
+  function dismissConsent() {
+    if (!consentEl) return;
+    /* Lift the initial gate BEFORE starting the consent fade-out. The
+       diptych becomes visibility:visible immediately, but is still
+       covered by the consent card at opacity 1; as the card fades, the
+       diptych is revealed smoothly underneath. Lifting AFTER the fade
+       would mean the diptych pops in at the moment the card finishes
+       disappearing — visible discontinuity. */
+    liftGate();
+    consentEl.classList.remove('visible');
+    consentEl.setAttribute('aria-hidden', 'true');
+    if (currentInterlude === consentEl) currentInterlude = null;
+    setTimeout(() => consentEl.remove(), 1000);
+  }
+
+  function showPrivacy() {
+    privacyEl.classList.add('visible');
+    privacyEl.setAttribute('aria-hidden', 'false');
+  }
+  function hidePrivacy() {
+    privacyEl.classList.remove('visible');
+    privacyEl.setAttribute('aria-hidden', 'true');
+  }
+
+  const stored = (() => { try { return localStorage.getItem(CONSENT_KEY); } catch { return null; } })();
+  if (stored === 'granted') {
+    loadAnalytics();
+    consentEl.remove();
+    privacyEl.remove();
+  } else if (stored === 'denied') {
+    consentEl.remove();
+    privacyEl.remove();
+  } else {
+    /* No stored decision — consent card stays in the DOM, hidden
+       (opacity:0 via .interlude default), and will be revealed by
+       showAnalytics() after the welcome dismisses. Handlers below
+       wait for the first-pair preload before dismissing so the
+       diptych reveal lands cleanly. */
+    document.getElementById('consent-accept').addEventListener('click', async (e) => {
+      e.stopPropagation();
+      try { localStorage.setItem(CONSENT_KEY, 'granted'); } catch {}
+      loadAnalytics();
+      if (interludePreload) await interludePreload;
+      dismissConsent();
+    });
+    document.getElementById('consent-decline').addEventListener('click', async (e) => {
+      e.stopPropagation();
+      try { localStorage.setItem(CONSENT_KEY, 'denied'); } catch {}
+      if (interludePreload) await interludePreload;
+      dismissConsent();
+    });
+    document.getElementById('consent-why').addEventListener('click', (e) => {
+      e.stopPropagation();
+      showPrivacy();
+    });
+
+    /* Privacy slide — clicking outside the buttons dismisses back to
+       the consent card. The buttons themselves complete the consent
+       flow (both the privacy slide and the consent card go away). */
+    privacyEl.addEventListener('click', (e) => {
+      if (e.target.closest('button')) return;
+      hidePrivacy();
+    });
+    document.getElementById('privacy-accept').addEventListener('click', async (e) => {
+      e.stopPropagation();
+      try { localStorage.setItem(CONSENT_KEY, 'granted'); } catch {}
+      loadAnalytics();
+      if (interludePreload) await interludePreload;
+      hidePrivacy();
+      dismissConsent();
+    });
+    document.getElementById('privacy-decline').addEventListener('click', async (e) => {
+      e.stopPropagation();
+      try { localStorage.setItem(CONSENT_KEY, 'denied'); } catch {}
+      if (interludePreload) await interludePreload;
+      hidePrivacy();
+      dismissConsent();
+    });
+  }
+</script>
+
+
+<script type="text/javascript" src="/unprotected/back_to_spaceship.js?hash=4975d460e508829e8fb64d3962bc44ad35f3a95a"></script>
+
+
+<script type="text/javascript" src="/unprotected/back_to_spaceship.js?hash=4975d460e508829e8fb64d3962bc44ad35f3a95a"></script>
+
+</body>
+</html>

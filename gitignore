@@ -1,0 +1,27 @@
+# Photos and videos — the work itself, not tracked in git.
+# The site discovers them by probing images/jpg/ff{N}.{ext} and videos/ff{N}.mp4
+# at runtime, so they live in these folders on your local machine and on the
+# deployed server, but never in this repo.
+images/
+videos/
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+desktop.ini
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*~
+
+# Node — only relevant if you ever run a build/tooling step, but harmless to keep.
+node_modules/
+.npm/
+
+# Logs and OS noise
+*.log
+.cache/
