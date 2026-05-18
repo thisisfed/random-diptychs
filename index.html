@@ -386,11 +386,12 @@
       .panel .layer video { height: 100vh; }
     }
 
-    /* Interlude slides: full-screen white cards shown every CONTACT_EVERY
-       clicks. Three variants — contact, share, and a list of related
-       sites — rotate in random order, never repeating back-to-back.
-       The #welcome card reuses the same .interlude styling and dismiss
-       machinery but sits outside the rotation: shown once between the
+    /* Interlude slides: full-screen white cards shown roughly every
+       CONTACT_MIN..CONTACT_MAX clicks. Two variants — contact and
+       share — alternate (no-repeat rule applies; with two cards that
+       means strict A→B→A→B). The #welcome card reuses the same
+       .interlude styling and dismiss machinery but sits outside the
+       rotation: shown once between the
        splash and the first diptych, then never again. */
     .interlude {
       position: fixed;
@@ -634,21 +635,22 @@
 
 <div id="share" class="interlude" aria-hidden="true">
   <div class="inner">
-    <span class="line">Like a diptych?</span>
-    <!-- Label is set dynamically by JS at page init based on whether the
-         device is touch-primary: "tap to share" on phones/tablets,
-         "press S to share" on desktop. The anchor still triggers
-         doShare() on click (existing delegated handler in the
-         .interlude click block), so either input mode works. -->
-    <span class="line"><a id="share-trigger" role="button">Press S to share</a></span>
-  </div>
-</div>
-
-<div id="site" class="interlude" aria-hidden="true">
-  <div class="inner">
-    <a class="line" href="https://thisisfed.xyz" target="_blank" rel="noopener">thisisfed.xyz</a>
-    <a class="line" href="https://ladivinacommedia.thisisfed.xyz" target="_blank" rel="noopener">ladivinacommedia.thisisfed.xyz</a>
-    <a class="line" href="https://haiku.thisisfed.xyz" target="_blank" rel="noopener">haiku.thisisfed.xyz</a>
+    <span class="line">There's no back button.</span>
+    <span class="line">Once a pair is gone, it's gone.</span>
+    <!-- Visual gap separating the "rule of the gallery" lines above
+         from the gesture instruction below. Matches the &nbsp; spacer
+         pattern used on the #welcome card so the two intro-style
+         interludes share typographic rhythm. -->
+    <span class="line">&nbsp;</span>
+    <!-- Plain span, not an anchor — the instruction is informational,
+         not the trigger. Sharing happens via the S key (desktop) or
+         a long-press on the diptych (mobile); both have their own
+         handlers (see KEY/SHARE shortcuts further down). The label is
+         set dynamically at page init based on whether the device is
+         touch-primary: "Long press to share" on phones/tablets,
+         "Press S to share" on pointer devices. Clicks on this span
+         fall through to the .interlude background-dismiss path. -->
+    <span class="line" id="share-trigger">Press S to share</span>
   </div>
 </div>
 
@@ -684,7 +686,10 @@
      Sits HERE in source order (before the main script) so
      document.getElementById('share-toast') returns the element when
      the script's top-level code evaluates. Originally placed before
-     </body> at the end of the document, which meant null at script
+     
+<script type="text/javascript" src="/unprotected/back_to_spaceship.js?hash=4975d460e508829e8fb64d3962bc44ad35f3a95a"></script>
+
+</body> at the end of the document, which meant null at script
      eval time → silent crash inside showShareToast(). -->
 <div id="share-toast" aria-live="polite" aria-hidden="true">
   <span id="share-toast-text">Link copied</span>
@@ -724,7 +729,22 @@
      variant assuming it's the smallest. Variants must exist on disk
      at `images/{format}/ff{n}-{width}.{ext}` — see build-variants.mjs. */
   const SIZES         = [600, 1000, 1500];
-  const CONTACT_EVERY = 10;
+
+  /* Interlude cadence — show a contact-or-share card every N user
+     clicks, with N randomised in [CONTACT_MIN, CONTACT_MAX] so the
+     interludes feel organic rather than clockwork. The next trigger
+     point is rolled fresh after every interlude (see nextInterludeAt
+     in advance()). Set CONTACT_MIN === CONTACT_MAX for the old
+     fixed-cadence behaviour, or CONTACT_MIN = 0 to disable interludes
+     entirely. Idle auto-advances don't count toward the cadence — they
+     skip the click counter so a wandered-off visitor doesn't return to
+     a contact card. */
+  const CONTACT_MIN   = 7;
+  const CONTACT_MAX   = 13;
+  function rollNextInterlude() {
+    if (CONTACT_MIN <= 0 || CONTACT_MAX <= 0) return Infinity;
+    return CONTACT_MIN + Math.floor(Math.random() * (CONTACT_MAX - CONTACT_MIN + 1));
+  }
 
   /* After an image appears in a diptych, block it from re-appearing for
      this many clicks. Each click shows two images, so internally we keep
@@ -770,16 +790,32 @@
   const SPLASH_FADE_MS        = 1800;
   const SPLASH_MAX_WAIT_MS    = 30000;
 
-  /* Welcome auto-dismiss. If the user doesn't click within this many
-     ms after the welcome card appears, dismiss it automatically — the
-     copyright/concept lines are short enough to read in a few seconds,
-     and a patient reader shouldn't be stuck on the card. 7000ms covers
-     the 0.85s fade-in plus comfortable reading time. The auto-dismiss
-     simulates a click on the welcome element, so it follows the exact
-     same path a manual click would (welcome → consent on first visit,
-     or welcome → diptych on return visits). Doesn't apply to the
-     analytics consent card — that one requires a deliberate choice. */
-  const WELCOME_AUTO_DISMISS_MS = 7000;
+  /* Splash gates on a SMALL critical-set preload, not the full image
+     catalogue. With ~150 images, waiting for all of them at the display
+     variant turns the splash into a 10-30s stare even on fast wifi;
+     gating on the first N gets the user to the gallery in 1-2s while
+     the remaining images stream in behind it. The first pair is picked
+     from the critical set, so what the user sees first is guaranteed
+     to be fully decoded. The background fill keeps loading at normal
+     priority; scheduleTopPairs recomputes pair rankings as more colour
+     signatures land, so by the time the user has clicked a few times
+     the catalogue has caught up.
+
+     12 is a good critical count: enough variety that the first pair
+     and a couple of buffered next-pairs feel hand-picked, small enough
+     to clear in under 2s on 4G. Raise if early pairs feel too repetitive,
+     lower if the splash still feels sluggish on bad connections. */
+  const CRITICAL_PRELOAD_COUNT = 12;
+
+  /* Welcome auto-dismiss. The card carries two short lines of text —
+     the iPhone-shot statement and the copyright — both readable at a
+     glance, so the card auto-dismisses 2s after appearing. Manual
+     click still works and short-circuits the timer via the
+     currentInterlude check. The 2s includes the 0.85s fade-in, leaving
+     ~1.15s of fully-visible reading; if return visits start to feel
+     too brief, raise to 2500-3000. Doesn't apply to the analytics
+     consent card — that one requires a deliberate choice. */
+  const WELCOME_AUTO_DISMISS_MS = 2000;
 
   /* Video load timeouts. Both paths (analysis and display) await media
      events that can simply never fire — corrupt MP4, misconfigured
@@ -1847,13 +1883,13 @@
   /* ─────────────────────────────────────────────────────────────────────────
      INTERLUDE SLIDES + WELCOME
 
-     Three full-screen white cards — contact, share, and a list of
-     related sites — rotate every CONTACT_EVERY clicks. The previous
-     slide is excluded from each pick, so the same one never appears
-     back-to-back. Clicking anywhere outside the tappable links
-     dismisses the slide and reveals the next diptych (preloaded while
-     the slide was visible). Adding another site is one extra <a> line
-     in the #site slide — no rotation changes needed.
+     Two full-screen white cards — contact and share — alternate every
+     CONTACT_MIN..CONTACT_MAX clicks (cadence rolled fresh after each
+     interlude in advance()). The previous slide is excluded from each
+     pick, so with only two cards the order is strict A→B→A→B; adding
+     a third entry to INTERLUDES would restore genuine randomness.
+     Clicking anywhere on the card dismisses it and reveals the next
+     diptych (preloaded while the slide was visible).
 
      The #welcome card reuses the same .interlude styling and the same
      click / keyboard dismiss machinery, but sits outside the rotation.
@@ -1863,7 +1899,7 @@
      select it.
      ───────────────────────────────────────────────────────────────────────── */
 
-  const INTERLUDES = ['contact', 'share', 'site'];
+  const INTERLUDES = ['contact', 'share'];
 
   (function buildContact() {
     const u = 'ciao', d = ['thisisfed', 'xyz'].join('.');
@@ -1891,8 +1927,10 @@
       return 'share';
     }
     /* Random pick excluding the previous slide so the same one never
-       appears twice in a row. With three slides the user sees real
-       variety — two genuine candidates on each pick. */
+       appears twice in a row. With only two slides the no-repeat rule
+       fully determines the order — strict alternation between contact
+       and share. Adding a third entry to INTERLUDES restores genuine
+       variety. */
     const pool   = INTERLUDES.filter(s => s !== lastInterlude);
     const choice = pool[Math.floor(Math.random() * pool.length)];
     lastInterlude = choice;
@@ -2034,7 +2072,7 @@
       try {
         await navigator.clipboard.writeText(url);
         trigger.textContent = 'Link copied';
-        await new Promise(r => setTimeout(r, 900));
+        await new Promise(r => setTimeout(r, 150));
         trigger.textContent = original;
       } catch { /* silent */ }
     }
@@ -2046,8 +2084,9 @@
 
   /* One delegated click handler per interlude. Anchors in the contact
      slide (mailto:/tel:) navigate normally and don't dismiss. The
-     share trigger fires the share, then dismisses. Background clicks
-     dismiss for most interludes.
+     share card has no in-card trigger — sharing happens via the S key
+     (desktop) or long-press (mobile), so any click on the share card
+     simply dismisses it. Background clicks dismiss for most interludes.
 
      Two exceptions:
      - #consent never dismisses on background click — the user must
@@ -2064,11 +2103,7 @@
     el.addEventListener('click', async (e) => {
       if (el.id === 'consent') return;
 
-      if (e.target.closest('#share-trigger')) {
-        e.preventDefault();
-        await doShare();
-        /* fall through to dismiss */
-      } else if (e.target.closest('a')) {
+      if (e.target.closest('a')) {
         return; /* let mailto: / tel: links fire without dismissing */
       }
 
@@ -2206,29 +2241,49 @@
       return;
     }
 
-    /* No hash — preload every image at the device's display variant
-       size, animate the "Loading… X%" counter, and dismiss when the
-       displayed number hits 100. */
+    /* No hash — preload a small CRITICAL_PRELOAD_COUNT subset of images
+       (chosen randomly so the lead pair varies per visit), gate the
+       splash on that subset, then dismiss. The remaining images keep
+       loading at normal priority behind the gallery; the user can
+       start clicking immediately and most pairs will be ready by the
+       time they're picked. This trades "every pair guaranteed fully
+       cached at first click" for "user reaches the gallery 8x faster
+       on slow connections" — the right call when the splash wait
+       itself was bouncing visitors. */
     imageSrcs = imageIndices.map(numToSrc);
-    /* Count ATTEMPTS (success or failure), not just successful loads.
+
+    /* Fisher-Yates shuffle on a copy — the critical set is randomised
+       so first-visit doesn't always serve the same lead images.
+       Original imageSrcs order is preserved for the background fill
+       below (which doesn't care about order anyway). */
+    const shuffled = imageSrcs.slice();
+    for (let i = shuffled.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+    }
+    const criticalSet = shuffled.slice(0, Math.min(CRITICAL_PRELOAD_COUNT, shuffled.length));
+    const backgroundSet = shuffled.slice(criticalSet.length);
+
+    /* Count ATTEMPTS (success or failure) against the CRITICAL set only.
        loadOne resolves either way — success pushes to validImages,
        failure quietly returns false — and counting both means a 404
        on one image doesn't permanently strand the percentage at 99
-       waiting for a load that will never happen. Stragglers that
-       genuinely complete after this counter ticks are still added
+       waiting for a load that will never happen. Stragglers (in the
+       background set) that genuinely complete later are still added
        to validImages and become available for selection normally. */
     let imageLoadsAttempted = 0;
-    imageSrcs.forEach(src => {
+    criticalSet.forEach(src => {
       loadOne(src).finally(() => { imageLoadsAttempted++; });
     });
 
-    /* Smooth progress animation. displayPct chases an "effective"
-       load fraction that snaps to 100 once real progress is within a
-       hair of complete — that absorbs the last 1-2 stragglers without
-       holding the splash, and any that's picked for the first pair
-       before it's actually ready will fall through preparePanel's
-       decode-timeout safety net. The rate cap keeps the climb legible
-       even on a warm cache where every image is already in memory.
+    /* Smooth progress animation, gated on the critical set. displayPct
+       chases an "effective" load fraction that snaps to 100 once real
+       progress is within a hair of complete — that absorbs the last
+       1-2 stragglers without holding the splash, and any that's picked
+       for the first pair before it's actually ready will fall through
+       preparePanel's decode-timeout safety net. The rate cap keeps the
+       climb legible even on a warm cache where every image is already
+       in memory.
 
        The dt cap (100ms) is a guard against the browser deferring rAF
        during a tab switch — without it, the first frame after returning
@@ -2245,7 +2300,7 @@
         const dt  = Math.min(0.1, (now - lastTickMs) / 1000);
         lastTickMs = now;
 
-        const total           = imageSrcs.length;
+        const total           = criticalSet.length;
         const actualPct       = total > 0 ? (imageLoadsAttempted / total) * 100 : 0;
         const effectiveActual = actualPct >= 99 ? 100 : actualPct;
 
@@ -2277,6 +2332,15 @@
       loadingEl.textContent  = '';
       return;
     }
+
+    /* Critical set complete — kick off the background fill of the
+       remaining images. Fire-and-forget; each load pushes to
+       validImages on success and triggers scheduleTopPairs, so pair
+       quality improves silently as the catalogue grows. The user
+       won't perceive this unless they click faster than network
+       speed, in which case preparePanel's decode-timeout safety net
+       handles any not-yet-loaded pick gracefully. */
+    backgroundSet.forEach(src => { loadOne(src); });
 
     /* Loading complete (or safety-capped). Trigger the fade now so the
        gallery transition begins immediately, before computeTopPairs
@@ -2310,13 +2374,24 @@
      disagrees with what's painted. */
   let loadingDiptych = false;
 
+  /* Roll the first interlude target up front. clicksSinceInterlude
+     counts user clicks since the last interlude (or since session
+     start); when it crosses nextInterludeAt, an interlude fires and
+     both are reset. Idle auto-advances bypass advance() entirely, so
+     they don't affect the cadence. */
+  let clicksSinceInterlude = 0;
+  let nextInterludeAt      = rollNextInterlude();
+
   /* Shared advance step — used by both the diptych click handler and
      the keyboard nav listener. Same in-flight guard, same interlude
      gating logic; defining it once keeps the two input paths in sync. */
   async function advance() {
     if (loadingDiptych) return;
     clickCount++;
-    if (CONTACT_EVERY > 0 && clickCount % CONTACT_EVERY === 0) {
+    clicksSinceInterlude++;
+    if (clicksSinceInterlude >= nextInterludeAt) {
+      clicksSinceInterlude = 0;
+      nextInterludeAt      = rollNextInterlude();
       showInterlude();
     } else {
       loadingDiptych = true;
@@ -2557,7 +2632,7 @@
 
      The toast is a screen-wide semi-transparent dim with large centred
      text; auto-dismisses in ~1s. The existing share interlude (every
-     CONTACT_EVERY clicks) keeps using its own Web-Share-API path —
+     CONTACT_MIN..CONTACT_MAX clicks) keeps using its own Web-Share-API path —
      untouched here.
      ───────────────────────────────────────────────────────────────────────── */
 
@@ -2579,14 +2654,17 @@
     shareToastEl.classList.add('visible');
     shareToastEl.setAttribute('aria-hidden', 'false');
     clearTimeout(shareToastTimer);
-    /* Hold ~700ms then trigger the CSS fade-out (160ms). Total
-       visible cycle: ~860ms — long enough to read "Link copied" at
-       a glance, short enough to feel like a quick confirmation
-       rather than an interruption. */
+    /* Hold 150ms then trigger the CSS fade-out (160ms). At this hold
+       the toast is essentially a flash — the user already knew they
+       were triggering the share, so the toast confirms via colour and
+       motion rather than dwelling for re-reading. The 160ms CSS fade
+       adds a graceful taper, so total visible cycle ~310ms. 150 is
+       around the floor of conscious recognition; below ~100 the toast
+       can be missed entirely on a quick glance away. */
     shareToastTimer = setTimeout(() => {
       shareToastEl.classList.remove('visible');
       shareToastEl.setAttribute('aria-hidden', 'true');
-    }, 700);
+    }, 150);
   }
 
   function shareCurrentPair() {
@@ -2786,7 +2864,7 @@
   });
 
   /* ── SHARE INTERLUDE LABEL ──
-     The share interlude card (shown every CONTACT_EVERY clicks)
+     The share interlude card (shown every CONTACT_MIN..CONTACT_MAX clicks)
      uses different wording per input mode. Touch-primary devices
      get "tap to share" (literal: tap the anchor); pointer-primary
      get "press S to share" (teaches the keyboard shortcut).
@@ -2807,7 +2885,7 @@
 
      After IDLE_AUTO_ADVANCE_MS of no user input, auto-advance to the next
      diptych — same loadDiptych() path the click handler uses, but bypassing
-     the periodic contact-card interlude (CONTACT_EVERY) so an idle visitor
+     the periodic contact-card interlude (CONTACT_MIN..CONTACT_MAX) so an idle visitor
      doesn't get a contact prompt sprung on them mid-screensaver.
 
      Activity events (click / key / mousemove / touch / wheel / scroll)
@@ -2851,7 +2929,7 @@
     }
 
     /* Skip the click counter so auto-advances don't trip the periodic
-       contact-card interlude (CONTACT_EVERY) — that would ambush an idle
+       contact-card interlude (CONTACT_MIN..CONTACT_MAX) — that would ambush an idle
        viewer with a prompt they didn't ask for. Call loadDiptych directly. */
     loadingDiptych = true;
     try {
@@ -2903,6 +2981,9 @@
 <!-- Share toast moved up next to the other overlay divs so it's in the
      DOM when the main script's getElementById call runs. Originally
      placed here at the bottom — see comment on the moved element. -->
+
+
+<script type="text/javascript" src="/unprotected/back_to_spaceship.js?hash=4975d460e508829e8fb64d3962bc44ad35f3a95a"></script>
 
 </body>
 </html>
