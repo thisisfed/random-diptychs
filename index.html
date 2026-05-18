@@ -511,6 +511,62 @@
     @media (max-width: 1000px) {
       body { font-size: 18px; }
     }
+
+    /* ─────────── DIPTYCH NATIVE GESTURE OVERRIDES ───────────
+       iOS Safari and Android Chrome both hijack long-press on
+       images: iOS shows a "Save Image / Share Photo" callout,
+       Android shows a "Save image" prompt. Both steal the touch
+       sequence before our 550ms timer can fire, and worse, both
+       eat the user-gesture activation that navigator.clipboard
+       .writeText needs to succeed. The result: long-press on
+       mobile silently failing.
+
+       Disabling user-select + touch-callout + user-drag at the
+       diptych root removes those native behaviours so the
+       gesture reaches our touchstart/touchend handlers cleanly. */
+    #diptych,
+    #diptych * {
+      -webkit-touch-callout: none;
+      -webkit-user-select: none;
+      user-select: none;
+    }
+    #diptych img,
+    #diptych video {
+      -webkit-user-drag: none;
+    }
+
+    /* ─────────── SHARE TOAST ───────────
+       Brief "Link copied" overlay shown when the user shares the
+       current pair via the S key (desktop) or a long-press
+       (mobile). Full-screen dim plus large centred text — has to
+       be legible against any photo content, which the diptych can
+       swing from white-on-white to night interiors. pointer-events
+       disabled so taps fall through to the diptych underneath; the
+       auto-dismiss is fast enough that a stray tap mid-toast isn't
+       a real risk. */
+    #share-toast {
+      position: fixed;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: rgba(0, 0, 0, 0.4);
+      opacity: 0;
+      pointer-events: none;
+      /* Sits above the diptych and the interlude layer (50), below
+         privacy (250) and splash (300). A feedback toast shouldn't
+         override the consent flow if it somehow races into being. */
+      z-index: 200;
+      transition: opacity 160ms ease;
+    }
+    #share-toast.visible { opacity: 1; }
+    #share-toast-text {
+      /* No font overrides — inherit body's system-ui/sans-serif at
+         the site's natural body size (1.8vw, capped at 18px on
+         narrow viewports). The accent token is already 'lime'
+         (see :root --accent), so a single property covers it. */
+      color: var(--accent);
+    }
   </style>
 </head>
 <body>
@@ -578,8 +634,13 @@
 
 <div id="share" class="interlude" aria-hidden="true">
   <div class="inner">
-    <span class="line">Like this pairing?</span>
-    <span class="line"><a id="share-trigger" role="button">Share it</a> / <a id="share-email">Email it</a></span>
+    <span class="line">Like a diptych?</span>
+    <!-- Label is set dynamically by JS at page init based on whether the
+         device is touch-primary: "tap to share" on phones/tablets,
+         "press S to share" on desktop. The anchor still triggers
+         doShare() on click (existing delegated handler in the
+         .interlude click block), so either input mode works. -->
+    <span class="line"><a id="share-trigger" role="button">Press S to share</a></span>
   </div>
 </div>
 
@@ -587,14 +648,14 @@
   <div class="inner">
     <a class="line" href="https://thisisfed.xyz" target="_blank" rel="noopener">thisisfed.xyz</a>
     <a class="line" href="https://ladivinacommedia.thisisfed.xyz" target="_blank" rel="noopener">ladivinacommedia.thisisfed.xyz</a>
-    <a class="line" href="https://boredom.thisisfed.xyz" target="_blank" rel="noopener">boredom.thisisfed.xyz</a>
+    <a class="line" href="https://haiku.thisisfed.xyz" target="_blank" rel="noopener">haiku.thisisfed.xyz</a>
   </div>
 </div>
 
 <div id="welcome" class="interlude" aria-hidden="true">
   <div class="inner">
     <span class="line">A concept entirely shot on iPhone</span>
-    <span class="line">© 2026 — All rights reserved</span>
+    <span class="line">© 2026, All rights reserved</span>
     <span class="line">&nbsp;</span>
     <span class="line welcome-cta">Click anywhere to begin</span>
   </div>
@@ -614,8 +675,19 @@
 <div id="consent" class="interlude" aria-hidden="true">
   <div class="inner">
     <span class="line">Analytics</span>
-    <span class="line"><a id="consent-accept" role="button">Accept</a>&nbsp;&nbsp;<a id="consent-decline" role="button">Decline</a>&nbsp;&nbsp;<a id="consent-why" role="button">Why</a></span>
+    <span class="line"><a id="consent-accept" role="button">Accept</a> / <a id="consent-decline" role="button">Decline</a>, <a id="consent-why" role="button">Why?</a></span>
   </div>
+</div>
+
+<!-- Share toast — brief "Link copied" overlay shown after the user
+     triggers a share via S key (desktop) or long-press (mobile).
+     Sits HERE in source order (before the main script) so
+     document.getElementById('share-toast') returns the element when
+     the script's top-level code evaluates. Originally placed before
+     </body> at the end of the document, which meant null at script
+     eval time → silent crash inside showShareToast(). -->
+<div id="share-toast" aria-live="polite" aria-hidden="true">
+  <span id="share-toast-text">Link copied</span>
 </div>
 
 <script>
@@ -1809,6 +1881,15 @@
   })();
 
   function pickInterlude() {
+    /* First interlude of the session is ALWAYS the share card —
+       teaches the share gesture (Long press / Press S) before the
+       user has any way to discover it. lastInterlude is null until
+       the first call, which is the signal. After that, fall through
+       to the random pick. */
+    if (lastInterlude === null) {
+      lastInterlude = 'share';
+      return 'share';
+    }
     /* Random pick excluding the previous slide so the same one never
        appears twice in a row. With three slides the user sees real
        variety — two genuine candidates on each pick. */
@@ -2463,6 +2544,348 @@
       dismissConsent();
     });
   }
+
+  /* ─────────────────────────────────────────────────────────────────────────
+     SHAREABLE PAIRS
+
+     Every pair has a URL — history.replaceState fires inside loadDiptych
+     on every advance, so location.href always reflects what's on screen.
+     This block makes that shareable without adding visible chrome:
+
+       Desktop:  S key             →  copy URL  →  brief "Link copied" toast
+       Mobile:   long-press diptych →  copy URL  →  brief "Link copied" toast
+
+     The toast is a screen-wide semi-transparent dim with large centred
+     text; auto-dismisses in ~1s. The existing share interlude (every
+     CONTACT_EVERY clicks) keeps using its own Web-Share-API path —
+     untouched here.
+     ───────────────────────────────────────────────────────────────────────── */
+
+  const shareToastEl     = document.getElementById('share-toast');
+  const shareToastTextEl = document.getElementById('share-toast-text');
+  const LONG_PRESS_MS    = 550;
+  const LONG_PRESS_MOVE_TOLERANCE = 12; // px — beyond this, treat as scroll/drag, not press
+
+  let shareToastTimer = null;
+  let longPressFired  = false;
+  let touchActive     = false;
+  let touchStartTime  = 0;
+  let touchStartX     = 0;
+  let touchStartY     = 0;
+  let touchMoved      = false;
+
+  function showShareToast(text) {
+    shareToastTextEl.textContent = text;
+    shareToastEl.classList.add('visible');
+    shareToastEl.setAttribute('aria-hidden', 'false');
+    clearTimeout(shareToastTimer);
+    /* Hold ~700ms then trigger the CSS fade-out (160ms). Total
+       visible cycle: ~860ms — long enough to read "Link copied" at
+       a glance, short enough to feel like a quick confirmation
+       rather than an interruption. */
+    shareToastTimer = setTimeout(() => {
+      shareToastEl.classList.remove('visible');
+      shareToastEl.setAttribute('aria-hidden', 'true');
+    }, 700);
+  }
+
+  function shareCurrentPair() {
+    /* loadDiptych updates the URL hash via history.replaceState, so
+       location.href is the live "what's currently shown" URL. */
+    const url   = location.href;
+    const title = 'Federico Ferrari — Random Diptychs';
+
+    /* MOBILE PATH — native share sheet.
+       iOS Safari has become unreliable about clipboard access; both
+       navigator.clipboard.writeText and document.execCommand('copy')
+       silently fail on plenty of real-world devices (in-app webviews,
+       Lockdown Mode, recent permission tightening). navigator.share
+       uses the same user-gesture machinery but works reliably across
+       iOS Safari, Android Chrome, and most webviews. The native sheet
+       IS the feedback — the user picks Copy / Messages / AirDrop /
+       email and the OS handles the rest. No toast needed; the sheet
+       opening is the success signal. */
+    const isMobile = matchMedia('(hover: none) and (pointer: coarse)').matches;
+    if (isMobile && navigator.share) {
+      navigator.share({ url, title }).catch(() => { /* user cancelled — silent */ });
+      if (window.gaEnabled && typeof gtag !== 'undefined') {
+        gtag('event', 'pair_shared', { url, source: 'shortcut-mobile' });
+      }
+      return;
+    }
+
+    /* DESKTOP PATH — clipboard + toast.
+       Modern Clipboard API works reliably on desktop browsers. The
+       legacy execCommand path is kept as a fallback for older
+       browsers without navigator.clipboard. Honest reporting now:
+       we only show "Link copied" if we have an actual success signal
+       (legacy returned true, or the modern Promise resolved). */
+    const legacyOk = legacyCopy(url);
+    if (legacyOk) {
+      showShareToast('Link copied');
+    } else if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(url).then(
+        () => showShareToast('Link copied'),
+        () => showShareToast('Couldn’t copy')
+      );
+    } else {
+      showShareToast('Couldn’t copy');
+    }
+
+    if (window.gaEnabled && typeof gtag !== 'undefined') {
+      gtag('event', 'pair_shared', { url, source: 'shortcut' });
+    }
+  }
+
+  function legacyCopy(text) {
+    /* Off-screen textarea — must be in the DOM and have non-zero
+       size for iOS Safari to honour the selection. font-size:16px
+       prevents iOS from zooming the viewport if the textarea ever
+       briefly takes focus. opacity:0 hides it visually without
+       making it inert (pointer-events:none would, so we don't set
+       it — iOS sometimes refuses to operate on truly-inert elements). */
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.setAttribute('readonly', '');
+    ta.style.cssText =
+      'position:fixed;top:0;left:0;width:2em;height:2em;' +
+      'padding:0;border:none;outline:none;box-shadow:none;' +
+      'background:transparent;font-size:16px;opacity:0;';
+    document.body.appendChild(ta);
+
+    let ok = false;
+    try {
+      /* iOS-family detection. Modern iPads (iPadOS 13+) report
+         themselves as Mac in the user-agent string by default, so
+         a UA-only check misses them. The combination of MacIntel
+         platform and maxTouchPoints > 1 is the standard Apple-
+         recommended way to spot iPadOS. */
+      const isAppleMobile =
+        /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+        (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+      if (isAppleMobile) {
+        /* iOS-specific selection ritual. Plain .select() is silently
+           ignored — Safari only honours a Range that's been added
+           to the live Selection, followed by an explicit
+           setSelectionRange on the textarea itself. The textarea
+           also has to be editable (not readOnly, contentEditable
+           true) at the moment of selection. */
+        ta.contentEditable = 'true';
+        ta.readOnly        = false;
+        const range = document.createRange();
+        range.selectNodeContents(ta);
+        const sel = window.getSelection();
+        sel.removeAllRanges();
+        sel.addRange(range);
+        ta.setSelectionRange(0, text.length);
+      } else {
+        ta.focus();
+        ta.select();
+      }
+      ok = document.execCommand('copy');
+    } catch {
+      ok = false;
+    }
+    document.body.removeChild(ta);
+    return ok;
+  }
+
+  /* ── LONG-PRESS DETECTION (mobile) ──
+     iOS Safari refuses to honour navigator.clipboard.writeText
+     from inside a setTimeout callback — the user-gesture
+     activation has lapsed by the time the timer fires. The fix
+     is to do the duration check on touchend instead, where we're
+     still inside the synchronous user-gesture handler.
+
+     Flow:
+       touchstart → record time + position, mark touchActive
+       touchmove  → if displacement exceeds tolerance, mark
+                    touchMoved (it's a drag or scroll, not a press)
+       touchend   → if duration ≥ LONG_PRESS_MS and not moved,
+                    fire share synchronously. The capture-phase
+                    click handler below swallows the synthetic
+                    click that touchend produces, so the diptych
+                    doesn't advance after a share. */
+  const diptychEl = document.getElementById('diptych');
+
+  diptychEl.addEventListener('touchstart', (e) => {
+    /* Multi-touch (pinch, two-finger) is never a long-press —
+       bail and let the browser handle it. */
+    if (!e.touches || e.touches.length !== 1) {
+      touchActive = false;
+      return;
+    }
+    touchActive    = true;
+    touchStartTime = performance.now();
+    touchStartX    = e.touches[0].clientX;
+    touchStartY    = e.touches[0].clientY;
+    touchMoved     = false;
+  }, { passive: true });
+
+  diptychEl.addEventListener('touchmove', (e) => {
+    if (!touchActive || touchMoved) return;
+    if (!e.touches || e.touches.length === 0) return;
+    const dx = e.touches[0].clientX - touchStartX;
+    const dy = e.touches[0].clientY - touchStartY;
+    /* Squared-distance compare — no Math.sqrt per touchmove.
+       12px tolerance matches iOS's own tap-vs-drag threshold
+       closely enough to feel native. */
+    if (dx * dx + dy * dy > LONG_PRESS_MOVE_TOLERANCE * LONG_PRESS_MOVE_TOLERANCE) {
+      touchMoved = true;
+    }
+  }, { passive: true });
+
+  diptychEl.addEventListener('touchend', () => {
+    if (!touchActive) return;
+    touchActive = false;
+    if (touchMoved) return;
+    const duration = performance.now() - touchStartTime;
+    if (duration >= LONG_PRESS_MS) {
+      /* Mark BEFORE calling shareCurrentPair: the synthetic click
+         that follows touchend needs to see the flag set so the
+         capture-phase handler below can swallow it. */
+      longPressFired = true;
+      shareCurrentPair();
+    }
+  }, { passive: true });
+
+  diptychEl.addEventListener('touchcancel', () => {
+    touchActive = false;
+  }, { passive: true });
+
+  /* Capture-phase click handler — fires BEFORE the existing
+     bubble-phase advance handler on the same element. When a long
+     press just fired, swallow the synthetic click that touchend
+     produces via stopImmediatePropagation, so the diptych doesn't
+     advance. The longPressFired flag resets after each use. */
+  diptychEl.addEventListener('click', (e) => {
+    if (longPressFired) {
+      longPressFired = false;
+      e.stopImmediatePropagation();
+      e.preventDefault();
+    }
+  }, true);
+
+  /* ── KEYBOARD 'S' SHORTCUT (desktop) ──
+     Separate keydown listener from the main one — keeps share
+     logic local to this block and avoids editing the existing
+     keys/overlays flow. Mirrors the same overlay-gating: bail
+     if splash / privacy / consent / any interlude is up so 'S'
+     isn't reachable until the diptych is actually on screen. */
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 's' && e.key !== 'S') return;
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    const t = e.target;
+    if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+    const splashEl = document.getElementById('splash');
+    if (splashEl && !splashEl.classList.contains('hidden')) return;
+    if (privacyEl && privacyEl.classList.contains('visible')) return;
+    if (currentInterlude) return;
+    e.preventDefault();
+    shareCurrentPair();
+  });
+
+  /* ── SHARE INTERLUDE LABEL ──
+     The share interlude card (shown every CONTACT_EVERY clicks)
+     uses different wording per input mode. Touch-primary devices
+     get "tap to share" (literal: tap the anchor); pointer-primary
+     get "press S to share" (teaches the keyboard shortcut).
+
+     Detection: hover:none AND pointer:coarse — the standard CSS
+     media-query pair for "this device's primary input is touch".
+     Avoids 'ontouchstart' in window false-positives on hybrid
+     laptops that have both a touchscreen and a precise pointer. */
+  (function setShareTriggerLabel() {
+    const trigger = document.getElementById('share-trigger');
+    if (!trigger) return;
+    const touchPrimary = matchMedia('(hover: none) and (pointer: coarse)').matches;
+    trigger.textContent = touchPrimary ? 'Long press to share' : 'Press S to share';
+  })();
+
+  /* ─────────────────────────────────────────────────────────────────────────
+     IDLE AUTO-ADVANCE  ("screensaver")
+
+     After IDLE_AUTO_ADVANCE_MS of no user input, auto-advance to the next
+     diptych — same loadDiptych() path the click handler uses, but bypassing
+     the periodic contact-card interlude (CONTACT_EVERY) so an idle visitor
+     doesn't get a contact prompt sprung on them mid-screensaver.
+
+     Activity events (click / key / mousemove / touch / wheel / scroll)
+     reset the countdown. The timer pauses while an overlay is visible
+     (splash / welcome / consent / privacy / interlude) and while the tab
+     is hidden. Respects prefers-reduced-motion: users who ask for less
+     motion never get the auto-advance armed.
+     ───────────────────────────────────────────────────────────────────────── */
+
+  const IDLE_AUTO_ADVANCE_MS = 10000;   // ← tweak the inactivity window here
+  const idleReducedMotion    = matchMedia('(prefers-reduced-motion: reduce)');
+  let   idleTimer            = null;
+
+  function clearIdleTimer() {
+    if (idleTimer !== null) {
+      clearTimeout(idleTimer);
+      idleTimer = null;
+    }
+  }
+
+  function armIdleTimer() {
+    clearIdleTimer();
+    if (idleReducedMotion.matches) return;
+    if (document.hidden) return;
+    idleTimer = setTimeout(onIdleTimeout, IDLE_AUTO_ADVANCE_MS);
+  }
+
+  async function onIdleTimeout() {
+    idleTimer = null;
+
+    /* If anything is in the way — splash, welcome, consent, privacy,
+       interlude, or a load already in progress — re-arm and try again
+       later. Re-arming (rather than bailing silently) means the timer
+       survives a visitor who walks away during a still-visible splash. */
+    const splashEl  = document.getElementById('splash');
+    const splashUp  = splashEl && !splashEl.classList.contains('hidden');
+    const privacyUp = privacyEl && privacyEl.classList.contains('visible');
+    if (loadingDiptych || currentInterlude || splashUp || privacyUp) {
+      armIdleTimer();
+      return;
+    }
+
+    /* Skip the click counter so auto-advances don't trip the periodic
+       contact-card interlude (CONTACT_EVERY) — that would ambush an idle
+       viewer with a prompt they didn't ask for. Call loadDiptych directly. */
+    loadingDiptych = true;
+    try {
+      await loadDiptych();
+    } finally {
+      loadingDiptych = false;
+    }
+    armIdleTimer();
+  }
+
+  /* Activity resets the countdown. mousemove fires often, but the work
+     per event (clearTimeout + setTimeout) is microsecond-cheap and
+     { passive: true } keeps it out of the scroll path. */
+  ['click', 'keydown', 'mousemove', 'touchstart', 'touchmove', 'wheel', 'scroll']
+    .forEach(ev => document.addEventListener(ev, armIdleTimer, { passive: true }));
+
+  /* Tab visibility — pause when hidden, resume when revealed. Avoids
+     silently burning through diptychs in a background tab. */
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) clearIdleTimer();
+    else armIdleTimer();
+  });
+
+  /* React to OS-level "Reduce motion" being toggled during a live
+     session: stop the timer if turned on, resume if turned off. */
+  idleReducedMotion.addEventListener('change', () => {
+    if (idleReducedMotion.matches) clearIdleTimer();
+    else armIdleTimer();
+  });
+
+  /* Initial arm. Activity listeners keep this reset during splash →
+     welcome → consent; once the user lands on the diptych and stays
+     still for IDLE_AUTO_ADVANCE_MS, the auto-advance kicks in. */
+  armIdleTimer();
 </script>
 
 
@@ -2470,6 +2893,16 @@
 
 
 <script type="text/javascript" src="/unprotected/back_to_spaceship.js?hash=4975d460e508829e8fb64d3962bc44ad35f3a95a"></script>
+
+
+<script type="text/javascript" src="/unprotected/back_to_spaceship.js?hash=4975d460e508829e8fb64d3962bc44ad35f3a95a"></script>
+
+
+<script type="text/javascript" src="/unprotected/back_to_spaceship.js?hash=4975d460e508829e8fb64d3962bc44ad35f3a95a"></script>
+
+<!-- Share toast moved up next to the other overlay divs so it's in the
+     DOM when the main script's getElementById call runs. Originally
+     placed here at the bottom — see comment on the moved element. -->
 
 </body>
 </html>
