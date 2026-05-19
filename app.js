@@ -76,6 +76,42 @@ const SIBLING_GROUPS = [
   ['97', '98'],
 ];
 
+/* Favorite images: get extra rotation priority. Their staleness is
+   multiplied by FAVORITE_BOOST inside the per-image guarantee branch,
+   so they cycle back more often than non-favorites would on the
+   algorithm's own judgement.
+
+   This is the right knob when the scorer "correctly" deprioritises
+   a photo you genuinely love — usually because it's hard to pair
+   (palette-narrow, very desaturated, very dark) and so its top-K
+   partners are mid-tier even though the photo itself is great. The
+   favorites mechanism doesn't override the scorer's choice of WHICH
+   partner to use; it just makes those favorite-led pairings come up
+   more often in rotation.
+
+   How it works in practice (rough math, ~100 image pool, GUARANTEE_RATE
+   at 0.45, FAVORITE_BOOST at 4):
+   - A non-favorite at average staleness gets ~1/100 of a guarantee
+     click, ≈ 0.45% of total clicks
+   - A favorite at the same staleness gets ~4/100 of a guarantee click,
+     ≈ 1.8% of total clicks — roughly one appearance every ~55 clicks
+   - So a favorite appears ~4× as often as it would unprompted
+
+   Boost only applies AFTER the recent-block window has cleared, so it
+   doesn't force back-to-back appearances. It's a long-term rotation
+   tilt, not a "show this next" override.
+
+   Format: bare image numbers as strings (e.g. '11', '14'). Videos are
+   not currently supported — let me know if you want that too. Use
+   sparingly — listing 30+ favorites cancels the effect since they all
+   compete with each other for the same boosted weight. */
+const FAVORITE_IMAGES = new Set([
+  '11',  '14',  '17',  '51',
+  '58',  '64',  '69',  '75',  '81',
+  '109', '112', '114', '117', '122', '124',
+]);
+const FAVORITE_BOOST  = 4.0;
+
 /* Splash timing.
 
    PROGRESS_RATE_PER_SEC caps how fast the "Loading… X%" counter can
@@ -1025,8 +1061,17 @@ function pickPair(arr, opts) {
          surface, then normalize. Note: a pair (A,B) may appear as
          a candidate twice (once with src=A, once with src=B) if
          it's in both images' top K. That's intentional — pairs
-         where both sides are stale get effectively doubled weight. */
-      const chosen     = weightedPick(gPool, c => staleness(c.src));
+         where both sides are stale get effectively doubled weight.
+
+         Favorites get their staleness multiplied by FAVORITE_BOOST,
+         so listed images cycle back more often once their recent-
+         block window has cleared. See FAVORITE_IMAGES near the top
+         of this file. */
+      const chosen = weightedPick(gPool, c => {
+        const base = staleness(c.src);
+        const num  = srcToNum(c.src);
+        return (num && FAVORITE_IMAGES.has(num)) ? base * FAVORITE_BOOST : base;
+      });
       const pair       = chosen.pair;
       const drewVideo  = isVideo(pair.a) || isVideo(pair.b);
       clicksSinceVideo = drewVideo ? 0 : clicksSinceVideo + 1;

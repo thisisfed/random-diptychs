@@ -43,6 +43,8 @@ Of the N×(N−1)/2 possible pairs, the top 250 are kept. Each click draws from 
 
 A per-image **guarantee branch** runs ~45% of clicks: instead of drawing from the global top-N, it picks a stale image (one not seen for a while) and pairs it with its highest-scoring partner. This keeps the rotation honest — an image with one popular partner doesn't get starved when the partner is in the recent-block window.
 
+**Favorites** override the algorithm's instincts for a small list of hand-picked photos. The scorer sometimes "correctly" deprioritises images that are hard to pair — palette-narrow, very desaturated, very dark — even when those are images the photographer genuinely loves. Adding an image number to `FAVORITE_IMAGES` boosts its staleness weight inside the guarantee branch by a configurable factor (default 4×), so it surfaces meaningfully more often without changing how partners are selected. It's a long-term rotation tilt, not a "show this next" override.
+
 ### Theme
 
 `html.night` is set **before first paint** by inline script in the `<head>`. Sunrise and sunset are computed from a longitude derived from the timezone offset (no geolocation prompt, no third-party call) and a latitude estimated from the IANA zone region. The theme re-evaluates every minute so the palette flips live at the threshold; gated behind `document.visibilityState === 'visible'` so a backgrounded tab is free.
@@ -116,6 +118,7 @@ All knobs live at the top of `app.js`. The defaults are tuned for ~150 images; a
 | `JOINT_FULL_PENALTY` / `JOINT_FULL_THRESHOLD` | `0.45` / `0.55` | Penalty for pairs where BOTH images are busy, and the density threshold above which "busy" starts. |
 | `JOINT_EMPTY_PENALTY` / `JOINT_EMPTY_THRESHOLD` | `0.30` / `0.35` | Penalty for pairs where BOTH images are near-empty, and the density threshold below which "empty" starts. |
 | `SIBLING_GROUPS` | `[['97','98']]` | Near-duplicate images that should block each other's slot in `recent`. |
+| `FAVORITE_IMAGES` / `FAVORITE_BOOST` | 15 image numbers / `4.0` | Image numbers to give extra rotation priority. Their staleness is multiplied by the boost inside the per-image guarantee branch, so they cycle back roughly `BOOST×` more often than non-favorites would on the algorithm's judgement alone. |
 | `PROGRESS_RATE_PER_SEC` | `60` | Max climb rate of the `Loading… X%` counter. |
 | `SPLASH_MAX_WAIT_MS` | `30000` | Safety cap; splash fades even if loading hasn't completed. |
 
