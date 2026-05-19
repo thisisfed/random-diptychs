@@ -19,8 +19,10 @@ A few decisions worth knowing about.
 Pairings aren't random. On first load every image is downsampled to a 128×128 canvas, then summarised by three signals:
 
 - a **7-bin lightness histogram** (tonal shape)
-- a **filtered 4-colour palette**, weighted, with desaturated and near-extreme tones excluded
+- a **filtered 4-colour palette**, weighted toward the centre of the frame (where the subject usually lives), with desaturated and near-extreme tones excluded
 - the image's **average saturation**
+
+Palette entries carry both HSL and OKLab coordinates. HSL drives the merge heuristic during palette construction and the hue-family detection in repetition catching (two reds are "the same family" even at different lightnesses). OKLab — a perceptually uniform colour space — drives the actual similarity scoring, since Euclidean distance in OKLab tracks how the eye reads colour difference. HSL gets this wrong in both directions: a soft pink and a deep red read as "close" because hue agrees, and two greys at different lightnesses read as "far" despite both being grey.
 
 `pairScore(a, b)` then rewards pairs with:
 
@@ -34,7 +36,7 @@ Pairings aren't random. On first load every image is downsampled to a 128×128 c
 - **blank-canvas repetition** — both images dominated by the same low-saturation tone (pale sky + grey wall)
 - **joint desaturation** — pair where neither side carries colour
 
-Of the N×(N−1)/2 possible pairs, the top 100 are kept. Each click draws from that pool with a quality bias (`Math.random() ** 2`), so the very best pairings dominate without ever showing the same one twice in close succession.
+Of the N×(N−1)/2 possible pairs, the top 250 are kept. Each click draws from that pool with a quality bias (`Math.random() ** 2`), so the very best pairings dominate without ever showing the same one twice in close succession.
 
 A per-image **guarantee branch** runs ~35% of clicks: instead of drawing from the global top-N, it picks a stale image (one not seen for a while) and pairs it with its highest-scoring partner. This keeps the rotation honest — an image with one popular partner doesn't get starved when the partner is in the recent-block window.
 
@@ -96,10 +98,10 @@ All knobs live at the top of `app.js`. The defaults are tuned for ~150 images; a
 
 | Const | Default | What it does |
 |---|---|---|
-| `TOP_PAIRS_POOL` | `300` | Best-N pairs eligible for selection. Hard floor on quality — pairs ranked worse never appear. For a pool of ~100 items, this is the top ~6% of all possible pairs and yields ~600 distinct diptychs. |
-| `RECENT_CLICKS_BLOCK` | `20` | An image can't reappear for this many clicks after being shown. |
+| `TOP_PAIRS_POOL` | `250` | Best-N pairs eligible for selection. Hard floor on quality — pairs ranked worse never appear. For a pool of ~100 items, this is the top ~5% of all possible pairs and yields 500 distinct diptychs. |
+| `RECENT_CLICKS_BLOCK` | `25` | An image can't reappear for this many clicks after being shown. With ~100 images, ~50 are locked at any time. |
 | `CONTACT_MIN` / `CONTACT_MAX` | `4` / `7` | Range for the random interlude cadence. |
-| `GUARANTEE_RATE` | `0.35` | Probability a click draws from the per-image staleness pool rather than the global top-N. |
+| `GUARANTEE_RATE` | `0.45` | Probability a click draws from the per-image staleness pool rather than the global top-N. ~1 in 2. |
 | `VIDEO_RATE` | `0.35` | Per-click probability of a video pair, once the minimum gap has elapsed. |
 | `VIDEO_MIN_GAP` | `1` | Photo-only clicks required between videos. |
 | `COLOR_SAMPLE_SIZE` | `128` | Side length of the downsampled analysis canvas. |
@@ -124,7 +126,7 @@ A handful of touchy things that get explicit defences in CSS or JS:
 - **iOS image long-press save callout** — blocked with `-webkit-touch-callout: none` on the diptych
 - **iOS muted-autoplay** — videos get `muted` + `playsinline` set both as attribute and JS property because iOS resets the property on `src` change
 - **iOS Safari background page suspension** — `img.decode()` is raced against a 5 s timeout so a screen-lock mid-load can't wedge the gallery permanently
-- **Mobile centerline misalignment** — `transform: translateZ(0)` on both `<img>` and `<video>` snaps them to the same GPU pixel grid
+- **iOS Safari `<video>` vs `<img>` alignment** — iOS gives video its own native composite layer, which rounds sub-pixel transforms differently from images. Vertical centering uses `top: 25vh` (resolved at layout, no transform) so both elements land on the same pixel row. iOS Safari also leaves a sub-pixel column of letterbox slack at the leading edge of `<video>` with `object-fit: contain`; the right-panel video is shifted 1px past the centerline so the slack lands inside the panel's `overflow: hidden` clip rather than on the centerline.
 
 ---
 

@@ -252,19 +252,18 @@ html.gated #diptych { visibility: hidden; }
 .panel .layer img,
 .panel .layer video {
   position: absolute;
-  top: 50%;
+  /* Was previously: top: 50%; transform: translateY(-50%) translateZ(0).
+     The transform produced a sub-pixel value (-25vh at most viewport
+     heights) that went through GPU composition. iOS Safari already
+     gives <video> its own native composite layer for playback, so
+     stacking translateZ on top sent it through a different rounding
+     path than <img> — the image landed on one device-pixel row, the
+     video on its neighbour, producing a 1px vertical misalignment
+     visible at the top and bottom of any mixed photo/video diptych.
+     `top: 25vh` is resolved at layout time and rounds to the same
+     device-pixel row for both element types. No transform needed. */
+  top: 25vh;
   left: 0;
-  /* translateZ(0) creates a GPU compositing layer, forcing the
-     element's rendering to snap to whole device pixels. Without
-     it, mobile browsers (iOS Safari most visibly) can resolve
-     <img> and <video> at slightly different subpixel positions
-     even with identical CSS — they go through different internal
-     rendering pipelines, and at 3x DPR with non-integer 50vw the
-     half-pixels round inconsistently. The visible symptom in a
-     mixed photo/video diptych is a hairline gap at the centerline
-     plus a hairline vertical offset on the video panel. Identical
-     CSS + identical GPU snap = identical pixel grid for both. */
-  transform: translateY(-50%) translateZ(0);
   width: 50vw;
   height: 50vh;
   object-fit: contain;
@@ -284,15 +283,41 @@ html.gated #diptych { visibility: hidden; }
   outline: 0;
   border-radius: 0;
   background: transparent;
+  vertical-align: top;
 }
 .panel.left  .layer img,
 .panel.left  .layer video { object-position: 100% 50%; }
 .panel.right .layer img,
 .panel.right .layer video { object-position: 0%   50%; }
 
+/* iOS Safari renders <video> with object-fit:contain via a slightly
+   different code path than <img>, producing a sub-pixel column of
+   letterbox slack at the element's LEADING edge — the side from
+   which content is positioned by object-position. For the LEFT panel
+   the leading edge (object-position 100% 50%) is the outer edge of
+   the viewport, where the slack is invisible. For the RIGHT panel
+   the leading edge (object-position 0% 50%) is the centerline, so
+   the slack lands as a visible 1px gap between the video and the
+   photo in the left panel. Fix: shift the right-panel video 1px
+   past the centerline and widen by 1px to compensate. The panel's
+   own overflow:hidden clips the 1px overshoot at its left boundary,
+   so the visible video content starts exactly at the centerline —
+   no gap. Images don't exhibit this slack, so the rule is video-only. */
+.panel.right .layer video {
+  left: -1px;
+  width: calc(50vw + 1px);
+}
+
 @media (orientation: landscape) and (max-height: 600px) {
   .panel .layer img,
-  .panel .layer video { height: 100vh; }
+  .panel .layer video {
+    /* Override the portrait-mode 25vh/50vh box: in landscape the
+       diptych fills the full panel height. Reset top to 0 too —
+       the base rule no longer uses translateY centring, so we have
+       to reset the explicit top:25vh that would otherwise apply. */
+    top: 0;
+    height: 100vh;
+  }
 }
 
 /* Interlude slides: full-screen white cards shown roughly every

@@ -51,12 +51,16 @@ function rollNextInterlude() {
 /* After an image appears in a diptych, block it from re-appearing for
    this many clicks. Each click shows two images, so internally we keep
    a buffer of the last 2 × RECENT_CLICKS_BLOCK image references. At
-   15, ~30 images stay off-limits at any time. Higher values stretch
-   out how often the same pair (or its swapped-orientation twin) can
-   re-appear, which matters when the pool is small and the quality-
-   bias concentrates picks at the top — without this, the top ~10
-   pairs cycle through fast and feel repetitive within a session. */
-const RECENT_CLICKS_BLOCK = 20;
+   25, ~50 images stay off-limits at any time (in a ~100-image pool).
+   Higher values stretch out how often the same pair (or its swapped-
+   orientation twin) can re-appear, which matters when the pool is
+   small and the quality-bias concentrates picks at the top — without
+   this, the top ~10 pairs cycle through fast and feel repetitive
+   within a session. Tuning: above ~30 with a ~100-image pool starts
+   starving the guarantee branch (too many of each image's top-K
+   partners get filtered out as "recent"); below ~15 the same pair
+   can recur within 30 seconds of casual tapping. */
+const RECENT_CLICKS_BLOCK = 25;
 
 /* Sibling groups — declare images that should be treated as the
    same image for recent-block purposes. When any image in a group
@@ -127,10 +131,11 @@ const DISCOVER_BATCH = 20;
    distinct diptychs. A hard floor: pairs ranked worse than N can
    never surface, no matter what the random roll does — so use this
    to set the worst-case quality you're willing to accept.
-   At 300, with ~100 items in the pool, that's the top ~6% of the
-   4950 possible pairs — strict enough that nothing weak surfaces,
-   loose enough to give long sessions genuine variety. */
-const TOP_PAIRS_POOL   = 300;
+   At 250, with ~100 items in the pool, that's the top ~5% of the
+   ~4950 possible pairs — strict enough that nothing weak surfaces,
+   loose enough to give long sessions genuine variety (500 distinct
+   diptychs). */
+const TOP_PAIRS_POOL   = 250;
 
 /* ─── RANKING WEIGHTS ───
    The ranker rewards two kinds of contrast that must BOTH be
@@ -185,11 +190,13 @@ const VIDEO_MIN_GAP = 1;
    dominate over those just shown — converting the guarantee from a
    coin flip into an active long-term rotation engine.
 
-   At 0.35, roughly 1 in 3 clicks rotates the catalogue while the
-   remaining ~2 in 3 follow the quality-biased top-300 selection.
+   At 0.45, roughly 1 in 2 clicks rotates the catalogue while the
+   remaining ~1 in 2 follow the quality-biased top-250 selection.
+   This keeps freshness high — most clicks bring back an under-shown
+   image — without entirely abandoning the global quality ranking.
    Higher values surface rare images faster at the cost of pulling
    more weight from the quality-ranked main pool. */
-const GUARANTEE_RATE = 0.35;
+const GUARANTEE_RATE = 0.45;
 
 /* Colour analysis. COLOR_SAMPLE_SIZE is the side length of the
    downsampled canvas each image is drawn to before histogram /
@@ -359,6 +366,45 @@ function rgbToHsl(r, g, b) {
   return { h: h * 60, s, l };
 }
 
+/* OKLab — a perceptually uniform colour space (Björn Ottosson, 2020).
+   Euclidean distance between two points in OKLab tracks how the eye
+   actually reads the difference between the two colours, unlike HSL
+   where a soft pink and a deep red can look "close" by hue but read
+   as unrelated, and two greys at different lightnesses can score as
+   "far" despite both being grey. This is what powers colorSimilarity,
+   so the precision of the entire pair score depends on it.
+
+   Pipeline: sRGB (0–255) → normalised → linearised (inverse gamma) →
+   LMS cone response matrix → cube-root non-linearity → OKLab matrix.
+   Constants are the canonical ones from the OKLab spec. Output L is
+   roughly [0, 1] (black to white); a is roughly [-0.4, +0.4] (green
+   to red); b is roughly [-0.4, +0.4] (blue to yellow). Maximum
+   Euclidean distance between sRGB-renderable points is ~1 (black/
+   white axis); typical "very different" photo colours sit at ~0.4. */
+function rgbToOklab(r, g, b) {
+  /* sRGB normalize + linearize (undo the gamma curve). */
+  const lin = c => {
+    c /= 255;
+    return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+  };
+  const lr = lin(r), lg = lin(g), lb = lin(b);
+
+  /* Linear-RGB → LMS cone responses. */
+  const l = 0.4122214708 * lr + 0.5363325363 * lg + 0.0514459929 * lb;
+  const m = 0.2119034982 * lr + 0.6806995451 * lg + 0.1073969566 * lb;
+  const s = 0.0883024619 * lr + 0.2817188376 * lg + 0.6299787005 * lb;
+
+  /* Cube-root for the perceptual non-linearity. */
+  const l_ = Math.cbrt(l), m_ = Math.cbrt(m), s_ = Math.cbrt(s);
+
+  /* LMS' → OKLab. */
+  return {
+    L: 0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_,
+    a: 1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_,
+    b: 0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_
+  };
+}
+
 /* Compositional density via lightness-histogram entropy. Returns
    [0, 1] — 0 = all pixels in one tonal bin (uniform / "empty"),
    1 = pixels perfectly spread across all bins ("full" / busy).
@@ -394,25 +440,52 @@ function analyzeImage(img) {
 
     const histogram = new Array(HIST_BINS).fill(0);
     const buckets   = new Map();
-    let pixels = 0, satSum = 0;
+    let totalWeight = 0, satWeighted = 0;
 
-    for (let i = 0; i < data.length; i += 4) {
+    /* Centre-weighting parameters. Subject of a photo is almost always
+       near the middle of the frame; edges carry background or peripheral
+       content. Giving centre pixels more vote in palette / histogram /
+       avgSat construction makes the colour signature better reflect
+       what the photo is *about*, not just what it has the most surface
+       area of. Linear ramp from CENTER_WEIGHT at the centre down to
+       1.0 at the corners, measured by max(|dx|, |dy|) — a square
+       gradient that matches the rectangular pixel grid (rounder L2
+       distance would over-penalise the corners). 1.6 was chosen as a
+       moderate setting: meaningfully changes pairing for portraits and
+       centred subjects without overpowering background colour when
+       that genuinely matters (e.g. wide landscapes, full-bleed
+       textures). Set to 1.0 to disable centre weighting entirely. */
+    const CENTER_WEIGHT = 1.6;
+    const half = N / 2;
+
+    for (let i = 0, px = 0; i < data.length; i += 4, px++) {
       const r = data[i], g = data[i + 1], b = data[i + 2];
-      pixels++;
+
+      /* Centre-weighted pixel vote. px = pixel index in row-major order;
+         x and y reconstructed from it. Distance from centre normalised
+         to [0, 1] via max-axis; weight = 1 at edges, CENTER_WEIGHT at
+         centre, linear between. */
+      const x = px % N;
+      const y = (px / N) | 0;
+      const dx = Math.abs(x - half) / half;
+      const dy = Math.abs(y - half) / half;
+      const distFromCenter = Math.max(dx, dy);                  // 0 = centre, 1 = edge
+      const w = 1 + (CENTER_WEIGHT - 1) * (1 - distFromCenter); // CENTER_WEIGHT → 1
+      totalWeight += w;
 
       const lum = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
-      histogram[Math.min(HIST_BINS - 1, Math.floor(lum * HIST_BINS))]++;
+      histogram[Math.min(HIST_BINS - 1, Math.floor(lum * HIST_BINS))] += w;
 
       const key = (r >> 3) << 10 | (g >> 3) << 5 | (b >> 3);
-      buckets.set(key, (buckets.get(key) || 0) + 1);
+      buckets.set(key, (buckets.get(key) || 0) + w);
 
       const mx = Math.max(r, g, b), mn = Math.min(r, g, b);
       const L = (mx + mn) / 510;
       const sat = mx === mn ? 0 : (L > 0.5 ? (mx - mn) / (510 - mx - mn) : (mx - mn) / (mx + mn));
-      satSum += sat;
+      satWeighted += sat * w;
     }
-    for (let i = 0; i < HIST_BINS; i++) histogram[i] /= pixels;
-    const avgSat = satSum / pixels;
+    for (let i = 0; i < HIST_BINS; i++) histogram[i] /= totalWeight;
+    const avgSat = satWeighted / totalWeight;
 
     const sorted  = [...buckets.entries()].sort((a, b) => b[1] - a[1]);
     const palette = [];
@@ -431,22 +504,41 @@ function analyzeImage(img) {
         let hueDiff = Math.abs(p.hsl.h - hsl.h);
         if (hueDiff > 180) hueDiff = 360 - hueDiff;
         if (hueDiff < 18 && Math.abs(p.hsl.l - hsl.l) < 0.12) {
-          p.weight += count / pixels;
+          p.weight += count / totalWeight;
           merged = true;
           break;
         }
       }
-      if (!merged) palette.push({ hsl, weight: count / pixels });
+      /* Each palette entry carries BOTH coordinate systems:
+         - hsl: used for the merge heuristic above and by
+           dominantRepetition's hue-family detection (hue distance is
+           the right idea there — two reds at different lightnesses
+           ARE related as a "red repetition", which is what we want
+           to catch).
+         - oklab: used by colorSimilarity in pair scoring, where
+           perceptual distance is what matters. */
+      if (!merged) palette.push({
+        hsl,
+        oklab: rgbToOklab(r, g, b),
+        weight: count / totalWeight,
+      });
     }
 
     if (palette.length === 0) {
-      let tr = 0, tg = 0, tb = 0;
+      /* Edge case: every dominant bucket was filtered out by the
+         too-dark / too-light / too-desaturated gate. Use the overall
+         mean colour as a last-resort palette of one — note this uses
+         simple pixel-count means (not centre-weighted) for robustness
+         since it's already a fallback path. */
+      let tr = 0, tg = 0, tb = 0, n = 0;
       for (let i = 0; i < data.length; i += 4) {
-        tr += data[i]; tg += data[i + 1]; tb += data[i + 2];
+        tr += data[i]; tg += data[i + 1]; tb += data[i + 2]; n++;
       }
+      const mr = tr / n, mg = tg / n, mb = tb / n;
       palette.push({
-        hsl: rgbToHsl(tr / pixels, tg / pixels, tb / pixels),
-        weight: 1
+        hsl:    rgbToHsl(mr, mg, mb),
+        oklab:  rgbToOklab(mr, mg, mb),
+        weight: 1,
       });
     }
     const wTotal = palette.reduce((s, p) => s + p.weight, 0);
@@ -469,19 +561,26 @@ function analyzeImage(img) {
   }
 }
 
-/* Pure similarity measure between two colours. 1 = effectively the same
-   colour, 0 = at opposite ends of the wheel. Hue contributes only when
-   both colours are saturated (greys have no meaningful hue); lightness
-   always contributes. */
+/* Pure similarity measure between two palette entries. 1 = effectively
+   the same colour, 0 = at opposite ends of the perceivable gamut.
+   Uses Euclidean distance in OKLab — a perceptually uniform space
+   where distance correlates with how the eye reads the difference.
+   This replaces the previous HSL hue/lightness mix, which gave
+   misleading scores in both directions (e.g. soft pink vs deep red
+   reading as close because hue agrees; two greys at different
+   lightnesses reading as far despite both being grey).
+
+   Normalisation: max practical distance between sRGB-renderable
+   points is ~1.0 (black to white axis). Typical "very different"
+   photo colours sit around 0.3–0.5. Clamping at 1.0 means similarity
+   = max(0, 1 - dist) maps the full sensible range to [0, 1] without
+   needing a custom curve. */
 function colorSimilarity(c1, c2) {
-  let hueDiff = Math.abs(c1.h - c2.h);
-  if (hueDiff > 180) hueDiff = 360 - hueDiff;
-
-  const satGate = Math.min(c1.s, c2.s);
-  const hueSim  = (1 - hueDiff / 180) * satGate;
-  const lightSim = 1 - Math.abs(c1.l - c2.l);
-
-  return hueSim * 0.6 + lightSim * 0.4;
+  const dL = c1.oklab.L - c2.oklab.L;
+  const da = c1.oklab.a - c2.oklab.a;
+  const db = c1.oklab.b - c2.oklab.b;
+  const dist = Math.sqrt(dL * dL + da * da + db * db);
+  return Math.max(0, 1 - dist);
 }
 
 /* Detects "blank canvas" repetition — both images are mostly dominated
@@ -584,7 +683,10 @@ function pairScore(a, b) {
     for (const cA of pA) {
       let best = 0;
       for (const cB of pB) {
-        const s = colorSimilarity(cA.hsl, cB.hsl);
+        /* Pass full palette entries so colorSimilarity can read the
+           oklab field. Was previously passing .hsl coordinates and
+           comparing in HSL — now perceptually uniform via OKLab. */
+        const s = colorSimilarity(cA, cB);
         if (s > best) best = s;
       }
       total += best * cA.weight;
@@ -877,10 +979,10 @@ function pickPair(arr, opts) {
   const poolSize  = Math.min(TOP_PAIRS_POOL, finalPool.length);
   /* Quality-biased pick: squaring Math.random() stretches the
      distribution toward 0 so the highest-scored pairs dominate.
-     With the current pool of 300, the top 10% (30 pairs) receives
+     With the current pool of 250, the top 10% (25 pairs) receives
      ~32% of picks and the bottom half receives ~29%. The hard
      floor on quality comes from TOP_PAIRS_POOL itself (no pair
-     ranked worse than 300 ever appears); this bias just shifts
+     ranked worse than 250 ever appears); this bias just shifts
      the rotation toward the very top within that pool. Bump to
      ** 3 for stronger top-emphasis, ** 1 for uniform. */
   const chosen    = finalPool[Math.floor(Math.random() ** 2 * poolSize)];
@@ -1083,7 +1185,15 @@ function fallbackSignature() {
   const histogram = new Array(HIST_BINS).fill(1 / HIST_BINS);
   return {
     histogram,
-    palette:   [{ hsl: { h: 0, s: 0, l: 0.5 }, weight: 1 }],
+    /* Mid-grey palette entry with both colour-space representations.
+       OKLab for rgb(128,128,128) is approximately (0.6, 0, 0) — a is
+       0 (no green-red tilt), b is 0 (no blue-yellow tilt), L sits in
+       the middle of the lightness range. Neutral against everything. */
+    palette:   [{
+      hsl:    { h: 0, s: 0, l: 0.5 },
+      oklab:  { L: 0.6, a: 0, b: 0 },
+      weight: 1,
+    }],
     avgSat:    0.3,
     density:   histogramDensity(histogram),
     histMag:   histogramMagnitude(histogram),
@@ -1381,7 +1491,7 @@ document.querySelectorAll('.interlude').forEach(el => {
   const subtitleEl = splashEl.querySelector('.subtitle');
   const loadingEl  = splashEl.querySelector('.loading');
 
-  let target            = 600;
+  let target            = 500;
   let imageSrcs         = null;
   let splashFinished    = false;
   let splashSafetyTimer = null;
@@ -1435,7 +1545,7 @@ document.querySelectorAll('.interlude').forEach(el => {
   }
 
   /* Update the static subtitle to the real pair count if discovery
-     reveals a different total than the HTML's placeholder "600". */
+     reveals a different total than the HTML's placeholder "500". */
   const unorderedPairs = totalCount * (totalCount - 1) / 2;
   const realTotal      = Math.min(TOP_PAIRS_POOL, unorderedPairs) * 2;
   if (realTotal !== target) {
