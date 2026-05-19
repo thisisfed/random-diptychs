@@ -71,6 +71,32 @@ h1 { font-size: inherit; font-weight: inherit; margin: 0; color: var(--fg); }
 a { color: var(--accent); text-decoration: none; }
 a:hover { color: var(--fg) !important; }
 
+/* Programmatic focus targets — every overlay's `.inner` is focused
+   by the JS focus-management code (captureFocus / restoreFocus) so
+   screen readers announce the overlay when it opens. They're only
+   reachable programmatically (tabindex="-1"), never by Tab, so the
+   default browser focus ring is just noise. Interactive children
+   inside the .inner blocks keep their own :focus-visible styling
+   untouched (see `.interlude a:focus-visible` below). */
+.inner:focus,
+.inner:focus-visible {
+  outline: none;
+  box-shadow: none;
+}
+
+/* Tap highlight — iOS Safari and Android Chrome paint a translucent
+   blue/grey rectangle over any tapped element by default. On every
+   gate card and on the diptych itself this reads as a flashing blue
+   border around the centred text (or around the photo) on every tap
+   to dismiss / advance. Killing it across all tappable surfaces
+   restores the "nothing but the photograph reacts" feel. */
+#splash, #splash *,
+.interlude, .interlude *,
+#privacy, #privacy *,
+#diptych, #diptych * {
+  -webkit-tap-highlight-color: transparent;
+}
+
 #diptych, .interlude, #privacy { cursor: pointer; }
 
 /* Initial gate. Hides the diptych from first paint until the last
@@ -175,11 +201,36 @@ html.gated #diptych { visibility: hidden; }
   position: absolute;
   top: 50%;
   left: 0;
-  transform: translateY(-50%);
+  /* translateZ(0) creates a GPU compositing layer, forcing the
+     element's rendering to snap to whole device pixels. Without
+     it, mobile browsers (iOS Safari most visibly) can resolve
+     <img> and <video> at slightly different subpixel positions
+     even with identical CSS — they go through different internal
+     rendering pipelines, and at 3x DPR with non-integer 50vw the
+     half-pixels round inconsistently. The visible symptom in a
+     mixed photo/video diptych is a hairline gap at the centerline
+     plus a hairline vertical offset on the video panel. Identical
+     CSS + identical GPU snap = identical pixel grid for both. */
+  transform: translateY(-50%) translateZ(0);
   width: 50vw;
   height: 50vh;
   object-fit: contain;
   display: block;
+}
+/* Reset UA-stylesheet contributions that apply to <video> but not
+   <img>. iOS Safari has historically applied subtle default styling
+   to video elements (background colour, micro border-radius, minute
+   internal padding) that doesn't apply to images. Zeroing these
+   ensures the video's rendering box matches the image's exactly, so
+   object-fit: contain resolves to the same pixel dimensions on both
+   element types and the centerline alignment holds. */
+.panel .layer video {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  outline: 0;
+  border-radius: 0;
+  background: transparent;
 }
 .panel.left  .layer img,
 .panel.left  .layer video { object-position: 100% 50%; }

@@ -40,9 +40,7 @@ const SIZES         = [600, 1000, 1500];
    encounters all three cards early in the session — each card is
    a single-use punctuation, not a recurring beat. Set CONTACT_MIN
    === CONTACT_MAX for the old fixed-cadence behaviour, or CONTACT_MIN
-   = 0 to disable interludes entirely. Idle auto-advances don't
-   count toward the cadence — they skip the click counter so a
-   wandered-off visitor doesn't return to a contact card. */
+   = 0 to disable interludes entirely. */
 const CONTACT_MIN   = 4;
 const CONTACT_MAX   = 7;
 function rollNextInterlude() {
@@ -224,7 +222,6 @@ let   clicksSinceVideo = Infinity;  // gap counter for VIDEO_MIN_GAP
 let   interludePreload = null;
 let   currentInterlude = null;
 let   lastInterlude    = null;
-let   pendingShareURL  = null;
 
 /* ─────────────────────────────────────────────────────────────────────────
    PATH HELPERS
@@ -254,7 +251,11 @@ function pickDisplayVariant() {
   const needed = (window.innerWidth * 0.5) * dpr;
   return SIZES.find(w => w >= needed) || SIZES[SIZES.length - 1];
 }
-function srcToNum(src) { const m = src && src.match(/ff(\d+)\.jpg$/i); return m ? m[1] : null; }
+/* Match canonical or variant URLs across any image format. Previously
+   this only matched `ff{n}.jpg`, which silently returned null for any
+   variant- or AVIF-suffixed path. Today every caller passes canonical
+   JPGs, but it was one future code path away from breaking quietly. */
+function srcToNum(src) { const m = src && src.match(/ff(\d+)(?:-\d+)?\.(?:jpg|avif|webp)$/i); return m ? m[1] : null; }
 function numToSrc(n)   { return `${IMAGES_BASE}/jpg/ff${n}.jpg`; }
 
 /* Video helpers. Videos live at `${VIDEO_BASE}/ff{n}.mp4` and share
@@ -292,14 +293,14 @@ for (const group of SIBLING_GROUPS) {
    IMAGE DISCOVERY
    ───────────────────────────────────────────────────────────────────────── */
 
-async function discoverImages() {
+async function discoverBy(urlFor) {
   const found = [];
   let start = 1;
   while (true) {
     const batch = Array.from({ length: DISCOVER_BATCH }, (_, i) => start + i);
     const results = await Promise.all(
       batch.map(n =>
-        fetch(`${IMAGES_BASE}/jpg/ff${n}.jpg`, { method: 'HEAD' })
+        fetch(urlFor(n), { method: 'HEAD' })
           .then(r => (r.ok ? n : null))
           .catch(() => null)
       )
@@ -320,7 +321,7 @@ async function discoverImages() {
        contiguous or have small isolated gaps. */
     if (present.length < batch.length) {
       const farN = start + DISCOVER_BATCH * 2;
-      const farExists = await fetch(`${IMAGES_BASE}/jpg/ff${farN}.jpg`, { method: 'HEAD' })
+      const farExists = await fetch(urlFor(farN), { method: 'HEAD' })
         .then(r => r.ok).catch(() => false);
       if (!farExists) break;
     }
@@ -330,37 +331,8 @@ async function discoverImages() {
   return found.sort((a, b) => a - b);
 }
 
-/* Parallel discovery for videos under VIDEO_BASE. Same batched HEAD
-   probing as images — silently returns an empty list if the folder
-   doesn't exist or contains nothing, so the site keeps working as
-   stills-only when no videos are uploaded. */
-async function discoverVideos() {
-  const found = [];
-  let start = 1;
-  while (true) {
-    const batch = Array.from({ length: DISCOVER_BATCH }, (_, i) => start + i);
-    const results = await Promise.all(
-      batch.map(n =>
-        fetch(`${VIDEO_BASE}/ff${n}.mp4`, { method: 'HEAD' })
-          .then(r => (r.ok ? n : null))
-          .catch(() => null)
-      )
-    );
-    const present = results.filter(n => n !== null);
-    found.push(...present);
-    if (present.length === 0) break;
-
-    if (present.length < batch.length) {
-      const farN = start + DISCOVER_BATCH * 2;
-      const farExists = await fetch(`${VIDEO_BASE}/ff${farN}.mp4`, { method: 'HEAD' })
-        .then(r => r.ok).catch(() => false);
-      if (!farExists) break;
-    }
-
-    start += DISCOVER_BATCH;
-  }
-  return found.sort((a, b) => a - b);
-}
+const discoverImages = () => discoverBy(n => `${IMAGES_BASE}/jpg/ff${n}.jpg`);
+const discoverVideos = () => discoverBy(n => `${VIDEO_BASE}/ff${n}.mp4`);
 
 /* ─────────────────────────────────────────────────────────────────────────
    COLOUR ANALYSIS
@@ -382,6 +354,30 @@ function rgbToHsl(r, g, b) {
     default: h = ((r - g) / d + 4);
   }
   return { h: h * 60, s, l };
+}
+
+/* Compositional density via lightness-histogram entropy. Returns
+   [0, 1] — 0 = all pixels in one tonal bin (uniform / "empty"),
+   1 = pixels perfectly spread across all bins ("full" / busy).
+   Real photos fall roughly between 0.2 (sky / wall) and 0.85
+   (varied scene). Used by pairScore to reward density CONTRAST,
+   not density itself. Precomputed once per image and cached on
+   the signature — pairScore reads sig.density. */
+function histogramDensity(histogram) {
+  let H = 0;
+  for (const p of histogram) {
+    if (p > 0) H -= p * Math.log2(p);
+  }
+  return H / Math.log2(HIST_BINS);
+}
+
+/* L2 norm of the histogram, cached so pairScore's cosine similarity
+   doesn't recompute it on every pair. The sqrt is paid once per image
+   instead of twice per pair. */
+function histogramMagnitude(histogram) {
+  let m = 0;
+  for (const p of histogram) m += p * p;
+  return Math.sqrt(m);
 }
 
 function analyzeImage(img) {
@@ -453,7 +449,18 @@ function analyzeImage(img) {
     const wTotal = palette.reduce((s, p) => s + p.weight, 0);
     palette.forEach(p => p.weight /= wTotal);
 
-    return { histogram, palette, avgSat };
+    /* Cache per-image scalars that pairScore would otherwise recompute
+       O(N²) times — entropy of the lightness histogram (density) and
+       the L2 norm of the histogram (for the tonalScore cosine). With
+       N≈150 these add up: ~45k entropy calls and ~45k sqrt calls per
+       full computeTopPairs pass collapse to N each. */
+    return {
+      histogram,
+      palette,
+      avgSat,
+      density: histogramDensity(histogram),
+      histMag: histogramMagnitude(histogram),
+    };
   } catch {
     return null;
   }
@@ -558,14 +565,14 @@ function pairScore(a, b) {
 
   /* Tonal cohesion via histogram cosine similarity. Kept as a low
      weight — it directly conflicts with density contrast, since a
-     full scene and an empty sky have very different histograms. */
-  let dot = 0, magA = 0, magB = 0;
+     full scene and an empty sky have very different histograms.
+     Magnitudes are precomputed once per image (see histogramMagnitude
+     in analyzeImage), so only the dot product runs per pair. */
+  let dot = 0;
   for (let i = 0; i < HIST_BINS; i++) {
-    dot  += a.histogram[i] * b.histogram[i];
-    magA += a.histogram[i] ** 2;
-    magB += b.histogram[i] ** 2;
+    dot += a.histogram[i] * b.histogram[i];
   }
-  const tonalScore = (magA && magB) ? dot / Math.sqrt(magA * magB) : 0;
+  const tonalScore = (a.histMag && b.histMag) ? dot / (a.histMag * b.histMag) : 0;
 
   /* Palette overlap: for each colour in A, find its best match in B
      and weight by A's weight. Symmetric average over both directions. */
@@ -585,16 +592,15 @@ function pairScore(a, b) {
   const paletteContrast = 1 - paletteOverlap;
 
   /* Compositional density contrast: Shannon entropy of each image's
-     lightness histogram, normalised to [0, 1]. A uniform sky or
-     blank wall concentrates pixels in one or two bins → low entropy
-     → low density. A busy/varied scene spreads pixels across bins
-     → high entropy → high density. The score rewards the ABSOLUTE
+     lightness histogram, normalised to [0, 1]. Cached on the signature
+     (a.density / b.density) so this is just a subtraction per pair
+     instead of two entropy passes. The score rewards the ABSOLUTE
      DIFFERENCE — pairing one full and one empty image gets a strong
-     boost, while two-full or two-empty pairs contribute nothing
-     from this term. This is the missing dimension that surfaces the
+     boost, while two-full or two-empty pairs contribute nothing from
+     this term. This is the missing dimension that surfaces the
      editorial "full vs negative space" pairings the eye recognises
      immediately but pure colour scoring keeps marking down. */
-  const densityContrast = Math.abs(densityOf(a) - densityOf(b));
+  const densityContrast = Math.abs(a.density - b.density);
 
   const satMatch = 1 - Math.abs(a.avgSat - b.avgSat);
 
@@ -611,20 +617,6 @@ function pairScore(a, b) {
        + satMatch                            * SAT_WEIGHT
        - repetition                          * REPETITION_PENALTY
        - jointDesat                          * JOINT_DESAT_PENALTY;
-}
-
-/* Compositional density via lightness-histogram entropy. Returns
-   [0, 1] — 0 = all pixels in one tonal bin (uniform / "empty"),
-   1 = pixels perfectly spread across all bins ("full" / busy).
-   Real photos fall roughly between 0.2 (sky / wall) and 0.85
-   (varied scene). Used by pairScore to reward density CONTRAST,
-   not density itself. */
-function densityOf(sig) {
-  let H = 0;
-  for (const p of sig.histogram) {
-    if (p > 0) H -= p * Math.log2(p);
-  }
-  return H / Math.log2(HIST_BINS);
 }
 
 function computeTopPairs() {
@@ -769,12 +761,25 @@ function weightedPick(items, weightFn) {
   return items[items.length - 1];
 }
 
-function pickPair(arr) {
+function pickPair(arr, opts) {
+  /* allowVideos defaults to true so existing call-sites keep their
+     behaviour. The first-pair caller in start() passes false because
+     videos aren't preloaded by the splash and a video pick would
+     leave the consent card waiting on a fresh MP4 fetch (2-4s on
+     decent connections). Affects BOTH the guarantee branch and the
+     main top-N draw — previously only the `arr` argument was filtered,
+     and pickPair ignored that for everything except the random
+     fallback below, so the safety claimed by the call-site was never
+     actually realised. */
+  const allowVideos = !opts || opts.allowVideos !== false;
+
   if (topPairs.length === 0) {
-    const i = Math.floor(Math.random() * arr.length);
-    let   j = Math.floor(Math.random() * arr.length);
-    while (j === i && arr.length > 1) j = Math.floor(Math.random() * arr.length);
-    return [arr[i], arr[j]];
+    const pool = allowVideos ? arr : arr.filter(s => !isVideo(s));
+    const src  = pool.length ? pool : arr;
+    const i = Math.floor(Math.random() * src.length);
+    let   j = Math.floor(Math.random() * src.length);
+    while (j === i && src.length > 1) j = Math.floor(Math.random() * src.length);
+    return [src[i], src[j]];
   }
 
   /* Per-image guarantee draw. With GUARANTEE_RATE probability, pick
@@ -795,17 +800,21 @@ function pickPair(arr) {
        recent[], find its highest-scoring pair where neither side
        is in recent[]. Iteration is over the Map's keys, so each
        image contributes at most ONE candidate row, weighted by
-       that image's own staleness. */
+       that image's own staleness. When allowVideos is false (first
+       pair), the candidate must be photo-only on both sides AND
+       the source image itself must not be a video. */
     const candidates = [];
     for (const [src, pairList] of bestsPerImage) {
       if (isRecent(src)) continue;
+      if (!allowVideos && isVideo(src)) continue;
       const avail = pairList.find(p =>
-        !isRecent(p.a) && !isRecent(p.b)
+        !isRecent(p.a) && !isRecent(p.b) &&
+        (allowVideos || (!isVideo(p.a) && !isVideo(p.b)))
       );
       if (avail) candidates.push({ src, pair: avail });
     }
     if (candidates.length > 0) {
-      const gHasVideos = candidates.some(c => isVideo(c.pair.a) || isVideo(c.pair.b));
+      const gHasVideos = allowVideos && candidates.some(c => isVideo(c.pair.a) || isVideo(c.pair.b));
       const gEligible  = clicksSinceVideo >= VIDEO_MIN_GAP;
       const gWantVideo = gHasVideos && gEligible && Math.random() < VIDEO_RATE;
       const gFiltered  = gWantVideo
@@ -832,8 +841,14 @@ function pickPair(arr) {
      RECENT_CLICKS_BLOCK clicks. If that filter empties the pool
      (e.g. early in the session when fewer images have loaded), fall
      back to the full ranked list rather than getting stuck. */
-  const available = topPairs.filter(p => !isRecent(p.a) && !isRecent(p.b));
-  const pool      = available.length > 0 ? available : topPairs;
+  let available = topPairs.filter(p => !isRecent(p.a) && !isRecent(p.b));
+  if (!allowVideos) {
+    available = available.filter(p => !isVideo(p.a) && !isVideo(p.b));
+  }
+  /* Fallback pool also respects allowVideos so a tiny early-session
+     pool doesn't smuggle a video into the first pair. */
+  const fallback  = allowVideos ? topPairs : topPairs.filter(p => !isVideo(p.a) && !isVideo(p.b));
+  const pool      = available.length > 0 ? available : fallback;
 
   /* Probabilistic video selection with a minimum-gap guard. The
      gap check ensures videos never appear back-to-back; once past
@@ -842,7 +857,7 @@ function pickPair(arr) {
      this, videos could still slip in via the top-N pool. The
      fallback to `pool` covers the (rare) case where filtering
      leaves nothing, e.g. very early in the session. */
-  const hasVideos = pool.some(p => isVideo(p.a) || isVideo(p.b));
+  const hasVideos = allowVideos && pool.some(p => isVideo(p.a) || isVideo(p.b));
   const eligible  = clicksSinceVideo >= VIDEO_MIN_GAP;
   const wantVideo = hasVideos && eligible && Math.random() < VIDEO_RATE;
   const drawPool  = wantVideo
@@ -942,7 +957,6 @@ function preparePanel(panelEl, src) {
     back.innerHTML =
       '<picture>' +
         '<source type="image/avif" sizes="50vw">' +
-        '<source type="image/webp" sizes="50vw">' +
         '<img alt="" sizes="50vw">' +
       '</picture>';
     picture = back.querySelector('picture');
@@ -950,11 +964,9 @@ function preparePanel(panelEl, src) {
 
   const num     = srcToNum(src);
   const avifSrc = picture.querySelector('source[type="image/avif"]');
-  const webpSrc = picture.querySelector('source[type="image/webp"]');
   const img     = picture.querySelector('img');
 
   avifSrc.srcset = FORMATS.includes('avif') ? srcset(num, 'avif') : '';
-  webpSrc.srcset = FORMATS.includes('webp') ? srcset(num, 'webp') : '';
   img.srcset     = SIZES.length ? srcset(num, 'jpg') : '';
   img.src        = path(num, 'jpg');
   img.alt        = altFor(num);
@@ -1061,12 +1073,17 @@ function loadOne(src) {
    means the pair scorer treats the video as neither strongly matching
    nor strongly clashing with anything — pairing quality drops, but
    the video appears in the rotation. Without this, videos that fail
-   analysis are silently dropped and never shown. */
+   analysis are silently dropped and never shown. Includes the same
+   precomputed density/histMag fields as analyzeImage's output so
+   pairScore can read them uniformly. */
 function fallbackSignature() {
+  const histogram = new Array(HIST_BINS).fill(1 / HIST_BINS);
   return {
-    histogram: new Array(HIST_BINS).fill(1 / HIST_BINS),
+    histogram,
     palette:   [{ hsl: { h: 0, s: 0, l: 0.5 }, weight: 1 }],
-    avgSat:    0.3
+    avgSat:    0.3,
+    density:   histogramDensity(histogram),
+    histMag:   histogramMagnitude(histogram),
   };
 }
 
@@ -1227,25 +1244,9 @@ function showInterlude() {
   seenInterludes.add(which);
   currentInterlude = document.getElementById(which);
 
-  /* Snapshot the current pair's URL BEFORE preloading the next one,
-     so the share slide always shares the diptych the user was just
-     looking at — not the one waiting behind the white card. */
-  pendingShareURL = location.href;
-
-  /* Refresh the email link's mailto target to match the current pair.
-     Subject gives context; body is just the URL so most email clients
-     handle it cleanly without truncation. */
-  if (which === 'share') {
-    const emailLink = document.getElementById('share-email');
-    if (emailLink) {
-      const subject = encodeURIComponent('Federico Ferrari — Random Diptychs');
-      const body    = encodeURIComponent(pendingShareURL);
-      emailLink.href = `mailto:?subject=${subject}&body=${body}`;
-    }
-  }
-
   currentInterlude.classList.add('visible');
   currentInterlude.setAttribute('aria-hidden', 'false');
+  captureFocus(currentInterlude);
   interludePreload = loadDiptych();
 
   if (window.gaEnabled && typeof gtag !== 'undefined') {
@@ -1262,37 +1263,50 @@ function liftGate() {
   document.documentElement.classList.remove('gated');
 }
 
+/* ── OVERLAY FOCUS MANAGEMENT ──
+   Move keyboard focus into an overlay when it appears, and restore
+   it on dismiss. Without this, screen readers and keyboard users
+   have no idea the overlay opened — focus stays on whatever invisible
+   element the user last interacted with, and Tab navigation reaches
+   the panels behind the card. Cheap a11y improvement.
+
+   Implementation notes:
+   - We focus the `.inner` block with tabindex="-1" (set inline below)
+     rather than the first interactive child, because not every overlay
+     has interactive children (welcome and share are plain text).
+   - previouslyFocused is captured once per show, restored once per
+     hide. Stacking (interlude → privacy → back) is handled by tracking
+     a stack rather than a single slot, but for this site only one
+     overlay is ever active at a time, so a single slot suffices. */
+let previouslyFocused = null;
+
+function captureFocus(targetEl) {
+  previouslyFocused = document.activeElement;
+  const inner = targetEl.querySelector('.inner') || targetEl;
+  if (!inner.hasAttribute('tabindex')) inner.setAttribute('tabindex', '-1');
+  /* Defer focus to the next frame so the visibility transition has
+     started — focusing a still-display:none element is a no-op in
+     some browsers, and we want the screen-reader announcement to
+     coincide with the visible appearance. */
+  requestAnimationFrame(() => { try { inner.focus({ preventScroll: true }); } catch {} });
+}
+
+function restoreFocus() {
+  const target = previouslyFocused;
+  previouslyFocused = null;
+  if (target && typeof target.focus === 'function' && document.contains(target)) {
+    try { target.focus({ preventScroll: true }); } catch {}
+  } else if (document.body) {
+    try { document.body.focus({ preventScroll: true }); } catch {}
+  }
+}
+
 function hideInterlude() {
   if (currentInterlude) {
     currentInterlude.classList.remove('visible');
     currentInterlude.setAttribute('aria-hidden', 'true');
     currentInterlude = null;
-  }
-}
-
-/* Share trigger — tries the Web Share API first (native share sheet
-   on mobile, where most traffic is). Falls back to copying the URL
-   to the clipboard on desktop with a brief in-place confirmation so
-   the user knows it worked. Silent on cancel or unsupported. */
-async function doShare() {
-  const url      = pendingShareURL || location.href;
-  const trigger  = document.getElementById('share-trigger');
-  const original = trigger.textContent;
-
-  if (navigator.share) {
-    try { await navigator.share({ title: 'Federico Ferrari — Random Diptychs', url }); }
-    catch { /* user cancelled — silent */ }
-  } else if (navigator.clipboard && navigator.clipboard.writeText) {
-    try {
-      await navigator.clipboard.writeText(url);
-      trigger.textContent = 'Link copied';
-      await new Promise(r => setTimeout(r, 150));
-      trigger.textContent = original;
-    } catch { /* silent */ }
-  }
-
-  if (window.gaEnabled && typeof gtag !== 'undefined') {
-    gtag('event', 'pair_shared', { url });
+    restoreFocus();
   }
 }
 
@@ -1394,6 +1408,12 @@ document.querySelectorAll('.interlude').forEach(el => {
   if (totalCount < 2) {
     subtitleEl.textContent = 'No media could be loaded.';
     loadingEl.textContent  = '';
+    /* Cancel the safety timer — without this it would fire ~30s later,
+       fade the splash, and leave the user staring at a permanently
+       blank page (the diptych is still hidden by html.gated and no
+       loadDiptych ever runs to populate it). Better to keep the
+       message on screen indefinitely than to silently disappear it. */
+    clearTimeout(splashSafetyTimer);
     return;
   }
   images = imageIndices.map(numToSrc).concat(videoIndices.map(videoNumToSrc));
@@ -1440,6 +1460,9 @@ document.querySelectorAll('.interlude').forEach(el => {
     if (validImages.length < 2) {
       subtitleEl.textContent = 'No media could be loaded.';
       loadingEl.textContent  = '';
+      /* Keep the splash on screen with its message; without this the
+         safety timer would fade it to a blank page. */
+      clearTimeout(splashSafetyTimer);
       return;
     }
     /* Background-fill the rest of the IMAGES (videos stay lazy). */
@@ -1543,6 +1566,10 @@ document.querySelectorAll('.interlude').forEach(el => {
   if (validImages.length < 2) {
     subtitleEl.textContent = 'No media could be loaded.';
     loadingEl.textContent  = '';
+    /* Keep the splash visible with its message rather than letting
+       the safety timer fade it to a permanently-blank page. See the
+       earlier no-media branch for the same reasoning. */
+    clearTimeout(splashSafetyTimer);
     return;
   }
 
@@ -1553,14 +1580,20 @@ document.querySelectorAll('.interlude').forEach(el => {
   finishSplash();
 
   /* scheduleTopPairs is rAF-debounced, so the latest analyses may
-     not yet be reflected. Force a sync compute before picking. */
+     not yet be reflected. Force a sync compute before picking — and
+     cancel the pending rAF so it doesn't redundantly recompute the
+     same pairs one frame later. */
+  if (topPairsPending) {
+    cancelAnimationFrame(topPairsPending);
+    topPairsPending = 0;
+  }
   computeTopPairs();
 
   /* Same selection logic as every other click — bias toward
      top-scoring pairs, with the per-image guarantee mixing in.
      recent[] is empty on first paint, so no filtering to dodge.
 
-     IMPORTANT: filter to images-only for the FIRST pair. Videos are
+     IMPORTANT: pass allowVideos:false for the FIRST pair. Videos are
      pre-registered to validImages with fallback colour signatures so
      they can appear in the rotation from click 2 onwards, but they're
      not preloaded by the splash — picking a video for the first pair
@@ -1570,7 +1603,7 @@ document.querySelectorAll('.interlude').forEach(el => {
      and a video first pair would leave the consent card stuck waiting
      for the video load. All images are fully cached by the time the
      splash dismisses, so img.decode() on the first pair is sub-ms. */
-  const firstPair = pickPair(validImages.filter(s => !isVideo(s)));
+  const firstPair = pickPair(validImages, { allowVideos: false });
   /* First visit (consent still required) → show consent card on top
      of the loading diptych; consent's Accept/Decline handlers await
      interludePreload before dismissing. Return visit → lift the gate
@@ -1601,8 +1634,7 @@ let loadingDiptych = false;
 /* Roll the first interlude target up front. clicksSinceInterlude
    counts user clicks since the last interlude (or since session
    start); when it crosses nextInterludeAt, an interlude fires and
-   both are reset. Idle auto-advances bypass advance() entirely, so
-   they don't affect the cadence. */
+   both are reset. */
 let clicksSinceInterlude = 0;
 let nextInterludeAt      = rollNextInterlude();
 
@@ -1627,10 +1659,19 @@ async function advance() {
   }
 }
 
+/* Touch-landscape devices get one fullscreen attempt per session.
+   Without the latch, deliberately exiting fullscreen via the
+   browser's own gesture would be immediately reversed by the next
+   tap on the diptych — the site fighting the user. The flag is
+   session-scoped (resets on refresh), which feels right: one
+   refresh re-arms the request. */
+let triedFullscreen = false;
 document.getElementById('diptych').addEventListener('click', () => {
-  if (matchMedia('(hover: none) and (orientation: landscape)').matches
+  if (!triedFullscreen
+      && matchMedia('(hover: none) and (orientation: landscape)').matches
       && !document.fullscreenElement
       && document.documentElement.requestFullscreen) {
+    triedFullscreen = true;
     document.documentElement.requestFullscreen().catch(() => {});
   }
   advance();
@@ -1760,6 +1801,7 @@ function showAnalytics() {
   currentInterlude = consentEl;
   consentEl.classList.add('visible');
   consentEl.setAttribute('aria-hidden', 'false');
+  captureFocus(consentEl);
 }
 
 /* Synchronous dismissal — fade out + DOM removal after the fade.
@@ -1779,17 +1821,22 @@ function dismissConsent() {
   liftGate();
   consentEl.classList.remove('visible');
   consentEl.setAttribute('aria-hidden', 'true');
-  if (currentInterlude === consentEl) currentInterlude = null;
+  if (currentInterlude === consentEl) {
+    currentInterlude = null;
+    restoreFocus();
+  }
   setTimeout(() => consentEl.remove(), 1000);
 }
 
 function showPrivacy() {
   privacyEl.classList.add('visible');
   privacyEl.setAttribute('aria-hidden', 'false');
+  captureFocus(privacyEl);
 }
 function hidePrivacy() {
   privacyEl.classList.remove('visible');
   privacyEl.setAttribute('aria-hidden', 'true');
+  restoreFocus();
 }
 
 const stored = (() => { try { return localStorage.getItem(CONSENT_KEY); } catch { return null; } })();
@@ -1885,17 +1932,15 @@ function showShareToast(text) {
   shareToastEl.classList.add('visible');
   shareToastEl.setAttribute('aria-hidden', 'false');
   clearTimeout(shareToastTimer);
-  /* Hold 150ms then trigger the CSS fade-out (160ms). At this hold
-     the toast is essentially a flash — the user already knew they
-     were triggering the share, so the toast confirms via colour and
-     motion rather than dwelling for re-reading. The 160ms CSS fade
-     adds a graceful taper, so total visible cycle ~310ms. 150 is
-     around the floor of conscious recognition; below ~100 the toast
-     can be missed entirely on a quick glance away. */
+  /* Hold 1.5s then trigger the CSS fade-out (160ms). Long enough for
+     the user to read "Link copied" with a glance — previously this
+     was 150ms, which is at the floor of conscious recognition and
+     unreadable in practice. 1500ms is the standard transient-toast
+     duration; total visible cycle ~1.66s. */
   shareToastTimer = setTimeout(() => {
     shareToastEl.classList.remove('visible');
     shareToastEl.setAttribute('aria-hidden', 'true');
-  }, 150);
+  }, 1500);
 }
 
 function shareCurrentPair() {
@@ -1924,19 +1969,25 @@ function shareCurrentPair() {
   }
 
   /* DESKTOP PATH — clipboard + toast.
-     Modern Clipboard API works reliably on desktop browsers. The
-     legacy execCommand path is kept as a fallback for older
-     browsers without navigator.clipboard. Honest reporting now:
-     we only show "Link copied" if we have an actual success signal
-     (legacy returned true, or the modern Promise resolved). */
-  const legacyOk = legacyCopy(url);
-  if (legacyOk) {
-    showShareToast('Link copied');
-  } else if (navigator.clipboard && navigator.clipboard.writeText) {
+     Modern Clipboard API works reliably on desktop browsers and
+     reports success/failure honestly. The legacy execCommand path
+     (document.execCommand('copy') via off-screen textarea) is
+     deprecated, notoriously dishonest about success on some engines,
+     and pollutes the DOM each call — so it's only the fallback for
+     ancient browsers without navigator.clipboard. We only show
+     "Link copied" on a real success signal. */
+  if (navigator.clipboard && navigator.clipboard.writeText) {
     navigator.clipboard.writeText(url).then(
       () => showShareToast('Link copied'),
-      () => showShareToast('Couldn’t copy')
+      () => {
+        /* Modern API rejected (permission, focus, lockdown). Try
+           the legacy path as a last resort before giving up. */
+        if (legacyCopy(url)) showShareToast('Link copied');
+        else                 showShareToast('Couldn’t copy');
+      }
     );
+  } else if (legacyCopy(url)) {
+    showShareToast('Link copied');
   } else {
     showShareToast('Couldn’t copy');
   }
@@ -2097,101 +2148,26 @@ document.addEventListener('keydown', (e) => {
 /* ── SHARE INTERLUDE LABEL ──
    The share interlude card (shown every CONTACT_MIN..CONTACT_MAX clicks)
    uses different wording per input mode. Touch-primary devices
-   get "tap to share" (literal: tap the anchor); pointer-primary
-   get "press S to share" (teaches the keyboard shortcut).
+   get "long press to share"; pointer-primary get "press S to share"
+   (teaches the keyboard shortcut).
 
    Detection: hover:none AND pointer:coarse — the standard CSS
    media-query pair for "this device's primary input is touch".
    Avoids 'ontouchstart' in window false-positives on hybrid
-   laptops that have both a touchscreen and a precise pointer. */
+   laptops that have both a touchscreen and a precise pointer.
+   Re-runs on input-mode change so a 2-in-1 flipping between
+   laptop and tablet posture gets the right wording without a
+   reload. */
 (function setShareTriggerLabel() {
   const trigger = document.getElementById('share-trigger');
   if (!trigger) return;
-  const touchPrimary = matchMedia('(hover: none) and (pointer: coarse)').matches;
-  trigger.textContent = touchPrimary ? 'Long press to share' : 'Press S to share';
+  const mq = matchMedia('(hover: none) and (pointer: coarse)');
+  const apply = () => {
+    trigger.textContent = mq.matches ? 'Long press to share' : 'Press S to share';
+  };
+  apply();
+  /* addEventListener is the modern API; older Safari only supports
+     the deprecated addListener. Try the modern one first. */
+  if (mq.addEventListener) mq.addEventListener('change', apply);
+  else if (mq.addListener) mq.addListener(apply);
 })();
-
-/* ─────────────────────────────────────────────────────────────────────────
-   IDLE AUTO-ADVANCE  ("screensaver")
-
-   After IDLE_AUTO_ADVANCE_MS of no user input, auto-advance to the next
-   diptych — same loadDiptych() path the click handler uses, but bypassing
-   the periodic contact-card interlude (CONTACT_MIN..CONTACT_MAX) so an idle visitor
-   doesn't get a contact prompt sprung on them mid-screensaver.
-
-   Activity events (click / key / mousemove / touch / wheel / scroll)
-   reset the countdown. The timer pauses while an overlay is visible
-   (splash / welcome / consent / privacy / interlude) and while the tab
-   is hidden. Respects prefers-reduced-motion: users who ask for less
-   motion never get the auto-advance armed.
-   ───────────────────────────────────────────────────────────────────────── */
-
-const IDLE_AUTO_ADVANCE_MS = 10000;   // ← tweak the inactivity window here
-const idleReducedMotion    = matchMedia('(prefers-reduced-motion: reduce)');
-let   idleTimer            = null;
-
-function clearIdleTimer() {
-  if (idleTimer !== null) {
-    clearTimeout(idleTimer);
-    idleTimer = null;
-  }
-}
-
-function armIdleTimer() {
-  clearIdleTimer();
-  if (idleReducedMotion.matches) return;
-  if (document.hidden) return;
-  idleTimer = setTimeout(onIdleTimeout, IDLE_AUTO_ADVANCE_MS);
-}
-
-async function onIdleTimeout() {
-  idleTimer = null;
-
-  /* If anything is in the way — splash, welcome, consent, privacy,
-     interlude, or a load already in progress — re-arm and try again
-     later. Re-arming (rather than bailing silently) means the timer
-     survives a visitor who walks away during a still-visible splash. */
-  const splashEl  = document.getElementById('splash');
-  const splashUp  = splashEl && !splashEl.classList.contains('hidden');
-  const privacyUp = privacyEl && privacyEl.classList.contains('visible');
-  if (loadingDiptych || currentInterlude || splashUp || privacyUp) {
-    armIdleTimer();
-    return;
-  }
-
-  /* Skip the click counter so auto-advances don't trip the periodic
-     contact-card interlude (CONTACT_MIN..CONTACT_MAX) — that would ambush an idle
-     viewer with a prompt they didn't ask for. Call loadDiptych directly. */
-  loadingDiptych = true;
-  try {
-    await loadDiptych();
-  } finally {
-    loadingDiptych = false;
-  }
-  armIdleTimer();
-}
-
-/* Activity resets the countdown. mousemove fires often, but the work
-   per event (clearTimeout + setTimeout) is microsecond-cheap and
-   { passive: true } keeps it out of the scroll path. */
-['click', 'keydown', 'mousemove', 'touchstart', 'touchmove', 'wheel', 'scroll']
-  .forEach(ev => document.addEventListener(ev, armIdleTimer, { passive: true }));
-
-/* Tab visibility — pause when hidden, resume when revealed. Avoids
-   silently burning through diptychs in a background tab. */
-document.addEventListener('visibilitychange', () => {
-  if (document.hidden) clearIdleTimer();
-  else armIdleTimer();
-});
-
-/* React to OS-level "Reduce motion" being toggled during a live
-   session: stop the timer if turned on, resume if turned off. */
-idleReducedMotion.addEventListener('change', () => {
-  if (idleReducedMotion.matches) clearIdleTimer();
-  else armIdleTimer();
-});
-
-/* Initial arm. Activity listeners keep this reset during splash →
-   welcome → consent; once the user lands on the diptych and stays
-   still for IDLE_AUTO_ADVANCE_MS, the auto-advance kicks in. */
-armIdleTimer();

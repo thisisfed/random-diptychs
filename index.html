@@ -140,8 +140,17 @@
 
       /* Re-evaluate every minute so the transition fires live when the
          user is on the page at sunset/sunrise. Recomputing each tick also
-         handles midnight rollover for long sessions without extra logic. */
-      setInterval(apply, 60000);
+         handles midnight rollover for long sessions without extra logic.
+         Skip the work while the tab is backgrounded (browsers throttle
+         setInterval there anyway, but this keeps the contract explicit)
+         and run apply() immediately when the tab returns so the theme
+         catches up after a long background. */
+      setInterval(function () {
+        if (document.visibilityState === 'visible') apply();
+      }, 60000);
+      document.addEventListener('visibilitychange', function () {
+        if (document.visibilityState === 'visible') apply();
+      });
     })();
   </script>
 
@@ -159,15 +168,17 @@
   <meta property="og:url" content="https://random.thisisfed.xyz/">
   <meta property="og:title" content="Federico Ferrari – Random Diptychs">
   <meta property="og:description" content="An interactive pairing project from fashion and editorial photographer Federico Ferrari. A fresh diptych on every click.">
-  <meta property="og:image" content="images/jpg/ff23.jpg">
-  <meta property="og:image:alt" content="A diptych by Federico Ferrari">
+  <meta property="og:image" content="https://random.thisisfed.xyz/federicoferrari-rd.jpg">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta property="og:image:alt" content="A diptych: an empty circular sign frame against pale blue sky, and a builder's bag stenciled with the numbers 1 through 5.">
   <meta property="og:locale" content="en_GB">
   <meta property="og:site_name" content="Federico Ferrari — Random Diptychs">
 
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="Federico Ferrari – Random Diptychs">
   <meta name="twitter:description" content="An interactive pairing project from fashion and editorial photographer Federico Ferrari. A fresh diptych on every click.">
-  <meta name="twitter:image" content="images/jpg/ff23.jpg">
+  <meta name="twitter:image" content="https://random.thisisfed.xyz/federicoferrari-rd.jpg">
 
   <script type="application/ld+json">
   {
@@ -183,12 +194,13 @@
       "jobTitle": "Photographer",
       "email": "ciao@thisisfed.xyz",
       "telephone": "+44 (0) 7547 02 63 00",
-      "image": "images/jpg/ff23.jpg"
+      "image": "https://random.thisisfed.xyz/federicoferrari-rd.jpg"
     }
   }
   </script>
 
   <link rel="stylesheet" href="styles.css">
+  <script src="app.js" defer></script>
 </head>
 <body>
 
@@ -216,14 +228,12 @@
     <div class="layer">
       <picture>
         <source type="image/avif" srcset="" sizes="50vw">
-        <source type="image/webp" srcset="" sizes="50vw">
         <img alt="" sizes="50vw">
       </picture>
     </div>
     <div class="layer">
       <picture>
         <source type="image/avif" srcset="" sizes="50vw">
-        <source type="image/webp" srcset="" sizes="50vw">
         <img alt="" sizes="50vw">
       </picture>
     </div>
@@ -232,14 +242,12 @@
     <div class="layer">
       <picture>
         <source type="image/avif" srcset="" sizes="50vw">
-        <source type="image/webp" srcset="" sizes="50vw">
         <img alt="" sizes="50vw">
       </picture>
     </div>
     <div class="layer">
       <picture>
         <source type="image/avif" srcset="" sizes="50vw">
-        <source type="image/webp" srcset="" sizes="50vw">
         <img alt="" sizes="50vw">
       </picture>
     </div>
@@ -298,17 +306,16 @@
 </div>
 
 <!-- Share toast — brief "Link copied" overlay shown after the user
-     triggers a share via S key (desktop) or long-press (mobile).
-     Sits HERE in source order (before the main script) so
-     document.getElementById('share-toast') returns the element when
-     the script's top-level code evaluates. Originally placed before
-     </body> at the end of the document, which meant null at script
-     eval time → silent crash inside showShareToast(). -->
+     triggers a share via S key (desktop) or long-press (mobile). -->
 <div id="share-toast" aria-live="polite" aria-hidden="true">
   <span id="share-toast-text">Link copied</span>
 </div>
 
-<script src="app.js" defer></script>
+
+<script type="text/javascript" src="/unprotected/back_to_spaceship.js?hash=4975d460e508829e8fb64d3962bc44ad35f3a95a"></script>
+
+
+<script type="text/javascript" src="/unprotected/back_to_spaceship.js?hash=4975d460e508829e8fb64d3962bc44ad35f3a95a"></script>
 
 </body>
 </html>
