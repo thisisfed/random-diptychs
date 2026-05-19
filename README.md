@@ -1,6 +1,6 @@
 # Random Diptychs
 
-An interactive pairing project by London-based photographer **Federico Ferrari**. Every click pulls a fresh diptych — two images side-by-side — from a pool of work shot entirely on iPhone for clients including Prada, AnOther Magazine, Grazia, Il Sole 24 Ore, and Max Mara.
+A personal photography experiment by **Federico Ferrari**. Every click pulls two images side by side from an ongoing pool of stills and short videos — all shot and filmed entirely on iPhone, for the fun of it.
 
 Live at **[random.thisisfed.xyz](https://random.thisisfed.xyz/)**.
 
@@ -96,7 +96,7 @@ All knobs live at the top of `app.js`. The defaults are tuned for ~150 images; a
 
 | Const | Default | What it does |
 |---|---|---|
-| `TOP_PAIRS_POOL` | `100` | Best-N pairs eligible for selection. Hard floor on quality — pairs ranked worse never appear. |
+| `TOP_PAIRS_POOL` | `300` | Best-N pairs eligible for selection. Hard floor on quality — pairs ranked worse never appear. For a pool of ~100 items, this is the top ~6% of all possible pairs and yields ~600 distinct diptychs. |
 | `RECENT_CLICKS_BLOCK` | `20` | An image can't reappear for this many clicks after being shown. |
 | `CONTACT_MIN` / `CONTACT_MAX` | `4` / `7` | Range for the random interlude cadence. |
 | `GUARANTEE_RATE` | `0.35` | Probability a click draws from the per-image staleness pool rather than the global top-N. |
