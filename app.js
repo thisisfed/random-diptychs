@@ -126,8 +126,11 @@ const DISCOVER_BATCH = 20;
    orientation, so the visible catalogue ends up at TOP_PAIRS_POOL × 2
    distinct diptychs. A hard floor: pairs ranked worse than N can
    never surface, no matter what the random roll does — so use this
-   to set the worst-case quality you're willing to accept. */
-const TOP_PAIRS_POOL   = 100;
+   to set the worst-case quality you're willing to accept.
+   At 300, with ~100 items in the pool, that's the top ~6% of the
+   4950 possible pairs — strict enough that nothing weak surfaces,
+   loose enough to give long sessions genuine variety. */
+const TOP_PAIRS_POOL   = 300;
 
 /* ─── RANKING WEIGHTS ───
    The ranker rewards two kinds of contrast that must BOTH be
@@ -183,7 +186,7 @@ const VIDEO_MIN_GAP = 1;
    coin flip into an active long-term rotation engine.
 
    At 0.35, roughly 1 in 3 clicks rotates the catalogue while the
-   remaining ~2 in 3 follow the quality-biased top-100 selection.
+   remaining ~2 in 3 follow the quality-biased top-300 selection.
    Higher values surface rare images faster at the cost of pulling
    more weight from the quality-ranked main pool. */
 const GUARANTEE_RATE = 0.35;
@@ -874,10 +877,10 @@ function pickPair(arr, opts) {
   const poolSize  = Math.min(TOP_PAIRS_POOL, finalPool.length);
   /* Quality-biased pick: squaring Math.random() stretches the
      distribution toward 0 so the highest-scored pairs dominate.
-     With the current pool of 150, the top 10% (15 pairs) receives
+     With the current pool of 300, the top 10% (30 pairs) receives
      ~32% of picks and the bottom half receives ~29%. The hard
      floor on quality comes from TOP_PAIRS_POOL itself (no pair
-     ranked worse than 150 ever appears); this bias just shifts
+     ranked worse than 300 ever appears); this bias just shifts
      the rotation toward the very top within that pool. Bump to
      ** 3 for stronger top-emphasis, ** 1 for uniform. */
   const chosen    = finalPool[Math.floor(Math.random() ** 2 * poolSize)];
@@ -1378,7 +1381,7 @@ document.querySelectorAll('.interlude').forEach(el => {
   const subtitleEl = splashEl.querySelector('.subtitle');
   const loadingEl  = splashEl.querySelector('.loading');
 
-  let target            = 200;
+  let target            = 600;
   let imageSrcs         = null;
   let splashFinished    = false;
   let splashSafetyTimer = null;
@@ -1432,7 +1435,7 @@ document.querySelectorAll('.interlude').forEach(el => {
   }
 
   /* Update the static subtitle to the real pair count if discovery
-     reveals a different total than the HTML's placeholder "200". */
+     reveals a different total than the HTML's placeholder "600". */
   const unorderedPairs = totalCount * (totalCount - 1) / 2;
   const realTotal      = Math.min(TOP_PAIRS_POOL, unorderedPairs) * 2;
   if (realTotal !== target) {
