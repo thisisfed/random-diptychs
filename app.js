@@ -147,31 +147,75 @@ const TOP_PAIRS_POOL   = 250;
    pairings come from (e.g. two pale-blue-dominated images, one
    busier than the other).
 
+   Lightness contrast is a separate reward — explicit "one bright,
+   one dark" preference, since two pairs with identical palette/
+   density signatures can read very differently if one is light-
+   and-light vs. one bright + one dim. Captures the "up and down"
+   editorial dimension that pure hue/density don't.
+
    Tonal cohesion is kept as a faint tiebreaker, deliberately low.
    It directly conflicts with what the eye values here (contrast
    over cohesion), so we don't want it competing with the contrast
    signals — but a small weight stops perfectly tonal-similar
    pairs from being penalised for that alone. Sum ≈ 1.0. */
-const TONAL_WEIGHT    = 0.05;
-const PALETTE_WEIGHT  = 0.50;
-const DENSITY_WEIGHT  = 0.40;
-const SAT_WEIGHT      = 0.05;
+const TONAL_WEIGHT     = 0.05;
+const PALETTE_WEIGHT   = 0.45;
+const DENSITY_WEIGHT   = 0.35;
+const LIGHTNESS_WEIGHT = 0.20;
+const SAT_WEIGHT       = 0.05;
+
+/* Palette-contrast curve. The raw paletteContrast value is in [0, 1].
+   Powering it by an exponent > 1 concentrates reward at the top:
+   pairs with weak-to-moderate contrast lose more ground, pairs with
+   strong contrast are barely affected. With exponent 2.0:
+     1.0 → 1.0  (full reward)
+     0.8 → 0.64 (20% lower)
+     0.5 → 0.25 (50% lower — halves)
+     0.3 → 0.09 (70% lower)
+   At this setting, only pairs with strong palette contrast meaningfully
+   score on the palette term — moderate similarity (warm-on-warm,
+   cool-on-cool) gets pushed firmly below the surface threshold and
+   relies on density or lightness contrast to qualify. Set to 1.0 to
+   disable and revert to a flat linear reward. 1.5 is a gentler
+   intermediate. 3.0 would be very aggressive — only near-opposite
+   palettes would clear the palette gate. */
+const PALETTE_CONTRAST_POWER = 2.0;
 
 /* How hard to penalise pairs whose dominant colour matches (whether
    that's a saturated palette[0] sharing a hue family, or a blank-canvas
-   neutral background). 0 disables; 0.9 is firm enough to push
-   two-brick / two-blue / two-red pairs out of the top pool without
-   being so aggressive that all analogous compositions vanish; 1.0
-   nearly excludes. */
-const REPETITION_PENALTY = 0.9;
+   neutral background). 0 disables; 1.1 is firm — pushes two-brick /
+   two-blue / two-red pairs cleanly out of the top pool. Previously
+   was 0.9, which let some near-misses through (oranges paired with
+   golds, where hue families overlap at the boundary). */
+const REPETITION_PENALTY = 1.1;
 
-/* How hard to penalise pairs where BOTH images are overall low in
-   saturation. The diptych wants colour life from at least one panel;
-   two muted/greyscale frames together feel monotonous even when their
-   palettes technically differ. Fires only when the MAX of the two
-   avgSats is below 0.25 — one colourful side is enough to keep the
-   pair alive (so a B&W can still pair with a vibrant shot). 0 disables. */
+/* Joint-desaturation penalty. Fires when BOTH images are overall low
+   in saturation; the diptych wants colour life from at least one
+   panel. Threshold lifted from 0.25 to 0.30 so it catches more
+   "everything is dust-grey" cases that just barely cleared the old
+   bar. One colourful side is still enough to keep the pair alive. */
 const JOINT_DESAT_PENALTY = 0.5;
+const JOINT_DESAT_THRESHOLD = 0.30;
+
+/* Joint-fullness penalty. Mirrors jointDesat for the density axis —
+   when BOTH images are highly busy (above the threshold), penalise.
+   Two-full pairs feel claustrophobic regardless of palette contrast;
+   the eye wants somewhere to rest in at least one panel. Ramp starts
+   at density 0.55 (firmly "full") and reaches full penalty by 1.0.
+   Without this, two busy compositions could surface on palette
+   contrast alone, even when there's no negative space anywhere. */
+const JOINT_FULL_PENALTY   = 0.45;
+const JOINT_FULL_THRESHOLD = 0.55;
+
+/* Joint-emptiness penalty. The other end of the density axis —
+   two near-empty frames (single subject on void, abstract texture,
+   monochrome surface with sparse detail) read as repetitive even
+   when palettes differ. Milder than fullness because some
+   minimalist pairs work; the penalty is meant to suppress the
+   "two empty similar surfaces with text/object" cases. Ramp starts
+   at density 0.35 (firmly "empty") and reaches full by 0. */
+const JOINT_EMPTY_PENALTY   = 0.30;
+const JOINT_EMPTY_THRESHOLD = 0.35;
 
 /* Video pacing — probabilistic, with a minimum gap between videos so
    they never appear back-to-back. VIDEO_RATE is the per-click chance
@@ -440,31 +484,30 @@ function analyzeImage(img) {
 
     const histogram = new Array(HIST_BINS).fill(0);
     const buckets   = new Map();
-    let totalWeight = 0, satWeighted = 0;
+    let totalWeight = 0, satWeighted = 0, lumWeighted = 0;
 
     /* Centre-weighting parameters. Subject of a photo is almost always
        near the middle of the frame; edges carry background or peripheral
        content. Giving centre pixels more vote in palette / histogram /
-       avgSat construction makes the colour signature better reflect
-       what the photo is *about*, not just what it has the most surface
-       area of. Linear ramp from CENTER_WEIGHT at the centre down to
-       1.0 at the corners, measured by max(|dx|, |dy|) — a square
-       gradient that matches the rectangular pixel grid (rounder L2
-       distance would over-penalise the corners). 1.6 was chosen as a
-       moderate setting: meaningfully changes pairing for portraits and
-       centred subjects without overpowering background colour when
-       that genuinely matters (e.g. wide landscapes, full-bleed
-       textures). Set to 1.0 to disable centre weighting entirely. */
+       avgSat / meanL construction makes the colour signature better
+       reflect what the photo is *about*, not just what it has the most
+       surface area of. Linear ramp from CENTER_WEIGHT at the centre
+       down to 1.0 at the corners, measured by max(|dx|, |dy|) — a
+       square gradient that matches the rectangular pixel grid (rounder
+       L2 distance would over-penalise the corners). 1.6 was chosen as
+       a moderate setting: meaningfully changes pairing for portraits
+       and centred subjects without overpowering background colour when
+       that genuinely matters (wide landscapes, full-bleed textures).
+       Set to 1.0 to disable centre weighting entirely. */
     const CENTER_WEIGHT = 1.6;
     const half = N / 2;
 
     for (let i = 0, px = 0; i < data.length; i += 4, px++) {
       const r = data[i], g = data[i + 1], b = data[i + 2];
 
-      /* Centre-weighted pixel vote. px = pixel index in row-major order;
-         x and y reconstructed from it. Distance from centre normalised
-         to [0, 1] via max-axis; weight = 1 at edges, CENTER_WEIGHT at
-         centre, linear between. */
+      /* Centre-weighted pixel vote. px = pixel index in row-major
+         order; x and y reconstructed from it. Distance from centre
+         normalised to [0, 1] via max-axis. */
       const x = px % N;
       const y = (px / N) | 0;
       const dx = Math.abs(x - half) / half;
@@ -475,6 +518,7 @@ function analyzeImage(img) {
 
       const lum = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
       histogram[Math.min(HIST_BINS - 1, Math.floor(lum * HIST_BINS))] += w;
+      lumWeighted += lum * w;
 
       const key = (r >> 3) << 10 | (g >> 3) << 5 | (b >> 3);
       buckets.set(key, (buckets.get(key) || 0) + w);
@@ -486,6 +530,7 @@ function analyzeImage(img) {
     }
     for (let i = 0; i < HIST_BINS; i++) histogram[i] /= totalWeight;
     const avgSat = satWeighted / totalWeight;
+    const meanL  = lumWeighted / totalWeight;   // mean lightness, [0, 1]
 
     const sorted  = [...buckets.entries()].sort((a, b) => b[1] - a[1]);
     const palette = [];
@@ -510,9 +555,9 @@ function analyzeImage(img) {
         }
       }
       /* Each palette entry carries BOTH coordinate systems:
-         - hsl: used for the merge heuristic above and by
-           dominantRepetition's hue-family detection (hue distance is
-           the right idea there — two reds at different lightnesses
+         - hsl: used by the palette-merge heuristic above and by
+           dominantRepetition's hue-family detection (hue distance
+           is the right idea there — two reds at different lightnesses
            ARE related as a "red repetition", which is what we want
            to catch).
          - oklab: used by colorSimilarity in pair scoring, where
@@ -527,9 +572,9 @@ function analyzeImage(img) {
     if (palette.length === 0) {
       /* Edge case: every dominant bucket was filtered out by the
          too-dark / too-light / too-desaturated gate. Use the overall
-         mean colour as a last-resort palette of one — note this uses
-         simple pixel-count means (not centre-weighted) for robustness
-         since it's already a fallback path. */
+         mean colour as a last-resort palette of one. Uses simple
+         pixel-count means (not centre-weighted) for robustness — it's
+         already a fallback path. */
       let tr = 0, tg = 0, tb = 0, n = 0;
       for (let i = 0; i < data.length; i += 4) {
         tr += data[i]; tg += data[i + 1]; tb += data[i + 2]; n++;
@@ -545,14 +590,16 @@ function analyzeImage(img) {
     palette.forEach(p => p.weight /= wTotal);
 
     /* Cache per-image scalars that pairScore would otherwise recompute
-       O(N²) times — entropy of the lightness histogram (density) and
-       the L2 norm of the histogram (for the tonalScore cosine). With
-       N≈150 these add up: ~45k entropy calls and ~45k sqrt calls per
-       full computeTopPairs pass collapse to N each. */
+       O(N²) times — entropy of the lightness histogram (density), the
+       L2 norm of the histogram (for the tonalScore cosine), and the
+       mean lightness (for lightness contrast). With N≈100 these add
+       up: ~10k entropy calls, ~10k sqrt calls per full computeTopPairs
+       pass collapse to N each. */
     return {
       histogram,
       palette,
       avgSat,
+      meanL,
       density: histogramDensity(histogram),
       histMag: histogramMagnitude(histogram),
     };
@@ -657,11 +704,12 @@ function dominantRepetition(a, b) {
   return Math.max(palRep, blankRep);
 }
 
-/* Pair score: rewards palette contrast, compositional density
-   contrast (full-vs-empty pairings), tonal cohesion as a mild
-   signal, and saturation match as a tiebreaker. Minus penalties
-   for predominant-colour repetition and for pairs where neither
-   image carries colour weight. */
+/* Pair score: rewards palette contrast (perceptual, OKLab-based),
+   compositional density contrast (full-vs-empty), lightness contrast
+   (bright-vs-dark), tonal cohesion as a faint signal, and saturation
+   match as a tiebreaker. Minus penalties for predominant-colour
+   repetition, two-empty pairs (joint-desat, joint-empty-density),
+   and two-full pairs (joint-full-density). */
 function pairScore(a, b) {
   if (!a || !b) return 0;
 
@@ -677,15 +725,13 @@ function pairScore(a, b) {
   const tonalScore = (a.histMag && b.histMag) ? dot / (a.histMag * b.histMag) : 0;
 
   /* Palette overlap: for each colour in A, find its best match in B
-     and weight by A's weight. Symmetric average over both directions. */
+     and weight by A's weight. Symmetric average over both directions.
+     colorSimilarity reads .oklab from each palette entry. */
   const directional = (pA, pB) => {
     let total = 0;
     for (const cA of pA) {
       let best = 0;
       for (const cB of pB) {
-        /* Pass full palette entries so colorSimilarity can read the
-           oklab field. Was previously passing .hsl coordinates and
-           comparing in HSL — now perceptually uniform via OKLab. */
         const s = colorSimilarity(cA, cB);
         if (s > best) best = s;
       }
@@ -696,32 +742,80 @@ function pairScore(a, b) {
   const paletteOverlap  = (directional(a.palette, b.palette) + directional(b.palette, a.palette)) / 2;
   const paletteContrast = 1 - paletteOverlap;
 
+  /* Concentrate reward at the top of the contrast range. With
+     PALETTE_CONTRAST_POWER = 2.0: a pair scoring 1.0 keeps full
+     reward, a pair at 0.5 drops to 0.25 (halves), at 0.3 drops to
+     0.09. Effect: only pairs with strong palette contrast score
+     meaningfully on the palette term; moderate palette similarity
+     (warm-on-warm, cool-on-cool, near-tonal-match pairs) drops
+     hard. See the constant declaration above for the full curve. */
+  const paletteContrastShaped = Math.pow(paletteContrast, PALETTE_CONTRAST_POWER);
+
   /* Compositional density contrast: Shannon entropy of each image's
      lightness histogram, normalised to [0, 1]. Cached on the signature
      (a.density / b.density) so this is just a subtraction per pair
      instead of two entropy passes. The score rewards the ABSOLUTE
      DIFFERENCE — pairing one full and one empty image gets a strong
      boost, while two-full or two-empty pairs contribute nothing from
-     this term. This is the missing dimension that surfaces the
-     editorial "full vs negative space" pairings the eye recognises
-     immediately but pure colour scoring keeps marking down. */
+     this term. Multiplying by paletteContrast (not its shaped form)
+     keeps the original interlock: density bonus only when there's
+     also some palette difference, to avoid the "two-blue / one busy
+     one calm" fake-contrast trap. */
   const densityContrast = Math.abs(a.density - b.density);
+
+  /* Lightness contrast — perceptual mean L (from OKLab pipeline,
+     stored as meanL [0, 1]). Rewards "one bright, one dark" pairings
+     independently of palette and density. Two photos can have the
+     same warm palette and similar density yet read very differently
+     if one is high-key (bright noon) and the other low-key (golden
+     hour); this term captures that "up-and-down" dimension explicitly.
+     Unlike densityContrast it is NOT gated by paletteContrast — a
+     bright-dark pair with a shared family of colours still scores
+     well here, since the lightness shift alone creates visual
+     dialogue. Max value ~0.8 (white-vs-black photo); typical
+     "noticeable" lightness contrast is 0.25–0.4. */
+  const lightnessContrast = Math.abs(a.meanL - b.meanL);
 
   const satMatch = 1 - Math.abs(a.avgSat - b.avgSat);
 
   const repetition = dominantRepetition(a, b);
 
-  /* Joint-desaturation penalty: only fires when BOTH images are below
-     0.25 avgSat. One colourful side is enough to keep the pair alive. */
-  const maxSat    = Math.max(a.avgSat, b.avgSat);
-  const jointDesat = Math.max(0, 1 - maxSat / 0.25);
+  /* Joint-desaturation penalty: fires when BOTH images sit below
+     JOINT_DESAT_THRESHOLD avgSat. Threshold raised from 0.25 → 0.30
+     so it catches more "everything is dust-grey" cases. One
+     colourful side is enough to keep the pair alive. */
+  const maxSat     = Math.max(a.avgSat, b.avgSat);
+  const jointDesat = Math.max(0, 1 - maxSat / JOINT_DESAT_THRESHOLD);
 
-  return tonalScore                          * TONAL_WEIGHT
-       + paletteContrast                     * PALETTE_WEIGHT
-       + paletteContrast * densityContrast   * DENSITY_WEIGHT
-       + satMatch                            * SAT_WEIGHT
-       - repetition                          * REPETITION_PENALTY
-       - jointDesat                          * JOINT_DESAT_PENALTY;
+  /* Joint-fullness penalty: ramps up when BOTH images are busy —
+     i.e. the minimum of the two densities is above the threshold.
+     Two highly-composed images compete for the eye; somewhere
+     should be quiet. Uses min(a, b) so the penalty fires only when
+     BOTH cross into "full" territory — a busy image paired with
+     an empty one is exactly what densityContrast rewards. */
+  const minDensity = Math.min(a.density, b.density);
+  const jointFull  = Math.max(0, (minDensity - JOINT_FULL_THRESHOLD) /
+                                 (1 - JOINT_FULL_THRESHOLD));
+
+  /* Joint-emptiness penalty: mirror of fullness, ramps up when
+     BOTH images are near-empty — max(a, b) below the threshold.
+     Catches "two minimal surfaces with sparse detail" pairs that
+     are technically distinct in palette/saturation but feel
+     visually similar (both quiet). Milder than fullness because
+     some minimalist pairs work intentionally. */
+  const maxDensity = Math.max(a.density, b.density);
+  const jointEmpty = Math.max(0, (JOINT_EMPTY_THRESHOLD - maxDensity) /
+                                 JOINT_EMPTY_THRESHOLD);
+
+  return tonalScore                                * TONAL_WEIGHT
+       + paletteContrastShaped                     * PALETTE_WEIGHT
+       + paletteContrast * densityContrast         * DENSITY_WEIGHT
+       + lightnessContrast                         * LIGHTNESS_WEIGHT
+       + satMatch                                  * SAT_WEIGHT
+       - repetition                                * REPETITION_PENALTY
+       - jointDesat                                * JOINT_DESAT_PENALTY
+       - jointFull                                 * JOINT_FULL_PENALTY
+       - jointEmpty                                * JOINT_EMPTY_PENALTY;
 }
 
 function computeTopPairs() {
@@ -979,10 +1073,10 @@ function pickPair(arr, opts) {
   const poolSize  = Math.min(TOP_PAIRS_POOL, finalPool.length);
   /* Quality-biased pick: squaring Math.random() stretches the
      distribution toward 0 so the highest-scored pairs dominate.
-     With the current pool of 250, the top 10% (25 pairs) receives
+     With the current pool of 150, the top 10% (15 pairs) receives
      ~32% of picks and the bottom half receives ~29%. The hard
      floor on quality comes from TOP_PAIRS_POOL itself (no pair
-     ranked worse than 250 ever appears); this bias just shifts
+     ranked worse than 150 ever appears); this bias just shifts
      the rotation toward the very top within that pool. Bump to
      ** 3 for stronger top-emphasis, ** 1 for uniform. */
   const chosen    = finalPool[Math.floor(Math.random() ** 2 * poolSize)];
@@ -1179,8 +1273,8 @@ function loadOne(src) {
    nor strongly clashing with anything — pairing quality drops, but
    the video appears in the rotation. Without this, videos that fail
    analysis are silently dropped and never shown. Includes the same
-   precomputed density/histMag fields as analyzeImage's output so
-   pairScore can read them uniformly. */
+   cached scalars as analyzeImage's output (oklab, meanL, density,
+   histMag) so pairScore can read them uniformly. */
 function fallbackSignature() {
   const histogram = new Array(HIST_BINS).fill(1 / HIST_BINS);
   return {
@@ -1195,6 +1289,7 @@ function fallbackSignature() {
       weight: 1,
     }],
     avgSat:    0.3,
+    meanL:     0.5,
     density:   histogramDensity(histogram),
     histMag:   histogramMagnitude(histogram),
   };

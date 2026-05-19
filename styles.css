@@ -71,69 +71,30 @@ h1 { font-size: inherit; font-weight: inherit; margin: 0; color: var(--fg); }
 a { color: var(--accent); text-decoration: none; }
 a:hover { color: var(--fg) !important; }
 
-/* ─── Defeat every browser-default blue artifact on tappable surfaces ───
-   The site is tap-anywhere-to-advance. Browser defaults paint various
-   blue/grey shapes that all read as visual noise framing the texts and
-   photos, so we neutralise each one explicitly:
+/* Programmatic focus targets — every overlay's `.inner` is focused
+   by the JS focus-management code (captureFocus / restoreFocus) so
+   screen readers announce the overlay when it opens. They're only
+   reachable programmatically (tabindex="-1"), never by Tab, so the
+   default browser focus ring is just noise. Interactive children
+   inside the .inner blocks keep their own :focus-visible styling
+   untouched (see `.interlude a:focus-visible` below). */
+.inner:focus,
+.inner:focus-visible {
+  outline: none;
+  box-shadow: none;
+}
 
-   1. -webkit-tap-highlight-color
-      iOS Safari and Android Chrome paint a translucent blue/grey
-      rectangle over the tapped element. Visible as a blue frame
-      around centred text on every card-dismiss tap and around the
-      photo on every diptych-advance tap.
-
-   2. :focus default outline on .inner
-      The JS focus-management code programmatically focuses each
-      overlay's .inner block (tabindex="-1") so screen readers
-      announce the overlay. Chromium paints a 2-3px blue ring,
-      Firefox a dotted border, Safari a blue glow. !important
-      defeats any UA stylesheet rule.
-
-   3. :focus-visible
-      Modern browsers use this for keyboard-only focus. Same shape
-      as :focus on .inner — covered with the same reset.
-
-   4. :-moz-focusring
-      Firefox's legacy keyboard-focus pseudo (pre-:focus-visible).
-      Same reset.
-
-   5. :focus on overlay anchors (consent / privacy / contact)
-      Older browsers (iOS Safari < 15.4, Chrome < 86, Firefox < 85)
-      don't support :focus-visible, so the existing lime
-      `.interlude a:focus-visible` rule never matches and the UA
-      blue outline shows through. Reset on plain :focus; modern
-      browsers re-apply the lime ring via the :focus-visible rule
-      that already exists further down the stylesheet.
-
-   6. box-shadow focus rings
-      Some Safari versions render the focus indicator via box-shadow
-      rather than outline. Belt-and-braces reset alongside the
-      outline reset on .inner. */
-
+/* Tap highlight — iOS Safari and Android Chrome paint a translucent
+   blue/grey rectangle over any tapped element by default. On every
+   gate card and on the diptych itself this reads as a flashing blue
+   border around the centred text (or around the photo) on every tap
+   to dismiss / advance. Killing it across all tappable surfaces
+   restores the "nothing but the photograph reacts" feel. */
 #splash, #splash *,
 .interlude, .interlude *,
 #privacy, #privacy *,
 #diptych, #diptych * {
   -webkit-tap-highlight-color: transparent;
-}
-
-/* Note on the four-rule split below: per CSS Selectors Level 4, a
-   comma-separated selector list containing an UNKNOWN pseudo-class
-   silently drops the WHOLE rule (only :is() / :where() have forgiving
-   parsing). :focus-visible was unrecognised in Safari pre-15.4 (March
-   2022); :-moz-focusring is Firefox-only. If they shared a rule with
-   .inner:focus, an older Safari would drop the entire block and the
-   default blue focus ring would show on every overlay despite the
-   reset being "there". Each pseudo gets its own rule so an unknown
-   selector only takes itself down. */
-.inner               { outline: none !important; box-shadow: none !important; }
-.inner:focus         { outline: none !important; box-shadow: none !important; }
-.inner:focus-visible { outline: none !important; box-shadow: none !important; }
-.inner:-moz-focusring{ outline: none !important; box-shadow: none !important; }
-
-.interlude a:focus,
-#privacy a:focus {
-  outline: none;
 }
 
 /* Text-selection colour — browsers default to a system blue

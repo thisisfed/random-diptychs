@@ -24,10 +24,11 @@ Pairings aren't random. On first load every image is downsampled to a 128×128 c
 
 Palette entries carry both HSL and OKLab coordinates. HSL drives the merge heuristic during palette construction and the hue-family detection in repetition catching (two reds are "the same family" even at different lightnesses). OKLab — a perceptually uniform colour space — drives the actual similarity scoring, since Euclidean distance in OKLab tracks how the eye reads colour difference. HSL gets this wrong in both directions: a soft pink and a deep red read as "close" because hue agrees, and two greys at different lightnesses read as "far" despite both being grey.
 
-`pairScore(a, b)` then rewards pairs with:
+`pairScore(a, b)` rewards pairs with:
 
-- **palette contrast** (different dominant colours) — the dominant signal
-- **density contrast** (full-vs-empty composition), but only when palette contrast is already present — so editorial "full vs negative space" pairings surface without false positives from two-blue-but-busy/calm pairs
+- **palette contrast** (different dominant colours) — the dominant signal, raised to a power so moderate similarity loses ground faster than strong contrast
+- **density contrast** (full-vs-empty composition), gated by palette contrast — so editorial "full vs negative space" pairings surface without false positives from two-blue-but-busy/calm pairs
+- **lightness contrast** (one bright, one dim) — an independent reward for the up-and-down editorial dimension, ungated
 - **tonal cohesion** as a faint tiebreaker
 
 …minus penalties for:
@@ -35,10 +36,12 @@ Palette entries carry both HSL and OKLab coordinates. HSL drives the merge heuri
 - **predominant-colour repetition** by hue family (catches "two blues" even at very different lightness)
 - **blank-canvas repetition** — both images dominated by the same low-saturation tone (pale sky + grey wall)
 - **joint desaturation** — pair where neither side carries colour
+- **joint fullness** — both images busy; the eye wants somewhere to rest
+- **joint emptiness** — both images near-empty; minimal-on-minimal feels samey
 
 Of the N×(N−1)/2 possible pairs, the top 250 are kept. Each click draws from that pool with a quality bias (`Math.random() ** 2`), so the very best pairings dominate without ever showing the same one twice in close succession.
 
-A per-image **guarantee branch** runs ~35% of clicks: instead of drawing from the global top-N, it picks a stale image (one not seen for a while) and pairs it with its highest-scoring partner. This keeps the rotation honest — an image with one popular partner doesn't get starved when the partner is in the recent-block window.
+A per-image **guarantee branch** runs ~45% of clicks: instead of drawing from the global top-N, it picks a stale image (one not seen for a while) and pairs it with its highest-scoring partner. This keeps the rotation honest — an image with one popular partner doesn't get starved when the partner is in the recent-block window.
 
 ### Theme
 
@@ -106,9 +109,12 @@ All knobs live at the top of `app.js`. The defaults are tuned for ~150 images; a
 | `VIDEO_MIN_GAP` | `1` | Photo-only clicks required between videos. |
 | `COLOR_SAMPLE_SIZE` | `128` | Side length of the downsampled analysis canvas. |
 | `PALETTE_SIZE` / `HIST_BINS` | `4` / `7` | Colour summary dimensions. |
-| `TONAL_WEIGHT`, `PALETTE_WEIGHT`, `DENSITY_WEIGHT`, `SAT_WEIGHT` | `0.05`, `0.50`, `0.40`, `0.05` | Pair-score weights. Sum ≈ 1. |
-| `REPETITION_PENALTY` | `0.9` | How hard to punish two-of-the-same-hue pairs. |
-| `JOINT_DESAT_PENALTY` | `0.5` | How hard to punish pairs where neither side has colour life. |
+| `TONAL_WEIGHT`, `PALETTE_WEIGHT`, `DENSITY_WEIGHT`, `LIGHTNESS_WEIGHT`, `SAT_WEIGHT` | `0.05`, `0.45`, `0.35`, `0.20`, `0.05` | Pair-score reward weights. |
+| `PALETTE_CONTRAST_POWER` | `2.0` | Exponent applied to palette contrast — concentrates reward at the top of the range. At 2.0, a pair with 0.5 contrast keeps only 25% of full reward, 0.3 keeps 9%. Set 1.0 to disable; 1.5 is a gentler intermediate; 3.0 is very aggressive. |
+| `REPETITION_PENALTY` | `1.1` | How hard to punish two-of-the-same-hue pairs. |
+| `JOINT_DESAT_PENALTY` / `JOINT_DESAT_THRESHOLD` | `0.5` / `0.30` | Penalty for pairs where neither side has colour life, and the avgSat threshold below which the penalty engages. |
+| `JOINT_FULL_PENALTY` / `JOINT_FULL_THRESHOLD` | `0.45` / `0.55` | Penalty for pairs where BOTH images are busy, and the density threshold above which "busy" starts. |
+| `JOINT_EMPTY_PENALTY` / `JOINT_EMPTY_THRESHOLD` | `0.30` / `0.35` | Penalty for pairs where BOTH images are near-empty, and the density threshold below which "empty" starts. |
 | `SIBLING_GROUPS` | `[['97','98']]` | Near-duplicate images that should block each other's slot in `recent`. |
 | `PROGRESS_RATE_PER_SEC` | `60` | Max climb rate of the `Loading… X%` counter. |
 | `SPLASH_MAX_WAIT_MS` | `30000` | Safety cap; splash fades even if loading hasn't completed. |
