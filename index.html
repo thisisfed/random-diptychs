@@ -8,6 +8,13 @@
   <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
   <meta name="theme-color" content="#ffffff">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <!-- iOS Safari auto-detects phone numbers / email addresses / dates
+       in body text and wraps them in its own blue-underlined link
+       elements, ignoring the surrounding author styling. The contact
+       card already wraps the phone in <a href="tel:…">, but iOS can
+       still apply its detection on top. Turning the feature off
+       removes that whole class of forced-blue artifact. -->
+  <meta name="format-detection" content="telephone=no, date=no, address=no, email=no">
 
   <!-- ═══════════════════════════════════════════════
        THEME — SUNRISE / SUNSET
@@ -310,9 +317,6 @@
 <div id="share-toast" aria-live="polite" aria-hidden="true">
   <span id="share-toast-text">Link copied</span>
 </div>
-
-
-<script type="text/javascript" src="/unprotected/back_to_spaceship.js?hash=4975d460e508829e8fb64d3962bc44ad35f3a95a"></script>
 
 
 <script type="text/javascript" src="/unprotected/back_to_spaceship.js?hash=4975d460e508829e8fb64d3962bc44ad35f3a95a"></script>
