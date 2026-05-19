@@ -1948,21 +1948,61 @@ document.querySelectorAll('.interlude').forEach(el => {
   }
   computeTopPairs();
 
-  /* Same selection logic as every other click — bias toward
-     top-scoring pairs, with the per-image guarantee mixing in.
-     recent[] is empty on first paint, so no filtering to dodge.
+  /* First pair: lead with a favorite image when possible.
+     Walks FAVORITE_IMAGES in random order, picks the first one that's
+     a valid image (not video, has a signature), then pairs it with its
+     highest-scoring non-video partner from bestsPerImage. If no favorite
+     is loadable or no eligible partner exists (very rare — only if all
+     favorites failed analysis), falls back to the normal pickPair
+     selection so the gallery always opens with something.
 
-     IMPORTANT: pass allowVideos:false for the FIRST pair. Videos are
-     pre-registered to validImages with fallback colour signatures so
-     they can appear in the rotation from click 2 onwards, but they're
-     not preloaded by the splash — picking a video for the first pair
-     means preparePanel has to fetch the MP4 fresh, which can take
-     2-4s even on decent connections. Consent's Accept/Decline await
-     interludePreload (so the diptych isn't revealed half-decoded),
-     and a video first pair would leave the consent card stuck waiting
-     for the video load. All images are fully cached by the time the
-     splash dismisses, so img.decode() on the first pair is sub-ms. */
-  const firstPair = pickPair(validImages, { allowVideos: false });
+     Why this is wanted: favorites are images you've explicitly marked
+     as ones you don't want to wait to see. Opening the gallery with
+     one signals the curation to anyone who refreshes or visits fresh,
+     and biases the first impression toward photography you stand by.
+
+     IMPORTANT: same allowVideos:false reasoning as the comment block
+     above — first-pair videos would stall the consent card on the
+     MP4 fetch. The favorite-pick is image-only by construction; the
+     partner is explicitly filtered to non-video too. */
+  let firstPair = null;
+  const favoriteSrcs = [...FAVORITE_IMAGES]
+    .map(numToSrc)
+    .filter(s => validImages.includes(s) && !isVideo(s) && colorSignatures.has(s));
+  if (favoriteSrcs.length > 0 && bestsPerImage.size > 0) {
+    /* Shuffle favorites so each refresh leads with a different one
+       (FAVORITE_BOOST handles long-term rotation; the first pair is
+       a single moment and benefits from randomness over staleness). */
+    for (let i = favoriteSrcs.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [favoriteSrcs[i], favoriteSrcs[j]] = [favoriteSrcs[j], favoriteSrcs[i]];
+    }
+    for (const favSrc of favoriteSrcs) {
+      const partners = bestsPerImage.get(favSrc);
+      if (!partners) continue;
+      /* Filter the favorite's top-K partners to non-videos. Then pick
+         randomly from those instead of taking [0] — otherwise every
+         session lands on the favorite's single highest-scoring partner,
+         and across refreshes the same one or two pairs dominate.
+         Random pick across the top-5 keeps the partner high-quality
+         (it's still in this favorite's top-5) while genuinely varying
+         per session. */
+      const eligible = partners.filter(p => !isVideo(p.a) && !isVideo(p.b));
+      if (eligible.length === 0) continue;
+      const partnerPair = eligible[Math.floor(Math.random() * eligible.length)];
+      /* Pair returns [favSrc, partner] — favSrc on the left if it's
+         the .a of the pair, otherwise on the right. Random orientation
+         50/50 to avoid favourites always anchoring the same side. */
+      const other = partnerPair.a === favSrc ? partnerPair.b : partnerPair.a;
+      firstPair = Math.random() < 0.5 ? [favSrc, other] : [other, favSrc];
+      break;
+    }
+  }
+  /* Fallback: no favorites available, or none had a non-video partner.
+     Falls back to the normal selection logic with the same constraints. */
+  if (!firstPair) {
+    firstPair = pickPair(validImages, { allowVideos: false });
+  }
   /* First visit (consent still required) → show consent card on top
      of the loading diptych; consent's Accept/Decline handlers await
      interludePreload before dismissing. Return visit → lift the gate
