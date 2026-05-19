@@ -39,7 +39,7 @@ Palette entries carry both HSL and OKLab coordinates. HSL drives the merge heuri
 - **joint fullness** — both images busy; the eye wants somewhere to rest
 - **joint emptiness** — both images near-empty; minimal-on-minimal feels samey
 
-Of the N×(N−1)/2 possible pairs, the top 250 are kept. Each click draws from that pool with a quality bias (`Math.random() ** 2`), so the very best pairings dominate without ever showing the same one twice in close succession.
+Of the N×(N−1)/2 possible pairs, the top 150 are kept. Each click draws from that pool with a quality bias (`Math.random() ** 2`), so the very best pairings dominate without ever showing the same one twice in close succession.
 
 A per-image **guarantee branch** runs ~45% of clicks: instead of drawing from the global top-N, it picks a stale image (one not seen for a while) and pairs it with its highest-scoring partner. This keeps the rotation honest — an image with one popular partner doesn't get starved when the partner is in the recent-block window.
 
@@ -56,6 +56,17 @@ The threshold is **civil twilight (−6° sun altitude)** rather than geometric 
 Image discovery is parallel batched `HEAD` probes (no manifest needed). The splash shows a smooth `Loading… X%` counter that animates 0→100 over real load progress — capped at 60%/s so even a warm cache shows a legible climb instead of a 0→100 flicker. Every image's display variant is fetched during the splash, so once the gate lifts, every diptych in the session is already cached and decode is sub-ms.
 
 Videos are **not** preloaded. They're registered with a neutral colour signature so they stay eligible for pair scoring, but their MP4 bytes only fetch when a pair containing them is selected. The first pair is forced to images-only via `pickPair(arr, { allowVideos: false })`, since a 2–4 s video fetch behind the consent card would leave the gate stuck.
+
+For accurate video colour pairing, drop a **poster JPG** next to each video — `ff{n}-poster.jpg` alongside `ff{n}.mp4`. The site analyses the poster with the same colour pipeline as the photos (centre-weighted palette, OKLab, density, etc.), so videos pair on real colour rather than a neutral signature. Generate them with ffmpeg:
+
+```bash
+for f in videos/ff*.mp4; do
+  N="${f%.mp4}"
+  ffmpeg -ss 1 -i "$f" -frames:v 1 -q:v 3 "${N}-poster.jpg"
+done
+```
+
+Pick the timestamp (`-ss 1`) that best represents the video. The poster is loaded by the splash like any image and is opt-in per video: videos without posters fall back to runtime frame extraction, then to the neutral signature on failure. Adding posters is the recommended way to get videos pairing correctly, especially because runtime extraction is unreliable on iOS Safari (offscreen videos often won't load, and `canvas.drawImage` can return black frames before play has been called).
 
 ### Shareable pairs
 
@@ -78,7 +89,8 @@ Every 4–7 clicks an interlude card appears: **contact**, **share**, or **welco
 │   ├── jpg/                # ff{N}.jpg (canonical) and ff{N}-{w}.jpg variants
 │   └── avif/               # ff{N}.avif and ff{N}-{w}.avif variants
 └── videos/
-    └── ff{N}.mp4
+    ├── ff{N}.mp4
+    └── ff{N}-poster.jpg    # representative frame, for colour analysis (optional but recommended)
 ```
 
 Images are discovered by probing `images/jpg/ff{1}.jpg`, `ff{2}.jpg`, … in parallel batches of 20 until a batch returns nothing AND a probe two batches ahead also 404s (handles small gaps in numbering without committing to wasted requests). Videos are discovered the same way in their own namespace — `ff1.mp4` is a different asset than `ff1.jpg`, addressed as `v1` in share URLs (`#5,v12`).
@@ -103,7 +115,7 @@ All knobs live at the top of `app.js`. The defaults are tuned for ~150 images; a
 
 | Const | Default | What it does |
 |---|---|---|
-| `TOP_PAIRS_POOL` | `250` | Best-N pairs eligible for selection. Hard floor on quality — pairs ranked worse never appear. For a pool of ~100 items, this is the top ~5% of all possible pairs and yields 500 distinct diptychs. |
+| `TOP_PAIRS_POOL` | `150` | Best-N pairs eligible for selection. Hard floor on quality — pairs ranked worse never appear. For a pool of ~110 items, this is the top ~3% of all possible pairs and yields 300 distinct diptychs. |
 | `RECENT_CLICKS_BLOCK` | `25` | An image can't reappear for this many clicks after being shown. With ~100 images, ~50 are locked at any time. |
 | `CONTACT_MIN` / `CONTACT_MAX` | `4` / `7` | Range for the random interlude cadence. |
 | `GUARANTEE_RATE` | `0.45` | Probability a click draws from the per-image staleness pool rather than the global top-N. ~1 in 2. |
@@ -117,6 +129,7 @@ All knobs live at the top of `app.js`. The defaults are tuned for ~150 images; a
 | `JOINT_DESAT_PENALTY` / `JOINT_DESAT_THRESHOLD` | `0.5` / `0.30` | Penalty for pairs where neither side has colour life, and the avgSat threshold below which the penalty engages. |
 | `JOINT_FULL_PENALTY` / `JOINT_FULL_THRESHOLD` | `0.45` / `0.55` | Penalty for pairs where BOTH images are busy, and the density threshold above which "busy" starts. |
 | `JOINT_EMPTY_PENALTY` / `JOINT_EMPTY_THRESHOLD` | `0.30` / `0.35` | Penalty for pairs where BOTH images are near-empty, and the density threshold below which "empty" starts. |
+| `FALLBACK_TRUST_PENALTY` | `0.40` | Penalty applied to any pair where one side lacks a real colour signature (a video without a poster image — see "Loading" above). Keeps fallback-signed videos out of the global top-N pool until a poster is generated; they still rotate via the per-image guarantee branch. Set to 0 to disable. |
 | `SIBLING_GROUPS` | `[['97','98']]` | Near-duplicate images that should block each other's slot in `recent`. |
 | `FAVORITE_IMAGES` / `FAVORITE_BOOST` | 15 image numbers / `4.0` | Image numbers to give extra rotation priority. Their staleness is multiplied by the boost inside the per-image guarantee branch, so they cycle back roughly `BOOST×` more often than non-favorites would on the algorithm's judgement alone. |
 | `PROGRESS_RATE_PER_SEC` | `60` | Max climb rate of the `Loading… X%` counter. |

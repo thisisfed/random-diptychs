@@ -457,7 +457,11 @@ html.gated #diptych { visibility: hidden; }
      privacy (250) and splash (300). A feedback toast shouldn't
      override the consent flow if it somehow races into being. */
   z-index: 200;
-  transition: opacity 160ms ease;
+  /* 120ms fade in/out — short enough to feel snappy, long enough
+     to be a transition rather than a hard cut. Combined with the
+     500ms hold in showShareToast (see app.js), total visible cycle
+     is ~740ms: a blip you can still read. */
+  transition: opacity 120ms ease;
 }
 #share-toast.visible { opacity: 1; }
 #share-toast-text {

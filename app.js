@@ -167,11 +167,15 @@ const DISCOVER_BATCH = 20;
    distinct diptychs. A hard floor: pairs ranked worse than N can
    never surface, no matter what the random roll does — so use this
    to set the worst-case quality you're willing to accept.
-   At 250, with ~100 items in the pool, that's the top ~5% of the
-   ~4950 possible pairs — strict enough that nothing weak surfaces,
-   loose enough to give long sessions genuine variety (500 distinct
-   diptychs). */
-const TOP_PAIRS_POOL   = 250;
+   At 150, with ~110 items in the pool, that's the top ~3% of the
+   ~6000 possible pairs — strict curation. Yields 300 distinct
+   diptychs. The scoring is calibrated tightly enough (OKLab,
+   centre weighting, paletteContrast^2, lightness contrast, joint
+   penalties, fallback trust, subject groups) that this top 3%
+   is genuinely top-tier. If long sessions start feeling repetitive
+   because the recent-block filter is starving the main pool, lift
+   to 200 or 250. */
+const TOP_PAIRS_POOL   = 150;
 
 /* ─── RANKING WEIGHTS ───
    The ranker rewards two kinds of contrast that must BOTH be
@@ -253,6 +257,25 @@ const JOINT_FULL_THRESHOLD = 0.55;
 const JOINT_EMPTY_PENALTY   = 0.30;
 const JOINT_EMPTY_THRESHOLD = 0.35;
 
+/* Trust penalty for signatures without real colour data — videos
+   that haven't had a poster generated yet (see videoPosterUrl) and
+   fall back to the neutral-grey signature. The fallback's
+   mid-saturation, mid-lightness, flat-histogram values can
+   "accidentally" pair well with achromatic photos under the OKLab
+   colour distance — neither side has any strong colour signal, so
+   `paletteContrast` reads as moderate, no `jointDesat` fires
+   (fallback avgSat is 0.3, exactly at threshold), and the pair
+   sneaks into the top pool with no real basis for the matching.
+   This penalty pushes any pair involving a fallback signature out
+   of the global top-N ranking — they can still appear via the
+   per-image guarantee branch (which doesn't read pair scores), so
+   videos still rotate, just less likely to surface via the main
+   draw until you give them a real signature via poster image.
+   0.40 is firm: a pair with otherwise solid scoring (~0.30) goes
+   firmly negative once this fires. Set to 0 to disable the
+   safeguard entirely. */
+const FALLBACK_TRUST_PENALTY = 0.40;
+
 /* Video pacing — probabilistic, with a minimum gap between videos so
    they never appear back-to-back. VIDEO_RATE is the per-click chance
    once eligible; VIDEO_MIN_GAP is how many photo-only clicks must
@@ -271,7 +294,7 @@ const VIDEO_MIN_GAP = 1;
    coin flip into an active long-term rotation engine.
 
    At 0.45, roughly 1 in 2 clicks rotates the catalogue while the
-   remaining ~1 in 2 follow the quality-biased top-250 selection.
+   remaining ~1 in 2 follow the quality-biased top-150 selection.
    This keeps freshness high — most clicks bring back an under-shown
    image — without entirely abandoning the global quality ranking.
    Higher values surface rare images faster at the cost of pulling
@@ -355,6 +378,30 @@ function numToSrc(n)   { return `${IMAGES_BASE}/jpg/ff${n}.jpg`; }
    still parse as images, so existing share links keep working. */
 function isVideo(src)     { return /\.mp4$/i.test(src); }
 function videoNumToSrc(n) { return `${VIDEO_BASE}/ff${n}.mp4`; }
+
+/* Poster companion image for a video — same directory, same name,
+   '-poster.jpg' suffix. The site loads and analyses this with the
+   regular image-analysis path (analyzeImage) so videos get a real
+   colour signature derived from the same algorithm as the photos,
+   instead of the neutral grey fallback. Reliable on every browser
+   — none of iOS Safari's offscreen-video / canvas-tainting issues
+   that plague runtime frame extraction.
+
+   Generate one per video with ffmpeg. Pick a representative frame
+   roughly 25% in:
+
+     for f in videos/ff*.mp4; do
+       N="${f%.mp4}"
+       ffmpeg -ss 1 -i "$f" -frames:v 1 -q:v 3 "${N}-poster.jpg"
+     done
+
+   Videos without a poster fall back to runtime frame extraction
+   (loadVideoForAnalysis), then to the neutral signature on failure.
+   So adding posters is opt-in per video; everything still works
+   without them, just with worse pairing for those videos. */
+function videoPosterUrl(videoSrc) {
+  return videoSrc.replace(/\.mp4$/i, '-poster.jpg');
+}
 function srcToId(src) {
   if (isVideo(src)) {
     const m = src.match(/ff(\d+)\.mp4$/i);
@@ -843,6 +890,14 @@ function pairScore(a, b) {
   const jointEmpty = Math.max(0, (JOINT_EMPTY_THRESHOLD - maxDensity) /
                                  JOINT_EMPTY_THRESHOLD);
 
+  /* Fallback-signature trust penalty. Either side carrying the
+     isFallback marker (video without a poster yet) deducts a fixed
+     amount, large enough to keep the pair out of the global top-N
+     pool. See FALLBACK_TRUST_PENALTY declaration for rationale.
+     Boolean OR — penalty doesn't double up if both sides are
+     fallback (extremely rare anyway since first pair is photo-only). */
+  const trustPenalty = (a.isFallback || b.isFallback) ? FALLBACK_TRUST_PENALTY : 0;
+
   return tonalScore                                * TONAL_WEIGHT
        + paletteContrastShaped                     * PALETTE_WEIGHT
        + paletteContrast * densityContrast         * DENSITY_WEIGHT
@@ -851,7 +906,8 @@ function pairScore(a, b) {
        - repetition                                * REPETITION_PENALTY
        - jointDesat                                * JOINT_DESAT_PENALTY
        - jointFull                                 * JOINT_FULL_PENALTY
-       - jointEmpty                                * JOINT_EMPTY_PENALTY;
+       - jointEmpty                                * JOINT_EMPTY_PENALTY
+       - trustPenalty;
 }
 
 function computeTopPairs() {
@@ -1275,7 +1331,18 @@ async function loadDiptych(forcedPair) {
    frame to feed to analyzeImage. In both cases the src arg is the
    canonical identifier used in validImages and colorSignatures. */
 function loadOne(src) {
-  if (isVideo(src)) return loadVideoForAnalysis(src);
+  if (isVideo(src)) {
+    /* Poster-first path: try `ff{n}-poster.jpg` next to the video.
+       If present, it's analysed exactly like an image — fast, reliable,
+       same colour algorithm. If absent (or fails to load), fall through
+       to runtime video frame extraction, which works on most desktops
+       but is unreliable on iOS Safari. If both fail, the video keeps
+       its neutral fallback signature from the bulk pre-registration in
+       start() and still appears in the rotation. */
+    return loadVideoPosterForAnalysis(src).then(ok =>
+      ok ? true : loadVideoForAnalysis(src)
+    );
+  }
   return new Promise(resolve => {
     const num = srcToNum(src);
     let attemptIdx = 0;
@@ -1337,7 +1404,46 @@ function fallbackSignature() {
     meanL:     0.5,
     density:   histogramDensity(histogram),
     histMag:   histogramMagnitude(histogram),
+    /* Marker read by pairScore. Any pair where one side is a fallback
+       signature gets FALLBACK_TRUST_PENALTY subtracted from its score
+       so it doesn't sneak into the top-N pool on accidental neutral-
+       neutral matching. The flag is cleared automatically when a real
+       signature replaces this one (via poster image or runtime video
+       frame extraction), since the replacement object doesn't carry
+       the flag. */
+    isFallback: true,
   };
+}
+
+/* Poster-image path for video colour analysis. The user can generate
+   one JPG per video (ff{n}-poster.jpg, same directory as the .mp4) and
+   the site analyses that with analyzeImage exactly like a photo — same
+   colour pipeline, same centre weighting, same OKLab conversion. This
+   is the recommended way to give videos accurate colour signatures.
+   See videoPosterUrl above for the ffmpeg one-liner. Returns true on
+   success (signature stored), false on missing poster or analysis
+   failure — loadOne then falls through to runtime extraction. */
+function loadVideoPosterForAnalysis(src) {
+  return new Promise(resolve => {
+    const img = new Image();
+    img.onload = () => {
+      try {
+        if (!validImages.includes(src)) validImages.push(src);
+        const sig = analyzeImage(img);
+        if (sig) {
+          colorSignatures.set(src, sig);
+          scheduleTopPairs();
+          resolve(true);
+        } else {
+          resolve(false);
+        }
+      } catch {
+        resolve(false);
+      }
+    };
+    img.onerror = () => resolve(false);
+    img.src = videoPosterUrl(src);
+  });
 }
 
 /* Frame extraction for video colour analysis. Creates a hidden
@@ -1631,7 +1737,7 @@ document.querySelectorAll('.interlude').forEach(el => {
   const subtitleEl = splashEl.querySelector('.subtitle');
   const loadingEl  = splashEl.querySelector('.loading');
 
-  let target            = 500;
+  let target            = 300;
   let imageSrcs         = null;
   let splashFinished    = false;
   let splashSafetyTimer = null;
@@ -1685,7 +1791,7 @@ document.querySelectorAll('.interlude').forEach(el => {
   }
 
   /* Update the static subtitle to the real pair count if discovery
-     reveals a different total than the HTML's placeholder "500". */
+     reveals a different total than the HTML's placeholder "300". */
   const unorderedPairs = totalCount * (totalCount - 1) / 2;
   const realTotal      = Math.min(TOP_PAIRS_POOL, unorderedPairs) * 2;
   if (realTotal !== target) {
@@ -2185,15 +2291,17 @@ function showShareToast(text) {
   shareToastEl.classList.add('visible');
   shareToastEl.setAttribute('aria-hidden', 'false');
   clearTimeout(shareToastTimer);
-  /* Hold 1.5s then trigger the CSS fade-out (160ms). Long enough for
-     the user to read "Link copied" with a glance — previously this
-     was 150ms, which is at the floor of conscious recognition and
-     unreadable in practice. 1500ms is the standard transient-toast
-     duration; total visible cycle ~1.66s. */
+  /* Hold 500ms then trigger the CSS fade-out (120ms). A "blip" —
+     fast enough to feel like a flash, slow enough that "Link copied"
+     reads on a single glance. Total visible cycle ~740ms.
+     Previously 1500ms (standard transient-toast duration), which felt
+     too settled-in for this site's lightweight pop-and-go interaction.
+     Going under ~400ms hits the floor of comfortable recognition for
+     a 10-character message; over ~800ms starts feeling like a dwell. */
   shareToastTimer = setTimeout(() => {
     shareToastEl.classList.remove('visible');
     shareToastEl.setAttribute('aria-hidden', 'true');
-  }, 1500);
+  }, 500);
 }
 
 function shareCurrentPair() {
