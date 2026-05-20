@@ -45,6 +45,8 @@ A per-image **guarantee branch** runs ~45% of clicks: instead of drawing from th
 
 **Favorites** override the algorithm's instincts for a small list of hand-picked photos. The scorer sometimes "correctly" deprioritises images that are hard to pair — palette-narrow, very desaturated, very dark — even when those are images the photographer genuinely loves. Adding an image number to `FAVORITE_IMAGES` boosts its staleness weight inside the guarantee branch by a configurable factor (default 4×), so it surfaces meaningfully more often without changing how partners are selected. It's a long-term rotation tilt, not a "show this next" override.
 
+The **first pair** of every session also leads with a favorite: one random favorite image, paired with its highest-scoring non-video partner. This ensures the gallery opens with curated work whatever the algorithm's current state. Falls back to normal selection if no favorites are loadable.
+
 ### Theme
 
 `html.night` is set **before first paint** by inline script in the `<head>`. Sunrise and sunset are computed from a longitude derived from the timezone offset (no geolocation prompt, no third-party call) and a latitude estimated from the IANA zone region. The theme re-evaluates every minute so the palette flips live at the threshold; gated behind `document.visibilityState === 'visible'` so a backgrounded tab is free.
@@ -125,6 +127,7 @@ All knobs live at the top of `app.js`. The defaults are tuned for ~150 images; a
 | `PALETTE_SIZE` / `HIST_BINS` | `4` / `7` | Colour summary dimensions. |
 | `TONAL_WEIGHT`, `PALETTE_WEIGHT`, `DENSITY_WEIGHT`, `LIGHTNESS_WEIGHT`, `SAT_WEIGHT` | `0.05`, `0.45`, `0.35`, `0.20`, `0.05` | Pair-score reward weights. |
 | `PALETTE_CONTRAST_POWER` | `2.0` | Exponent applied to palette contrast — concentrates reward at the top of the range. At 2.0, a pair with 0.5 contrast keeps only 25% of full reward, 0.3 keeps 9%. Set 1.0 to disable; 1.5 is a gentler intermediate; 3.0 is very aggressive. |
+| `MIN_PALETTE_CONTRAST` | `0.25` | Hard floor — pairs below this palette-contrast threshold are excluded from selection entirely (forced score of −10). Catches white-on-white and similar-palette pairs that the graduated reward only deprioritises. Raise to 0.30+ for stricter contrast; lower to 0.20 if too many subtle pairs are filtered; 0 disables. |
 | `REPETITION_PENALTY` | `1.1` | How hard to punish two-of-the-same-hue pairs. |
 | `JOINT_DESAT_PENALTY` / `JOINT_DESAT_THRESHOLD` | `0.5` / `0.30` | Penalty for pairs where neither side has colour life, and the avgSat threshold below which the penalty engages. |
 | `JOINT_FULL_PENALTY` / `JOINT_FULL_THRESHOLD` | `0.45` / `0.55` | Penalty for pairs where BOTH images are busy, and the density threshold above which "busy" starts. |

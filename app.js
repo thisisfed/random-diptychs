@@ -276,6 +276,35 @@ const JOINT_EMPTY_THRESHOLD = 0.35;
    safeguard entirely. */
 const FALLBACK_TRUST_PENALTY = 0.40;
 
+/* Hard palette-contrast floor. Pairs whose paletteContrast falls
+   below this threshold are unconditionally excluded from selection
+   by returning a deeply-negative score that nothing else can clear.
+
+   Why a hard floor on top of the graduated reward? The shaped
+   palette reward (paletteContrast^PALETTE_CONTRAST_POWER × weight)
+   only DEPRIORITISES similar-palette pairs — it doesn't exclude
+   them. With the guarantee branch picking each image's top-K best
+   partners, a narrow-palette source (mostly white, mostly one hue)
+   can find that all of its top-K partners are similar-palette pairs
+   that score moderately rather than strongly. The guarantee branch
+   then surfaces these because they're the "best available" for that
+   source, even though the absolute pair quality is weak.
+
+   The floor cuts those pairs off completely. A narrow-palette image
+   that has no genuinely-contrasting partner just appears less often
+   (only via the main draw, where it gets outranked by stronger
+   pairs). Better than surfacing the bad pair just to give that
+   image airtime.
+
+   At 0.25: pairs need at least moderate palette difference to
+   qualify. Most photo pairs in a varied catalogue clear this
+   easily — typical "good" pairs sit at 0.5–0.8. White-on-white,
+   pale-on-pale, monochrome-on-monochrome are reliably excluded.
+   Raise to 0.30 or 0.35 if even moderate-contrast pairs still feel
+   too similar; drop to 0.20 if too many subtle pairs are being
+   filtered out. Set to 0 to disable the floor entirely. */
+const MIN_PALETTE_CONTRAST = 0.25;
+
 /* Video pacing — probabilistic, with a minimum gap between videos so
    they never appear back-to-back. VIDEO_RATE is the per-click chance
    once eligible; VIDEO_MIN_GAP is how many photo-only clicks must
@@ -825,6 +854,12 @@ function pairScore(a, b) {
   const paletteOverlap  = (directional(a.palette, b.palette) + directional(b.palette, a.palette)) / 2;
   const paletteContrast = 1 - paletteOverlap;
 
+  /* Hard floor — pair score is forced to -10 (well below any natural
+     pair score) if palettes are too similar. See MIN_PALETTE_CONTRAST
+     declaration for the full rationale. Returning early also short-
+     circuits the rest of the computation for failed pairs. */
+  if (paletteContrast < MIN_PALETTE_CONTRAST) return -10;
+
   /* Concentrate reward at the top of the contrast range. With
      PALETTE_CONTRAST_POWER = 2.0: a pair scoring 1.0 keeps full
      reward, a pair at 0.5 drops to 0.25 (halves), at 0.3 drops to
@@ -945,6 +980,32 @@ function computeTopPairs() {
   bestsPerImage = new Map();
   for (const pair of pairs) {
     for (const src of [pair.a, pair.b]) {
+      /* Skip fallback-signature sources entirely. The guarantee branch
+         iterates bestsPerImage keys to find candidate "lead" images for
+         each click — and if a fallback-signed video (one without a
+         poster) is a key, the algorithm picks IT as the lead, then
+         pairs it with whichever of its top-K partners is least-bad.
+         The FALLBACK_TRUST_PENALTY in pairScore deducts equally from
+         all pairs involving that video, so the relative ranking among
+         its partners is unchanged — meaning the "best" partner is still
+         a moderately-similar palette match, which is exactly the kind
+         of pair we don't want to surface.
+
+         By excluding fallback-signed sources from bestsPerImage, those
+         videos can no longer lead the guarantee branch. They still
+         appear via the main draw (with the trust penalty pushing them
+         down in topPairs) and they can still be the PARTNER side of
+         another image's guarantee draw, but only if a non-fallback
+         image picks them — which only happens if they're genuinely
+         in that image's top-K best partners despite the trust penalty.
+
+         The fix is self-disabling: once a video gets a poster image
+         and its signature is replaced by a real one (no isFallback
+         marker), it joins bestsPerImage normally on the next compute.
+         No code change needed when posters arrive. */
+      const srcSig = colorSignatures.get(src);
+      if (srcSig && srcSig.isFallback) continue;
+
       const list = bestsPerImage.get(src);
       if (!list) bestsPerImage.set(src, [pair]);
       else if (list.length < BESTS_PER_IMAGE) list.push(pair);
