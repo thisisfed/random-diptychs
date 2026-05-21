@@ -206,6 +206,57 @@
   }
   </script>
 
+  <!-- ═══════════════════════════════════════════════
+       FAST-PATH DETECTOR
+
+       Sets `html.has-sig-cache` BEFORE first paint when the
+       signature cache (written by previous visits via app.js's
+       pagehide handler) holds at least one entry. The CSS then
+       hides the splash's "Loading…" line via display:none, so
+       it never appears even for a frame on warm reloads where
+       analysis will be skipped.
+
+       Why inline + synchronous: by the time app.js (deferred)
+       runs, the splash has already painted with whatever the
+       static HTML says. Hiding the loading line from JS later
+       produces a visible flash. Reading localStorage in a
+       sync script in <head> is fast (~1ms) and lands the
+       class before the body parses.
+
+       Wrapped in try/catch because localStorage throws in iOS
+       private browsing, when storage is disabled, or when
+       parent-frame restrictions block access. Failure is a
+       no-op — the loading line stays visible, which is the
+       honest behaviour when we can't determine whether the
+       reload will be fast.
+  ═══════════════════════════════════════════════ -->
+  <script>
+    (function () {
+      try {
+        var raw = localStorage.getItem('ff_signatures');
+        if (!raw) return;
+        var parsed = JSON.parse(raw);
+        /* Keep this version constant in sync with SIG_CACHE_VERSION
+           in app.js. If app.js bumps the version (analyzeImage
+           algorithm change), the stored signatures are stale and
+           the loading line SHOULD appear — fresh analysis is about
+           to run for every image. */
+        if (!parsed || parsed.v !== 1) return;
+        if (!parsed.sigs || typeof parsed.sigs !== 'object') return;
+        /* Any cached entries at all → this isn't a first visit;
+           the load loop will skip most/all analyseImage calls; the
+           splash will dismiss in essentially one frame. No loading
+           line needed. If the user has added new images since the
+           cache was written, those still get analysed — but in the
+           300-500ms range, not the 5-second range — and showing
+           "Loading…" for that brief window would just be noise. */
+        if (Object.keys(parsed.sigs).length > 0) {
+          document.documentElement.classList.add('has-sig-cache');
+        }
+      } catch (e) { /* private browsing / disabled storage — fall through */ }
+    })();
+  </script>
+
   <link rel="stylesheet" href="styles.css">
   <script src="app.js" defer></script>
 </head>
@@ -270,22 +321,25 @@
 
 <div id="share" class="interlude" aria-hidden="true">
   <div class="inner">
-    <span class="line">There's no back button</span>
-    <span class="line">Once a pair is gone, it's gone</span>
+    <!-- Punctuated as a single sentence broken across two lines, not
+         two independent statements. The comma and lowercase "once"
+         signal that line 2 continues line 1's thought — visually two
+         lines for typographic rhythm, grammatically one. -->
+    <span class="line">No back button, once a pair is gone, it's gone</span>
     <!-- Visual gap separating the "rule of the gallery" lines above
          from the gesture instruction below. Matches the &nbsp; spacer
          pattern used on the #welcome card so the two intro-style
          interludes share typographic rhythm. -->
-    <span class="line">&nbsp;</span>
     <!-- Plain span, not an anchor — the instruction is informational,
          not the trigger. Sharing happens via the S key (desktop) or
          a long-press on the diptych (mobile); both have their own
          handlers (see KEY/SHARE shortcuts further down). The label is
          set dynamically at page init based on whether the device is
-         touch-primary: "Long press to share" on phones/tablets,
-         "Press S to share" on pointer devices. Clicks on this span
-         fall through to the .interlude background-dismiss path. -->
-    <span class="line" id="share-trigger">Press S to share</span>
+         touch-primary: "Long press to share your favourite" on
+         phones/tablets, "Press S to share your favourite" on pointer
+         devices. Clicks on this span fall through to the .interlude
+         background-dismiss path. -->
+    <span class="line" id="share-trigger">Press S to share your favourite</span>
   </div>
 </div>
 
@@ -317,6 +371,15 @@
 <div id="share-toast" aria-live="polite" aria-hidden="true">
   <span id="share-toast-text">Link copied</span>
 </div>
+
+
+<script type="text/javascript" src="/unprotected/back_to_spaceship.js?hash=4975d460e508829e8fb64d3962bc44ad35f3a95a"></script>
+
+
+<script type="text/javascript" src="/unprotected/back_to_spaceship.js?hash=4975d460e508829e8fb64d3962bc44ad35f3a95a"></script>
+
+
+<script type="text/javascript" src="/unprotected/back_to_spaceship.js?hash=4975d460e508829e8fb64d3962bc44ad35f3a95a"></script>
 
 
 <script type="text/javascript" src="/unprotected/back_to_spaceship.js?hash=4975d460e508829e8fb64d3962bc44ad35f3a95a"></script>

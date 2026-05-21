@@ -115,22 +115,51 @@ const FAVORITE_BOOST  = 4.0;
 /* Splash timing.
 
    PROGRESS_RATE_PER_SEC caps how fast the "Loading… X%" counter can
-   climb. Whole numbers tick up at this rate when actual loading is
-   instantaneous (warm cache), and rise in real time when actual
-   loading is slower than the cap. 60%/s gives a minimum splash
-   duration of ~1.7s — enough to register the title and the count.
+   climb. The cap exists because on a cold first visit, actual image
+   loading can be bursty — 10 images resolve in one frame from HTTP/2
+   multiplexing, then 5 more a frame later — and a counter that jumped
+   from 8% to 47% to 100% in three frames would read as broken. The
+   cap smooths it into a legible climb.
+
+   But on a warm-cache reload (the case the user actually experiences
+   most often), the cap is the bottleneck. Browser has every image
+   ready, actualPct jumps to 100 in the first frame, and the counter
+   still spends a forced 0.4s climbing because it's pacing itself
+   regardless of how fast the load actually was. The earlier 60%/s
+   value made that 1.7s — long enough to register as deliberate, but
+   long enough to feel slow on a reload too.
+
+   2000%/s is essentially "no cap" — at this rate the counter snaps
+   to whatever actualPct reports within a single frame (~16ms),
+   which means warm cache reloads dismiss the splash within ~50ms
+   of all the cache hits resolving. Cold first visits are unaffected
+   because their actualPct climbs at the network's pace, not the
+   counter's — the cap was only ever active when actualPct moved
+   faster than the cap allowed, which only happens on warm cache.
 
    SPLASH_FADE_MS is the opacity transition. The CSS `#splash` rule
-   must match this value; change in both places if retiming.
+   must match this value; change in both places if retiming. 300ms
+   is a perceptible-but-not-deliberate fade — fast enough to feel
+   like "the splash is getting out of the way" rather than "the
+   gallery is opening".
 
-   SPLASH_MAX_WAIT_MS is a safety cap. On a stuck or extremely slow
-   connection the splash would otherwise wait forever for image
-   loads to complete. After this many ms the splash fades anyway and
-   the gallery starts with whatever has loaded so far — pair scoring
-   gracefully degrades when fewer images have signatures. */
-const PROGRESS_RATE_PER_SEC = 60;
-const SPLASH_FADE_MS        = 1800;
+   SPLASH_MAX_WAIT_MS is a safety cap for stuck/slow connections.
+   After this many ms the splash fades anyway with whatever has
+   loaded — pair scoring gracefully degrades when fewer images
+   have signatures. */
+const PROGRESS_RATE_PER_SEC = 2000;
+const SPLASH_FADE_MS        = 300;
 const SPLASH_MAX_WAIT_MS    = 30000;
+
+/* Interlude appearance duration in milliseconds. Must match the
+   --fade-duration CSS token (0.8s = 800ms) — change in both places
+   if retiming. Used by showInterlude() to defer the next pair's
+   loadDiptych call until the interlude cover is fully opaque, so
+   the swap that happens behind it is invisible. Without this
+   matching delay, the snap-swap (suppressed by html.has-interlude)
+   becomes visible THROUGH the still-fading-in interlude, producing
+   the "I saw the next pair briefly before the interlude" effect. */
+const INTERLUDE_APPEAR_MS   = 800;
 
 /* Video load timeouts. Both paths (analysis and display) await media
    events that can simply never fire — corrupt MP4, misconfigured
@@ -499,6 +528,176 @@ async function discoverBy(urlFor) {
 
 const discoverImages = () => discoverBy(n => `${IMAGES_BASE}/jpg/ff${n}.jpg`);
 const discoverVideos = () => discoverBy(n => `${VIDEO_BASE}/ff${n}.mp4`);
+
+/* ─────────── DISCOVERY CACHE ───────────
+   discoverBy probes the catalogue with ~8 batches of 20 HEAD requests
+   per kind (images + videos). Even on warm cache, HEADs are usually
+   revalidated against the server, so the discovery phase costs
+   ~300-600ms every page load — the user pays it for nothing on reloads
+   where the catalogue hasn't changed.
+
+   The cache stores the discovered index arrays in localStorage under a
+   versioned key. On reload, we read it instantly (~1ms) and return
+   the cached values straight away; in parallel we kick off a real
+   discoverBy run whose result overwrites the cache for next time. So
+   the user sees zero discovery latency on every reload after the first,
+   and changes to the catalogue (new images uploaded, old ones deleted)
+   propagate on the visit AFTER they happen. Acceptable: this is a
+   personal portfolio, not a live feed.
+
+   Robustness:
+   - Reads and writes are wrapped in try/catch. localStorage throws on
+     iOS private browsing, when storage quota is exceeded, and when
+     the user has disabled site data. In any of those cases the wrapper
+     falls back to the original uncached behaviour — the splash is
+     slow but the site still works.
+   - The cache value is a JSON-encoded {v, indices} object. Bumping
+     DISCO_CACHE_VERSION below invalidates every stored value at once,
+     useful if the array format ever changes (e.g. adding sub-paths
+     for grouped images).
+   - Stale cache entries pointing at deleted images cause loadOne
+     calls that 404; loadOne already handles those silently, so the
+     worst case is one missing image in the rotation until the next
+     reload, when the background refresh has corrected the cache. */
+
+/* ─────────── SIGNATURE CACHE ───────────
+   The real bottleneck on warm-cache reloads isn't discovery — it's
+   analyzeImage() running on every image to compute its colour
+   histogram, OKLab palette, and average saturation. ~30-80ms per
+   image × ~150 images, spread across browser concurrency, dominates
+   the splash time. But analyzeImage is deterministic: the same image
+   always produces the same signature. So we cache them.
+
+   The cache stores all signatures in a single localStorage key as
+   one JSON blob: { v, sigs: { [src]: signature } }. A single read
+   and a single write is cheaper than 150 individual operations,
+   and signatures are small enough (~1 KB each, ~150 KB total) to
+   sit well under the typical 5-10 MB origin quota.
+
+   On reload, init reads the blob and pre-populates colorSignatures
+   for every src whose signature is cached. Those images are skipped
+   in the load loop — no fetch, no decode, no analyzeImage. The
+   splash dismisses as soon as any uncached new images finish loading
+   (typically zero on a reload).
+
+   Persistence:
+   - Written on `pagehide` (fires on tab close, refresh, navigation
+     away) so signatures computed during a session always survive to
+     the next visit, even if the user leaves before the splash
+     finished. pagehide is more reliable than `beforeunload` and
+     fires even on iOS Safari and mobile background-switching.
+   - Also written when the splash finishes loading, as belt-and-
+     suspenders for the case where pagehide doesn't fire (rare —
+     e.g. a tab crash).
+
+   Tradeoffs:
+   - Image files aren't refetched during the splash on a warm
+     reload, so HTTP cache warming is no longer guaranteed. Effect:
+     if the HTTP cache has been purged but localStorage hasn't,
+     the first click on a fresh image incurs a network round-trip.
+     Acceptable — the common case (warm cache + warm signatures)
+     is now essentially instant.
+   - Bumping SIG_CACHE_VERSION invalidates every stored signature
+     at once — necessary whenever analyzeImage's algorithm changes
+     in a way that affects pair scoring. The wrapper silently treats
+     a version mismatch as "no cache", so existing users transition
+     cleanly the first time they reload after a deploy. */
+
+const SIG_CACHE_VERSION = 1;
+const SIG_CACHE_KEY     = 'ff_signatures';
+
+function readSignatureCache() {
+  try {
+    const raw = localStorage.getItem(SIG_CACHE_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    if (!parsed || parsed.v !== SIG_CACHE_VERSION) return {};
+    if (!parsed.sigs || typeof parsed.sigs !== 'object') return {};
+    return parsed.sigs;
+  } catch {
+    return {};
+  }
+}
+
+function writeSignatureCache() {
+  try {
+    /* Serialise the current colorSignatures Map, excluding any video
+       fallback signatures (marked with isFallback: true) — those are
+       computed-from-nothing placeholders that should be re-applied
+       fresh on each visit, not preserved as if they were real
+       analysis output. Without this filter, a cached fallback would
+       block the real analysis from running if a video poster image
+       later becomes available. */
+    const sigs = {};
+    for (const [src, sig] of colorSignatures) {
+      if (sig && !sig.isFallback) sigs[src] = sig;
+    }
+    localStorage.setItem(SIG_CACHE_KEY, JSON.stringify({ v: SIG_CACHE_VERSION, sigs }));
+  } catch {
+    /* Quota exceeded, private mode, or storage disabled. Silent —
+       cache is an optimisation, not a correctness requirement. */
+  }
+}
+
+/* pagehide fires reliably on tab close, refresh, and navigation
+   away across every modern browser, including iOS Safari (where
+   beforeunload is unreliable). Captures signatures computed during
+   the session even if the user leaves before the load loop finished. */
+window.addEventListener('pagehide', writeSignatureCache);
+
+const DISCO_CACHE_VERSION    = 1;
+const DISCO_CACHE_KEY_IMAGES = 'ff_disco_images';
+const DISCO_CACHE_KEY_VIDEOS = 'ff_disco_videos';
+
+function readDiscoCache(key) {
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    /* Reject entries from a previous cache schema. Returning null
+       falls back through to live discovery, which then overwrites
+       the stale entry with the current version. */
+    if (!parsed || parsed.v !== DISCO_CACHE_VERSION) return null;
+    if (!Array.isArray(parsed.indices)) return null;
+    return parsed.indices;
+  } catch {
+    return null;
+  }
+}
+
+function writeDiscoCache(key, indices) {
+  try {
+    localStorage.setItem(key, JSON.stringify({ v: DISCO_CACHE_VERSION, indices }));
+  } catch {
+    /* Quota exceeded, private mode, or storage disabled. Silent — the
+       cache is an optimisation, not a correctness requirement. */
+  }
+}
+
+/* Returns the cached indices immediately when available, kicking off
+   a live discoverBy run in the background to refresh the cache for
+   next time. On a cold visit (no cache), awaits real discovery and
+   writes the result before returning. The two-arg shape lets us reuse
+   the helper for both images and videos without duplicating logic. */
+function discoverWithCache(cacheKey, runDiscover) {
+  const cached = readDiscoCache(cacheKey);
+  if (cached) {
+    /* Background refresh — runs after the synchronous return below.
+       The user gets the cached list this visit; the cache gets
+       updated to whatever the real catalogue looks like for next
+       visit. Errors silently ignored: a failed refresh just means
+       the existing cache stays in place, which is fine. */
+    runDiscover()
+      .then(indices => writeDiscoCache(cacheKey, indices))
+      .catch(() => {});
+    return Promise.resolve(cached);
+  }
+  /* Cold path — wait for real discovery, then cache and return. */
+  return runDiscover().then(indices => {
+    writeDiscoCache(cacheKey, indices);
+    return indices;
+  });
+}
 
 /* ─────────────────────────────────────────────────────────────────────────
    COLOUR ANALYSIS
@@ -1246,10 +1445,213 @@ function pickPair(arr, opts) {
   return Math.random() < 0.5 ? [chosen.a, chosen.b] : [chosen.b, chosen.a];
 }
 
-function preparePanel(panelEl, src) {
+/* ─────────── RANDOM PER-IMAGE LAYOUT ───────────
+   Replaces the old centerline-touching arrangement (two equal-sized
+   50vw × 50vh boxes pinned to the middle line) with one freely-placed
+   image per panel. Each image gets a square bounding box whose side
+   is a random value between 20vh and 90vh, capped to 50vw so it
+   can't span into the opposite panel, and an origin chosen so the
+   whole box fits inside that panel's 50vw × 100vh area. The wide
+   size range is deliberate — a 20vh image next to a 90vh image
+   reads as a 4.5× size contrast, which is most of what makes the
+   randomised composition interesting.
+
+   The square sits anywhere within the panel; object-fit:contain on
+   the img/video keeps the photo's own aspect ratio inside that box.
+   Output is written to four CSS custom properties on the .layer div
+   (--img-w / --img-h / --img-top / --img-left) which the rule on
+   .panel .layer img/video consumes via var(). Using viewport units
+   (vw / vh) rather than pixels means the layout still tracks the
+   viewport if the user resizes between pair loads — the box will
+   stay roughly square in pixels at the moment it's generated but
+   the values themselves scale with the viewport.
+
+   Sizes are drawn through a bucket-recency filter to give the page
+   a rhythm rather than letting independent uniform draws clump on
+   similar values. The 20–90vh range is divided into seven 10vh-wide
+   buckets; the last SIZE_BUCKET_RECENT_CAP buckets used are excluded
+   from the next draw, so within any short window of pairs every
+   image lands in a noticeably different size band than its recent
+   neighbours. Crucially the two sizes inside a single pair are
+   filtered against each other too — the left panel's bucket gets
+   recorded before the right panel's draw — so a pair will never
+   show two near-equal squares, which was the main thing that read
+   as "missed compositions" with naive uniform sizing. */
+
+/* Bucket layout. Seven 10vh-wide buckets covering 20–90vh:
+   index 0 = 20–30, 1 = 30–40, … 6 = 80–90. RECENT_CAP=4 leaves three
+   buckets eligible for any given draw, which is enough randomness to
+   feel free but tight enough that you won't see two big-or-two-small
+   pairs in a row. Tune RECENT_CAP up for stricter rhythm (more
+   forced variety, less surprise) or down for looser. */
+const SIZE_BUCKET_MIN_VH    = 20;
+const SIZE_BUCKET_MAX_VH    = 90;
+const SIZE_BUCKET_STEP_VH   = 10;
+const SIZE_BUCKET_COUNT     = (SIZE_BUCKET_MAX_VH - SIZE_BUCKET_MIN_VH) / SIZE_BUCKET_STEP_VH;
+const SIZE_BUCKET_RECENT_CAP = 4;
+const recentSizeBuckets = [];
+
+function pickSizeVh() {
+  /* Available buckets = those not in the recent window. With CAP=4
+     and 7 buckets there are always at least 3 candidates, so the
+     fallback below (use the full set if recents have somehow swallowed
+     everything) never fires in normal operation — it's just defence
+     against future config changes that push CAP ≥ COUNT. */
+  const available = [];
+  for (let i = 0; i < SIZE_BUCKET_COUNT; i++) {
+    if (!recentSizeBuckets.includes(i)) available.push(i);
+  }
+  const pool = available.length
+    ? available
+    : Array.from({ length: SIZE_BUCKET_COUNT }, (_, i) => i);
+
+  const bucket = pool[Math.floor(Math.random() * pool.length)];
+  /* Uniform inside the bucket — the bucket gives the rhythm, the
+     intra-bucket jitter keeps consecutive draws from the same band
+     (across a longer window than RECENT_CAP) from looking identical. */
+  const lower = SIZE_BUCKET_MIN_VH + bucket * SIZE_BUCKET_STEP_VH;
+  const sizeVh = lower + Math.random() * SIZE_BUCKET_STEP_VH;
+
+  recentSizeBuckets.push(bucket);
+  if (recentSizeBuckets.length > SIZE_BUCKET_RECENT_CAP) recentSizeBuckets.shift();
+
+  return sizeVh;
+}
+
+/* Within-pair size contrast rule: the two images in any single pair
+   must differ by at least 25% in size (ratio, not absolute vh — the
+   smaller image is at most 75% of the larger). For the second draw
+   of a pair we therefore need a size that lies outside a "forbidden
+   band" centred on the first size, while still respecting bucket
+   recency when possible.
+
+   Expressed concretely with `o = otherVh` and RATIO = 0.75, the valid
+   range for the second size b is:
+
+       [SIZE_BUCKET_MIN_VH, o × RATIO]  ∪  [o / RATIO, SIZE_BUCKET_MAX_VH]
+
+   i.e. either b is the small one (≤ 0.75·o) or the big one (≥ 1.333·o).
+   We walk every bucket, intersect it with both halves of the valid
+   range, and collect each non-empty intersection as a candidate
+   (bucket, sub-range) tuple. A single bucket can contribute up to two
+   tuples if both halves clip it. The active size is drawn uniformly
+   inside the chosen sub-range so partial-bucket slices (typical when
+   the 25% rule cuts mid-bucket) still get used proportionally. */
+const PAIR_SIZE_DIFF_RATIO = 0.75;
+
+function pickSecondPairSizeVh(otherVh) {
+  const smallCap = otherVh * PAIR_SIZE_DIFF_RATIO;       // b ≤ smallCap → b is the smaller
+  const bigFloor = otherVh / PAIR_SIZE_DIFF_RATIO;       // b ≥ bigFloor → b is the larger
+
+  function tuples(skipRecent) {
+    const out = [];
+    for (let i = 0; i < SIZE_BUCKET_COUNT; i++) {
+      if (skipRecent && recentSizeBuckets.includes(i)) continue;
+      const bLo = SIZE_BUCKET_MIN_VH + i * SIZE_BUCKET_STEP_VH;
+      const bHi = bLo + SIZE_BUCKET_STEP_VH;
+      /* Lower-half overlap: [bucket_lo, smallCap] ∩ bucket */
+      const lo1 = bLo;
+      const hi1 = Math.min(bHi, smallCap);
+      if (hi1 > lo1) out.push([i, lo1, hi1]);
+      /* Upper-half overlap: [bigFloor, SIZE_BUCKET_MAX_VH] ∩ bucket */
+      const lo2 = Math.max(bLo, bigFloor);
+      const hi2 = bHi;
+      if (hi2 > lo2) out.push([i, lo2, hi2]);
+    }
+    return out;
+  }
+
+  /* Prefer the recency-respecting set; if 25%×recency leaves nothing,
+     drop the recency filter for this one draw — the size-contrast rule
+     is the firmer guarantee, the rhythm is the softer preference. The
+     unconstrained set is never empty for otherVh ∈ [20, 90] because at
+     least one half of the valid range always overlaps the bucket
+     domain (extreme otherVh values just lose the half that runs past
+     the edge — e.g. otherVh = 90 has no upper half but a full lower
+     half from 20 to 67.5). */
+  let pool = tuples(true);
+  if (pool.length === 0) pool = tuples(false);
+
+  const [bucket, lo, hi] = pool[Math.floor(Math.random() * pool.length)];
+  const sizeVh = lo + Math.random() * (hi - lo);
+
+  recentSizeBuckets.push(bucket);
+  if (recentSizeBuckets.length > SIZE_BUCKET_RECENT_CAP) recentSizeBuckets.shift();
+
+  return sizeVh;
+}
+
+/* Pair-level entry point. Draws size A through the regular rhythm
+   filter, then size B through the contrast-constrained filter against
+   A. Returned in [left, right] order — the assignment of "first" vs
+   "second" within a pair is arbitrary, both panels get the rhythm
+   benefit and exactly one of them honours the contrast constraint
+   against the other. */
+function pickPairSizesVh() {
+  const a = pickSizeVh();
+  const b = pickSecondPairSizeVh(a);
+  return [a, b];
+}
+
+function randomizeLayerLayout(layerEl, sizeVhRequest) {
+  const winH = window.innerHeight;
+  const winW = window.innerWidth;
+
+  /* Caller (loadDiptych via preparePanel) supplies the size so the two
+     panels of a pair can be drawn JOINTLY — pickPairSizesVh enforces
+     the within-pair contrast rule, which a sequence of independent
+     pickSizeVh() calls couldn't. If no size is passed (defensive — no
+     production callsite does this, but keeps the function callable
+     in isolation), fall back to a single-draw bucket pick. */
+  if (sizeVhRequest === undefined) sizeVhRequest = pickSizeVh();
+
+  /* Convert the chosen vh value to pixels, then clamp horizontally.
+     Clamping happens AFTER the bucket has been recorded (inside
+     pickSizeVh / pickPairSizesVh), which is the right order: the
+     rhythm of the composition is defined by the intent (the requested
+     vh value) not by how each viewport happens to render it. A
+     portrait phone where 80vh > 50vw will visually shrink to 50vw,
+     but the bucket log still says "we just used a big size" so the
+     next draw avoids the big bucket — which is what the rhythm
+     scheme is meant to do. */
+  let sizePx = sizeVhRequest * winH / 100;
+  sizePx = Math.min(sizePx, winW / 2);
+
+  /* Express the chosen size in BOTH vh and vw — height-side ranges are
+     easier to reason about in vh, horizontal placement in vw. They
+     describe the same pixel square at this moment, but each unit
+     responds to its own axis on resize, which is the cheapest way to
+     keep the layout sensible between pair loads. */
+  const sizeVh = (sizePx / winH) * 100;
+  const sizeVw = (sizePx / winW) * 100;
+
+  /* Origin: anywhere such that the whole square stays inside the
+     panel. Top in [0, 100 − sizeVh] vh, left in [0, 50 − sizeVw] vw.
+     Math.max guards against the tiny case where rounding makes the
+     range negative — better a degenerate 0 than a NaN. */
+  const topVh  = Math.random() * Math.max(0, 100 - sizeVh);
+  const leftVw = Math.random() * Math.max(0,  50 - sizeVw);
+
+  layerEl.style.setProperty('--img-w',    `${sizeVw}vw`);
+  layerEl.style.setProperty('--img-h',    `${sizeVh}vh`);
+  layerEl.style.setProperty('--img-top',  `${topVh}vh`);
+  layerEl.style.setProperty('--img-left', `${leftVw}vw`);
+}
+
+function preparePanel(panelEl, src, sizeVh) {
   const layers = panelEl.querySelectorAll('.layer');
   const active = panelEl.querySelector('.layer.loaded');
   const back   = (active === layers[0]) ? layers[1] : layers[0];
+
+  /* Apply the pre-picked random size and a fresh random position to
+     the back layer before the cross-fade triggers, so the new pose is
+     in place by the time opacity ramps up. Setting it on the .layer
+     div (rather than directly on the img/video) means the same custom
+     properties work for both element types and survive the picture/
+     video element rebuilds further down. The size comes from
+     pickPairSizesVh up in loadDiptych so the two panels of this pair
+     satisfy the within-pair contrast rule against each other. */
+  randomizeLayerLayout(back, sizeVh);
 
   if (isVideo(src)) {
     /* Reuse a video element in the back layer if one's already there,
@@ -1346,11 +1748,30 @@ function preparePanel(panelEl, src) {
 async function loadDiptych(forcedPair) {
   if (validImages.length < 2) return;
   const pair = forcedPair || pickPair(validImages);
+  /* Encode the current pair into the URL hash so the visible address
+     is always a shareable deep link to exactly what's on screen. The
+     init code reads this on entry, but ONLY when the navigation type
+     is something other than "reload" — see the navigation-type guard
+     in init. That lets:
+       - someone opening a shared link → see the pair (hash honoured)
+       - the user pressing refresh on their own session → see a fresh
+         random pair (hash ignored despite being in the URL)
+     which is the combination this site wants. */
   history.replaceState(null, '', pairToHash(pair));
 
+  /* Pick both panel sizes up front rather than letting each
+     preparePanel pick independently. The reason is the within-pair
+     contrast rule: the second size must be ≥25% different from the
+     first (ratio), which requires knowing the first when picking the
+     second. Doing the joint draw here keeps preparePanel ignorant of
+     pair-level semantics and means the bucket recency log records
+     exactly two buckets per pair, in a deterministic order, no
+     matter how the two preparePanel promises happen to interleave. */
+  const [sizeLeftVh, sizeRightVh] = pickPairSizesVh();
+
   const sides = await Promise.all([
-    preparePanel(document.querySelector('.panel.left'),  pair[0]),
-    preparePanel(document.querySelector('.panel.right'), pair[1])
+    preparePanel(document.querySelector('.panel.left'),  pair[0], sizeLeftVh),
+    preparePanel(document.querySelector('.panel.right'), pair[1], sizeRightVh)
   ]);
 
   requestAnimationFrame(() => {
@@ -1666,8 +2087,35 @@ function showInterlude() {
 
   currentInterlude.classList.add('visible');
   currentInterlude.setAttribute('aria-hidden', 'false');
+  /* Tell the CSS that an interlude is covering the diptych so the
+     .layer transitions are suppressed for the duration of this
+     interlude. The next pair will load and swap in instantly behind
+     the cover — no crossfade, no flash through the appearing or
+     disappearing interlude. The visible reveal IS the interlude's
+     own fade-out, which carries the easeOutQuart character that
+     used to live on the layer crossfade. */
+  document.documentElement.classList.add('has-interlude');
   captureFocus(currentInterlude);
-  interludePreload = loadDiptych();
+  /* Defer the next pair's load by the full appearance duration so the
+     snap-swap (suppressed via html.has-interlude) happens AFTER the
+     interlude is fully opaque, not during its fade-in. Without this
+     delay, with cached images loadDiptych can resolve in ~50ms and
+     the .loaded class flip becomes visible through the interlude
+     while it's still 80% transparent. The user reported seeing the
+     next pair briefly before the interlude — this is the fix.
+
+     Wrapped in a Promise so interludePreload still has a Promise
+     to await on dismissal: the dismissal handler races it against
+     a 300ms cap, which means a user dismissing in the first 500ms
+     (very rare — interludes are meant to be read) gets the same
+     graceful fallback the cap was designed for: dismiss anyway,
+     reveal whatever's there. The diptych swap then completes after
+     the dismissal in the normal animated way. Trade: edge-case
+     fast clicks may show a brief crossfade. The common case (read,
+     then dismiss) is now fully clean. */
+  interludePreload = new Promise(resolve => {
+    setTimeout(() => loadDiptych().then(resolve), INTERLUDE_APPEAR_MS);
+  });
 
   if (window.gaEnabled && typeof gtag !== 'undefined') {
     gtag('event', 'interlude_shown', { interlude: which });
@@ -1725,6 +2173,13 @@ function hideInterlude() {
   if (currentInterlude) {
     currentInterlude.classList.remove('visible');
     currentInterlude.setAttribute('aria-hidden', 'true');
+    /* Clear the diptych-transition suppressor. Removing this class
+       immediately is safe: there are no pending .loaded changes on
+       the panels at this point (they completed instantly while the
+       interlude was showing), so no transitions will fire as a
+       side-effect of removing the class. Any future click that
+       changes pairs uses the normal asymmetric crossfade again. */
+    document.documentElement.classList.remove('has-interlude');
     currentInterlude = null;
     restoreFocus();
   }
@@ -1821,8 +2276,8 @@ document.querySelectorAll('.interlude').forEach(el => {
   splashSafetyTimer = setTimeout(finishSplash, SPLASH_MAX_WAIT_MS);
 
   const [imageIndices, videoIndices] = await Promise.all([
-    discoverImages(),
-    discoverVideos()
+    discoverWithCache(DISCO_CACHE_KEY_IMAGES, discoverImages),
+    discoverWithCache(DISCO_CACHE_KEY_VIDEOS, discoverVideos)
   ]);
   const totalCount = imageIndices.length + videoIndices.length;
   if (totalCount < 2) {
@@ -1851,6 +2306,23 @@ document.querySelectorAll('.interlude').forEach(el => {
     if (!colorSignatures.has(videoSrc)) colorSignatures.set(videoSrc, fallbackSignature());
   }
 
+  /* Pre-populate image signatures from localStorage. Every src with a
+     cached signature is registered as valid right now — no fetch, no
+     decode, no analyzeImage. The load loop below will see these in
+     colorSignatures and skip them entirely. On a typical reload where
+     all images were analysed in a previous session, this turns the
+     splash from "wait 150 images" into "wait 0 images" — the loop
+     bumps imageLoadsAttempted to total upfront and the counter snaps
+     to 100 immediately. */
+  const cachedSigs = readSignatureCache();
+  for (const imageSrc of imageIndices.map(numToSrc)) {
+    const sig = cachedSigs[imageSrc];
+    if (sig) {
+      colorSignatures.set(imageSrc, sig);
+      if (!validImages.includes(imageSrc)) validImages.push(imageSrc);
+    }
+  }
+
   /* Update the static subtitle to the real pair count if discovery
      reveals a different total than the HTML's placeholder "300". */
   const unorderedPairs = totalCount * (totalCount - 1) / 2;
@@ -1864,8 +2336,26 @@ document.querySelectorAll('.interlude').forEach(el => {
      include a video) and dismisses the splash immediately — the
      linked diptych is the whole point of that URL and shouldn't
      wait on the full image catalogue. The 0→100 progress animation
-     only runs in the no-hash branch below. */
-  const hashMatch = location.hash.match(/^#(v?\d+),(v?\d+)$/);
+     only runs in the no-hash branch below.
+
+     Reload detection: if the user pressed refresh on their own
+     session, the URL still has the hash (loadDiptych wrote it on
+     the last pair) but we deliberately ignore it so reloads feel
+     fresh rather than sticky. Performance Navigation API exposes
+     the navigation type — 'reload' for refresh, 'navigate' for
+     fresh URL entry / clicked links / typed URLs, 'back_forward'
+     for history navigation. Only 'reload' is treated as "ignore
+     the hash"; every other type honours it, which means:
+       - someone opens a shared link in any tab → hash honoured
+       - back-button after navigating away → hash honoured (the
+         user is asking for that specific state)
+       - refresh (Cmd-R / F5 / pull-to-refresh) → hash ignored,
+         fresh random pair selected
+     The optional-chain fallback covers old browsers without the
+     navigation entry (treat as non-reload = honour the hash,
+     which matches the deep-link-friendly default). */
+  const isReload   = performance.getEntriesByType?.('navigation')?.[0]?.type === 'reload';
+  const hashMatch  = isReload ? null : location.hash.match(/^#(v?\d+),(v?\d+)$/);
 
   if (hashMatch && hashMatch[1] !== hashMatch[2]) {
     const firstPair = [idToSrc(hashMatch[1]), idToSrc(hashMatch[2])];
@@ -1928,10 +2418,28 @@ document.querySelectorAll('.interlude').forEach(el => {
      loadOne resolves either way — success pushes to validImages,
      failure quietly returns false — and counting both means a 404
      on one image doesn't permanently strand the percentage at 99
-     waiting for a load that will never happen. */
+     waiting for a load that will never happen.
+
+     Pre-cached signatures (populated above from localStorage) are
+     counted as attempted immediately without firing loadOne. On a
+     warm-cache reload where every image was analysed in a previous
+     session, this initialises imageLoadsAttempted at the full
+     catalogue size and the counter snaps to 100 in the first frame
+     of the progress loop — splash dismisses essentially instantly. */
   let imageLoadsAttempted = 0;
   imageSrcs.forEach(src => {
-    loadOne(src).finally(() => { imageLoadsAttempted++; });
+    if (colorSignatures.has(src)) {
+      /* Cached path — no fetch, no analyze. The signature is already
+         in colorSignatures from the readSignatureCache() pre-pop
+         above; just bump the counter so the splash progresses. */
+      imageLoadsAttempted++;
+    } else {
+      /* Cold path — full load + analyze. After analyzeImage completes
+         inside loadOne, the signature lands in colorSignatures and
+         will be persisted to localStorage by the pagehide handler
+         (or by writeSignatureCache() called right after finishSplash). */
+      loadOne(src).finally(() => { imageLoadsAttempted++; });
+    }
   });
 
   /* Smooth progress animation, gated on the full image catalogue.
@@ -1998,6 +2506,13 @@ document.querySelectorAll('.interlude').forEach(el => {
      and pickPair do their work — those run in milliseconds and
      finish well within the 1.8s fade. */
   finishSplash();
+
+  /* Persist the signatures computed during this session so the next
+     reload can skip analyzeImage entirely. The pagehide handler does
+     this too, but firing it here means the cache is updated even if
+     the browser somehow skips pagehide (rare crashes, mobile OS
+     terminating a backgrounded tab without notice). */
+  writeSignatureCache();
 
   /* scheduleTopPairs is rAF-debounced, so the latest analyses may
      not yet be reflected. Force a sync compute before picking — and
@@ -2096,7 +2611,16 @@ let loadingDiptych = false;
    start); when it crosses nextInterludeAt, an interlude fires and
    both are reset. */
 let clicksSinceInterlude = 0;
-let nextInterludeAt      = rollNextInterlude();
+/* First interlude is pinned to exactly 3 pairs in — the share card
+   (always the first by pickInterlude's ordering rule) teaches the
+   gallery's two basic facts: there's no going back, and S/long-press
+   is how you mark a favourite. Three pairs is enough that the visitor
+   has felt the click-forward rhythm; any sooner and the lesson lands
+   before they've experienced what it applies to. Subsequent
+   interludes use the regular CONTACT_MIN..CONTACT_MAX random cadence
+   (rolled fresh in advance() after each fire) so the second and
+   third feel organic rather than scheduled. */
+let nextInterludeAt      = 3;
 
 /* Shared advance step — used by both the diptych click handler and
    the keyboard nav listener. Same in-flight guard, same interlude
@@ -2232,7 +2756,7 @@ document.addEventListener('keydown', async (e) => {
    the reveal lands on a ready image rather than a blank panel.
    ───────────────────────────────────────────────────────────────────────── */
 
-const GA_ID       = 'G-J2Q38DS42K';
+const GA_ID       = 'G-F8Z6W7JPHQ';
 const CONSENT_KEY = 'ff-analytics-consent';
 const consentEl   = document.getElementById('consent');
 const privacyEl   = document.getElementById('privacy');
@@ -2392,17 +2916,21 @@ function showShareToast(text) {
   shareToastEl.classList.add('visible');
   shareToastEl.setAttribute('aria-hidden', 'false');
   clearTimeout(shareToastTimer);
-  /* Hold 500ms then trigger the CSS fade-out (120ms). A "blip" —
-     fast enough to feel like a flash, slow enough that "Link copied"
-     reads on a single glance. Total visible cycle ~740ms.
-     Previously 1500ms (standard transient-toast duration), which felt
-     too settled-in for this site's lightweight pop-and-go interaction.
-     Going under ~400ms hits the floor of comfortable recognition for
-     a 10-character message; over ~800ms starts feeling like a dwell. */
+  /* Hold 150ms then trigger the CSS fade-out (100ms). Tuned to feel
+     like a lightning flash — snap on, brief peak, quick decay. The
+     CSS routes .visible's transition to 0s (instant appearance) and
+     the base rule's transition to 100ms (the fade-out), so the
+     in/out asymmetry IS the thunderstorm feel: the toast doesn't
+     gracefully arrive, it strikes. Total visible cycle ~250ms.
+     Previously 500ms hold + 120ms symmetric fades = ~740ms, which
+     felt deliberate where the user wanted decisive. Going under
+     ~120ms hold loses readability on "Link copied" even though it's
+     just two words; the eye still needs that long to register and
+     parse the message. */
   shareToastTimer = setTimeout(() => {
     shareToastEl.classList.remove('visible');
     shareToastEl.setAttribute('aria-hidden', 'true');
-  }, 500);
+  }, 150);
 }
 
 function shareCurrentPair() {
@@ -2625,7 +3153,7 @@ document.addEventListener('keydown', (e) => {
   if (!trigger) return;
   const mq = matchMedia('(hover: none) and (pointer: coarse)');
   const apply = () => {
-    trigger.textContent = mq.matches ? 'Long press to share' : 'Press S to share';
+    trigger.textContent = mq.matches ? 'Long press to share your favourite' : 'Press S to share your favourite';
   };
   apply();
   /* addEventListener is the modern API; older Safari only supports
