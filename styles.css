@@ -37,7 +37,7 @@
      curves and crossfades-with-random-positions are basically
      incompatible — pick one. Ghost-free was the request. */
   --fade-duration:     0.8s;
-  --fade-out-duration: 0.3s;
+  --fade-out-duration: 0.2s;
   --fade-curve:     cubic-bezier(0.25, 1, 0.5, 1);  /* easeOutQuart — incoming */
   --fade-out-curve: cubic-bezier(0.25, 1, 0.5, 1);  /* easeOutQuart — outgoing */
 }
@@ -53,16 +53,37 @@ html.night {
    restate it here, because the `transition` shorthand replaces the
    full transition list (not just the color parts) and `html.theme-ready X`
    has higher specificity than `X` alone. Without this, the splash,
-   interludes, and privacy slide would snap in/out instead of fading. */
+   interludes, and privacy slide would snap in/out instead of fading.
+
+   Asymmetric fade direction (interludes): the appear and disappear
+   directions use different durations. To preserve that under the
+   `html.theme-ready` cascade, we split into TWO rules — one for the
+   base state (.interlude alone, disappear destination) using
+   --fade-out-duration, and one for the visible state (interlude.visible,
+   appear destination) using --fade-duration. The visible variant's
+   specificity (0,3,1) beats the base (0,2,1), so each direction picks
+   up the right duration. Without this split, both directions were
+   inheriting --fade-duration from a single shared rule (the old bug:
+   intended fast disappear became slow). */
 html.theme-ready body,
 html.theme-ready .panel {
   transition: background-color 1.2s ease, color 1.2s ease;
 }
 html.theme-ready #splash {
-  transition: opacity var(--fade-duration) var(--fade-curve),
+  /* Splash only fades out (never back in), and the JS removes the
+     element at SPLASH_FADE_MS + 50 = 350ms — keep this duration in
+     sync with that constant. */
+  transition: opacity 0.3s var(--fade-curve),
               background-color 1.2s ease, color 1.2s ease;
 }
 html.theme-ready .interlude {
+  /* Disappear destination — fast (0.2s). */
+  transition: opacity var(--fade-out-duration) var(--fade-out-curve),
+              background-color 1.2s ease, color 1.2s ease;
+}
+html.theme-ready .interlude.visible {
+  /* Appear destination — slow (0.8s). Higher specificity than the
+     base `.interlude` rule above, so it wins for the visible state. */
   transition: opacity var(--fade-duration) var(--fade-curve),
               background-color 1.2s ease, color 1.2s ease;
 }
@@ -149,8 +170,8 @@ a:hover { color: var(--fg) !important; }
    opacity 1 when the gate lifts, no popping. */
 html.gated #diptych { visibility: hidden; }
 
-/* Welcome card inherits the global --fade-duration (0.65s) and
-   --fade-curve (easeInOutQuart) — same fade as every other interlude
+/* Welcome card inherits the global --fade-duration (0.8s) and
+   --fade-curve (easeOutQuart) — same fade as every other interlude
    and as image transitions. No CSS override needed; the .interlude
    transition rule covers it. The two lines centre naturally — no
    min-height padding — so the text sits at the actual vertical
@@ -186,9 +207,15 @@ html.gated #diptych { visibility: hidden; }
   /* Same curve as the image/interlude transitions so the whole
      site shares one easing language. Duration tracks SPLASH_FADE_MS
      in the script — change in both places if retiming. Dropped from
-     1.8s to 0.5s because the ceremonial-feeling longer fade is
+     1.8s to 0.3s because the ceremonial-feeling longer fade is
      pleasant on first load but reads as latency on return visits
-     where the cache is already warm. */
+     where the cache is already warm.
+
+     Note: the html.theme-ready #splash rule at the top of this file
+     restates this transition with the same duration. By the time the
+     splash fades, .theme-ready is always set (DOMContentLoaded fires
+     well before loading completes), so the theme-ready version is
+     the one that actually runs. Both must stay in sync. */
   transition: opacity 0.3s var(--fade-curve);
 }
 #splash.hidden {
@@ -238,9 +265,9 @@ html.has-sig-cache #splash .line.loading { display: none; }
   /* Outgoing-direction transition. CSS transitions use the property
      declared on the DESTINATION state, and removing .loaded makes
      this rule the destination, so this is the curve+duration that
-     runs when a photo leaves the screen. Short duration (0.25s)
-     means the old image is at ~10% opacity by 100ms and gone by
-     250ms — too fast for the eye to register as "lingering at the
+     runs when a photo leaves the screen. Short duration (0.2s)
+     means the old image is at ~10% opacity by 80ms and gone by
+     200ms — too fast for the eye to register as "lingering at the
      old position" while the new image arrives in a different one. */
   transition: opacity var(--fade-out-duration) var(--fade-out-curve);
   pointer-events: none;
@@ -249,7 +276,7 @@ html.has-sig-cache #splash .line.loading { display: none; }
   opacity: 1;
   /* Incoming-direction transition. Override the base rule's
      transition so adding .loaded routes through the full
-     --fade-duration (0.65s) ease-out — the new image has time to
+     --fade-duration (0.8s) ease-out — the new image has time to
      settle in gracefully while the outgoing one (much shorter
      duration above) clears out fast. */
   transition: opacity var(--fade-duration) var(--fade-curve);
@@ -273,14 +300,18 @@ html.has-interlude .panel .layer { transition: none; }
      in app.js, which sets the four custom properties below on the .layer
      div before the cross-fade triggers. Each image gets a square bounding
      box between 20vh and 90vh (capped to 50vw so the box never spills
-     into the opposite panel) placed anywhere inside its 50vw × 100vh
-     panel. The fallbacks below reproduce the old centred 50vw × 50vh box
-     so a layer that hasn't been randomised yet (cold page-load before
-     the first preparePanel call sets the vars) still renders sensibly. */
-  top:    var(--img-top, 25vh);
+     into the opposite panel) placed anywhere inside the SAFE area of
+     its panel — a 3-unit margin top and bottom keeps content off the
+     viewport edges. The fallbacks below reproduce the old centred
+     50vw × 50dvh box so a layer that hasn't been randomised yet (cold
+     page-load before the first preparePanel call sets the vars) still
+     renders sensibly. dvh ("dynamic viewport height") is used instead
+     of vh on the vertical axis so the box respects the visible viewport
+     on mobile Safari — see the randomizeLayerLayout comment for why. */
+  top:    var(--img-top, 25dvh);
   left:   var(--img-left, 0);
   width:  var(--img-w, 50vw);
-  height: var(--img-h, 50vh);
+  height: var(--img-h, 50dvh);
   object-fit: contain;
   /* No longer pinned to the centerline — each image floats freely
      inside its panel and the bounding box is sized to the image's
@@ -367,15 +398,21 @@ html.has-interlude .panel .layer { transition: none; }
   pointer-events: none;
   /* DISAPPEAR direction (the base rule is the destination when
      .visible is removed). Uses --fade-out-duration / --fade-out-curve
-     — same 0.25s easeOutQuart as the image-outgoing direction. Things
-     leaving the screen are fast and decisive across the whole site. */
+     — same 0.2s easeOutQuart as the image-outgoing direction. Things
+     leaving the screen are fast and decisive across the whole site.
+
+     Note: this transition is ALSO restated in the html.theme-ready
+     .interlude rule near the top of this file — that's deliberate.
+     Without the restatement, the theme-ready rule's higher specificity
+     would override this with --fade-duration, breaking the asymmetric
+     fast-disappear design. */
   transition: opacity var(--fade-out-duration) var(--fade-out-curve);
 }
 .interlude.visible {
   opacity: 1;
   pointer-events: auto;
   /* APPEAR direction (this rule is the destination when .visible
-     is added). Uses --fade-duration / --fade-curve — same 0.65s
+     is added). Uses --fade-duration / --fade-curve — same 0.8s
      easeOutQuart as the image-incoming direction. Things arriving
      take their time across the whole site.
 
@@ -387,7 +424,10 @@ html.has-interlude .panel .layer { transition: none; }
      through the slow fade-in is handled by html.has-interlude (see
      below): while an interlude is on screen, diptych layer
      transitions are suppressed so the next pair snap-swaps
-     silently behind the cover. */
+     silently behind the cover.
+
+     Restated in html.theme-ready .interlude.visible at the top of
+     this file for the same specificity reason as the base rule. */
   transition: opacity var(--fade-duration) var(--fade-curve);
 }
 .interlude .line  { display: block; }
@@ -537,4 +577,49 @@ html.has-interlude .panel .layer { transition: none; }
      narrow viewports). The accent token is already 'lime'
      (see :root --accent), so a single property covers it. */
   color: var(--accent);
+}
+
+/* ─────────── ROTATE PROMPT ───────────
+   The diptych is designed for portrait viewing on phones — the two
+   panels each get the full visible height, and image sizing scales
+   to the panel width. In landscape on a phone, the panels collapse
+   to short wide strips, the safe-area dvh math gets cramped, and
+   the size variation that works on portrait stops reading. Easier
+   to ask the visitor to rotate than to design a second layout that
+   never quite works as well.
+
+   Visibility is controlled purely by media query — no JS, no class
+   toggling, no event listener for orientation change. Rotating the
+   device flips the CSS evaluation and the prompt
+   appears/disappears automatically.
+
+   Trigger conditions (all must be true):
+   - hover:none + pointer:coarse → touch primary device (no Mac
+     trackpad, no Surface stylus, just a finger)
+   - orientation:landscape → device held horizontally
+   - max-height:600px → small viewport on the short axis, which
+     excludes tablets (iPad mini is ~768px tall in landscape, iPad
+     Pro ~834px) so they can use landscape if they prefer
+
+   z-index above everything else (400 > splash:300 > privacy:250 >
+   share-toast:200 > interludes:50) so the prompt covers the entire
+   experience including any mid-load splash. */
+#rotate-prompt {
+  position: fixed;
+  inset: 0;
+  height: 100dvh;
+  box-sizing: border-box;
+  padding-top: env(safe-area-inset-top);
+  padding-bottom: env(safe-area-inset-bottom);
+  background: var(--bg);
+  color: var(--fg);
+  display: none;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  z-index: 400;
+}
+#rotate-prompt .line { display: block; }
+@media (hover: none) and (pointer: coarse) and (orientation: landscape) and (max-height: 600px) {
+  #rotate-prompt { display: flex; }
 }

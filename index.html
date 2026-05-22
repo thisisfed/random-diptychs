@@ -230,18 +230,19 @@
        honest behaviour when we can't determine whether the
        reload will be fast.
   ═══════════════════════════════════════════════ -->
+  <!-- Single source of truth for the signature-cache schema version.
+       Both the inline detector below and app.js's SIG_CACHE_VERSION
+       constant read from this global, so bumping the algorithm only
+       requires changing the number in one place. -->
+  <script>window.SIG_CACHE_VERSION = 1;</script>
+
   <script>
     (function () {
       try {
         var raw = localStorage.getItem('ff_signatures');
         if (!raw) return;
         var parsed = JSON.parse(raw);
-        /* Keep this version constant in sync with SIG_CACHE_VERSION
-           in app.js. If app.js bumps the version (analyzeImage
-           algorithm change), the stored signatures are stale and
-           the loading line SHOULD appear — fresh analysis is about
-           to run for every image. */
-        if (!parsed || parsed.v !== 1) return;
+        if (!parsed || parsed.v !== window.SIG_CACHE_VERSION) return;
         if (!parsed.sigs || typeof parsed.sigs !== 'object') return;
         /* Any cached entries at all → this isn't a first visit;
            the load loop will skip most/all analyseImage calls; the
@@ -269,9 +270,9 @@
       <!-- Subtitle is static — JS updates it to the real pair total
            after discovery (TARGET = min(TOP_PAIRS_POOL, n×(n-1)/2) × 2)
            but if discovery turns out to match the placeholder, no
-           update is needed. Change the "300" here if you change
+           update is needed. Change the "500" here if you change
            TOP_PAIRS_POOL so the first paint isn't visibly wrong. -->
-      <span class="line subtitle">300 Random Diptychs</span>
+      <span class="line subtitle">1000 Random Diptychs</span>
       <!-- Loading progress. Starts as plain "Loading…" with no
            percentage — the rAF loop in start() appends "X%" only once
            displayPct has climbed above 0, so a warm-cache visit never
@@ -372,14 +373,19 @@
   <span id="share-toast-text">Link copied</span>
 </div>
 
-
-<script type="text/javascript" src="/unprotected/back_to_spaceship.js?hash=4975d460e508829e8fb64d3962bc44ad35f3a95a"></script>
-
-
-<script type="text/javascript" src="/unprotected/back_to_spaceship.js?hash=4975d460e508829e8fb64d3962bc44ad35f3a95a"></script>
-
-
-<script type="text/javascript" src="/unprotected/back_to_spaceship.js?hash=4975d460e508829e8fb64d3962bc44ad35f3a95a"></script>
+<!-- Rotate prompt — shown only when the visitor is on a touch device
+     held in landscape orientation. The diptych is designed for portrait
+     viewing, where the two panels each get the full visible height. In
+     landscape on a phone, the panels collapse to short wide strips that
+     don't show photography well. Visibility is controlled purely by CSS
+     media query (see styles.css) — no JS, no class toggling. Rotating
+     the device back to portrait dismisses the prompt automatically. -->
+<div id="rotate-prompt" aria-hidden="true">
+  <div class="inner">
+    <span class="line">Please rotate your device</span>
+    <span class="line">to portrait</span>
+  </div>
+</div>
 
 
 <script type="text/javascript" src="/unprotected/back_to_spaceship.js?hash=4975d460e508829e8fb64d3962bc44ad35f3a95a"></script>

@@ -90,12 +90,13 @@ const SIBLING_GROUPS = [
    more often in rotation.
 
    How it works in practice (rough math, ~100 image pool, GUARANTEE_RATE
-   at 0.45, FAVORITE_BOOST at 4):
+   at 0.50, FAVORITE_BOOST at 2.5):
    - A non-favorite at average staleness gets ~1/100 of a guarantee
-     click, ≈ 0.45% of total clicks
-   - A favorite at the same staleness gets ~4/100 of a guarantee click,
-     ≈ 1.8% of total clicks — roughly one appearance every ~55 clicks
-   - So a favorite appears ~4× as often as it would unprompted
+     click, ≈ 0.50% of total clicks
+   - A favorite at the same staleness gets ~2.5/100 of a guarantee
+     click, ≈ 1.25% of total clicks — roughly one appearance every
+     ~80 clicks
+   - So a favorite appears ~2.5× as often as it would unprompted
 
    Boost only applies AFTER the recent-block window has cleared, so it
    doesn't force back-to-back appearances. It's a long-term rotation
@@ -104,13 +105,30 @@ const SIBLING_GROUPS = [
    Format: bare image numbers as strings (e.g. '11', '14'). Videos are
    not currently supported — let me know if you want that too. Use
    sparingly — listing 30+ favorites cancels the effect since they all
-   compete with each other for the same boosted weight. */
+   compete with each other for the same boosted weight. Previously 5.0;
+   reduced to 2.5 because with 15+ favorites the 5× multiplier was
+   funnelling roughly half of all guarantee-branch picks into the
+   favorites set, leaving non-favorites under-rotated. */
 const FAVORITE_IMAGES = new Set([
   '11',  '14',  '17',  '51',
   '58',  '64',  '69',  '75',  '81',
   '109', '112', '114', '117', '122', '124',
 ]);
-const FAVORITE_BOOST  = 4.0;
+const FAVORITE_BOOST  = 2.5;
+
+/* First-pair selection: probability that the gallery opens with a
+   favorite-led pair (vs falling through to the normal pickPair logic
+   that draws from the full top-N pool). Previously hard-coded to 1.0
+   ("always lead with a favorite"), which meant the opening pair on
+   every refresh was drawn from FAVORITE_IMAGES × bestsPerImage —
+   roughly 15 × 5 = 75 distinct compositions. Across visits the same
+   first-impression pool kept surfacing.
+
+   At 0.5, half of fresh-session opens lead with a favorite (curated
+   first impression) and half draw from the full top-pool (variety).
+   Set to 1.0 to revert to old behaviour, or 0.0 to disable favorites
+   leading the first pair entirely. */
+const FIRST_PAIR_FAVORITE_PROB = 0.5;
 
 /* Splash timing.
 
@@ -196,15 +214,34 @@ const DISCOVER_BATCH = 20;
    distinct diptychs. A hard floor: pairs ranked worse than N can
    never surface, no matter what the random roll does — so use this
    to set the worst-case quality you're willing to accept.
-   At 150, with ~110 items in the pool, that's the top ~3% of the
-   ~6000 possible pairs — strict curation. Yields 300 distinct
-   diptychs. The scoring is calibrated tightly enough (OKLab,
-   centre weighting, paletteContrast^2, lightness contrast, joint
-   penalties, fallback trust, subject groups) that this top 3%
-   is genuinely top-tier. If long sessions start feeling repetitive
-   because the recent-block filter is starving the main pool, lift
-   to 200 or 250. */
-const TOP_PAIRS_POOL   = 150;
+   At 250, with ~110 items in the pool, that's the top ~4% of the
+   ~6000 possible pairs — still strict curation but with more room.
+   Yields 500 distinct diptychs. Previous setting was 150 (300
+   diptychs); raised because long sessions were starting to feel
+   repetitive as the recent-block filter narrowed the active pool.
+   The scoring is calibrated tightly enough (OKLab, centre weighting,
+   paletteContrast^2, lightness contrast, joint penalties, fallback
+   trust, subject groups) that the top ~4% is still genuinely top-
+   tier. */
+const TOP_PAIRS_POOL   = 500;
+
+/* Quality bias for the main-draw pick. The chosen pair index is
+   `Math.floor(Math.random() ** QUALITY_BIAS_POWER * poolSize)` — a
+   power > 1 stretches the distribution toward 0 so higher-scored
+   pairs dominate. P(picked in top fraction x) = x^(1/POWER), so:
+
+     POWER = 1.0  → uniform (no bias)
+     POWER = 1.5  → top 10% gets ~22% of picks, top 50% gets ~63%
+     POWER = 2.0  → top 10% gets ~32% of picks, top 50% gets ~71%
+     POWER = 3.0  → top 10% gets ~46% of picks, top 50% gets ~79%
+
+   Was 2.0 originally and tuned for TOP_PAIRS_POOL = 150. With the
+   pool raised to 500 the 2.0 bias funnelled too hard into the very
+   top of the ranking, making the same handful of "obvious winner"
+   pairs dominate. 1.5 keeps the top of the ranking favoured without
+   the front-runner concentration — top decile drops from ~32% to
+   ~22% of picks, top quartile from ~50% to ~40%. */
+const QUALITY_BIAS_POWER = 1.5;
 
 /* ─── RANKING WEIGHTS ───
    The ranker rewards two kinds of contrast that must BOTH be
@@ -357,7 +394,7 @@ const VIDEO_MIN_GAP = 1;
    image — without entirely abandoning the global quality ranking.
    Higher values surface rare images faster at the cost of pulling
    more weight from the quality-ranked main pool. */
-const GUARANTEE_RATE = 0.45;
+const GUARANTEE_RATE = 0.50;
 
 /* Colour analysis. COLOR_SAMPLE_SIZE is the side length of the
    downsampled canvas each image is drawn to before histogram /
@@ -382,6 +419,16 @@ function altFor(num) {
 
 let   images          = [];
 const validImages     = [];
+/* O(1) membership mirror of `validImages`. Both must stay in sync —
+   only ever mutated via `addValid()` below. Replaces hot-path
+   `validImages.includes(...)` calls, which were O(N) and ran inside
+   the analysis loops and the rotation-cache restore.  */
+const validImagesSet  = new Set();
+function addValid(src) {
+  if (validImagesSet.has(src)) return;
+  validImages.push(src);
+  validImagesSet.add(src);
+}
 const colorSignatures = new Map();    // src → { histogram, palette, avgSat }
 let   topPairs        = [];           // globally-ranked pair list (best first)
 let   imageBests      = [];           // per-image first-best pair (kept for debugging)
@@ -393,6 +440,23 @@ let   clicksSinceVideo = Infinity;  // gap counter for VIDEO_MIN_GAP
 let   interludePreload = null;
 let   currentInterlude = null;
 let   lastInterlude    = null;
+
+/* In-flight guard for loadDiptych. Hoisted up here (rather than alongside
+   the click handler) so the IIFE-driven first-pair load can also gate on
+   it — without this, a rapid first click can race the initial decode. */
+let loadingDiptych = false;
+
+/* Analytics gate elements — hoisted ABOVE the IIFE that references them.
+   Previously declared further down, which only worked because the IIFE's
+   first `await` happened before the references and the rest of the script's
+   synchronous top-level code (these declarations included) ran during that
+   await window. That arrangement broke the moment any refactor moved an
+   await around. Now the references are top-of-file constants, evaluated
+   before start() even begins. */
+const GA_ID       = 'G-F8Z6W7JPHQ';
+const CONSENT_KEY = 'ff-analytics-consent';
+const consentEl   = document.getElementById('consent');
+const privacyEl   = document.getElementById('privacy');
 
 /* ─────────────────────────────────────────────────────────────────────────
    PATH HELPERS
@@ -491,6 +555,20 @@ for (const group of SIBLING_GROUPS) {
 async function discoverBy(urlFor) {
   const found = [];
   let start = 1;
+  /* Number of consecutive empty batches we'll walk past before
+     declaring end of catalogue. With DISCOVER_BATCH = 20 and
+     MAX_GAP_BATCHES = 3, we tolerate single gaps of up to ~60 missing
+     items, and — unlike the old single-grace far-probe design —
+     multiple such gaps in the same catalogue.
+
+     Cost: in the true end-of-catalogue case we now spend MAX_GAP_BATCHES
+     extra empty batches (≈ 60 HEADs) before stopping. With HTTP/2
+     multiplexing that's a few hundred ms once, and only on cold visits
+     (warm visits hit the discovery cache). Worth the simplification and
+     the multi-gap robustness. */
+  const MAX_GAP_BATCHES = 3;
+  let emptyRun = 0;
+
   while (true) {
     const batch = Array.from({ length: DISCOVER_BATCH }, (_, i) => start + i);
     const results = await Promise.all(
@@ -502,23 +580,14 @@ async function discoverBy(urlFor) {
     );
     const present = results.filter(n => n !== null);
     found.push(...present);
-    if (present.length === 0) break;
 
-    /* Partial-hit batch usually means we've crossed the end of the
-       catalogue, but it could also be a hole (e.g. ff100 deleted,
-       ff101-ff147 still present). Probe one item far ahead to tell
-       the two apart. If the far probe also 404s, we're at the end
-       and break — saves the ~20 wasted HEADs the old logic spent
-       on a confirming full batch. If it hits, there's genuinely a
-       hole; continue normal batched probing. Trade-off: a hole
-       exactly between this batch and the far probe would fool us,
-       but that's a contrived pattern; in practice catalogues are
-       contiguous or have small isolated gaps. */
-    if (present.length < batch.length) {
-      const farN = start + DISCOVER_BATCH * 2;
-      const farExists = await fetch(urlFor(farN), { method: 'HEAD' })
-        .then(r => r.ok).catch(() => false);
-      if (!farExists) break;
+    if (present.length === 0) {
+      emptyRun++;
+      if (emptyRun >= MAX_GAP_BATCHES) break;
+    } else {
+      /* Any hit resets the run counter — gaps don't accumulate
+         across batches that contain even a single item. */
+      emptyRun = 0;
     }
 
     start += DISCOVER_BATCH;
@@ -603,7 +672,11 @@ const discoverVideos = () => discoverBy(n => `${VIDEO_BASE}/ff${n}.mp4`);
      a version mismatch as "no cache", so existing users transition
      cleanly the first time they reload after a deploy. */
 
-const SIG_CACHE_VERSION = 1;
+/* Schema version comes from window.SIG_CACHE_VERSION, set by an inline
+   script in index.html's <head> ABOVE the fast-path detector. Single
+   source of truth: bumping the algorithm only requires changing the
+   number in HTML, and the detector and app.js stay in lockstep. */
+const SIG_CACHE_VERSION = window.SIG_CACHE_VERSION;
 const SIG_CACHE_KEY     = 'ff_signatures';
 
 function readSignatureCache() {
@@ -698,6 +771,127 @@ function discoverWithCache(cacheKey, runDiscover) {
     return indices;
   });
 }
+
+/* ─────────── ROTATION CACHE ───────────
+   `recent` and `lastShown` drive the per-image rotation: which images
+   are currently blocked from re-appearing, and which haven't surfaced
+   in a while (so the guarantee branch should favour them). Without
+   persistence these reset every visit, which means a returning visitor
+   sees the same handful of first-impression pairs every time — the
+   guarantee branch favours never-shown images, so on a fresh session
+   the first ~15 clicks always pull from the same small pool of
+   "high-staleness, high-boost" candidates.
+
+   Persisting carries that state across sessions: an image shown on
+   yesterday's visit is still in `recent` today (until clickCount
+   advances past the RECENT_CLICKS_BLOCK window), and an image
+   under-shown over many sessions gets a real long-term staleness
+   advantage rather than being reset to "never seen" each time.
+
+   The whole rotation state is one JSON blob keyed on
+   ROTATION_CACHE_KEY: { v, clickCount, recent, lastShown }. clickCount
+   itself persists too — without it, the relative click-distances in
+   `recent` and `lastShown` would be meaningless across sessions
+   (`clickCount - last` only works if both come from the same numbering).
+
+   Bumping ROTATION_CACHE_VERSION discards stored state on the next
+   load — useful if the rotation algorithm itself changes in ways that
+   would make old click-count values misleading. */
+const ROTATION_CACHE_VERSION = 1;
+const ROTATION_CACHE_KEY     = 'ff_rotation';
+
+function readRotationCache() {
+  try {
+    const raw = localStorage.getItem(ROTATION_CACHE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || parsed.v !== ROTATION_CACHE_VERSION) return null;
+    if (typeof parsed.clickCount !== 'number') return null;
+    if (!Array.isArray(parsed.recent) || !Array.isArray(parsed.lastShown)) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function writeRotationCache() {
+  try {
+    /* Serialise the live Maps via [...entries] — JSON.stringify
+       doesn't natively handle Map, so we materialise as [[k,v],...]
+       and rehydrate on read. Both maps are bounded in practice
+       (recent capped by the click-block window, lastShown by the
+       catalogue size), so the total payload stays well under 10KB.
+
+       clicksSinceVideo is also persisted so VIDEO_MIN_GAP is honoured
+       across session boundaries — without this, the last click of one
+       session and the first of the next could both land a video. The
+       counter is a plain number; readers tolerate its absence (older
+       caches default to Infinity) so no version bump is needed. */
+    localStorage.setItem(ROTATION_CACHE_KEY, JSON.stringify({
+      v:                ROTATION_CACHE_VERSION,
+      clickCount,
+      clicksSinceVideo: Number.isFinite(clicksSinceVideo) ? clicksSinceVideo : null,
+      recent:           [...recent.entries()],
+      lastShown:        [...lastShown.entries()],
+    }));
+  } catch {
+    /* Quota exceeded, private mode, or storage disabled. Silent —
+       same fallback semantics as the other caches: rotation will
+       simply reset to "fresh session" on the next load, which is the
+       pre-persistence behaviour and still works. */
+  }
+}
+
+/* Same pagehide-write strategy as signatures: fires reliably on tab
+   close / refresh / navigate-away on all modern browsers including
+   iOS Safari. The rotation state at session end is what matters for
+   the next visit. */
+window.addEventListener('pagehide', writeRotationCache);
+
+/* ─────────── SEEN INTERLUDES CACHE ───────────
+   The three interlude cards (share, welcome, contact) are single-use
+   within a session — once shown, removed from the pool. By default
+   that resets each visit; this cache persists a subset of "seen"
+   across sessions for cards that genuinely shouldn't recur.
+
+   PERSISTENT_INTERLUDES is the allowlist. Entries listed here will
+   be remembered across visits — share teaches a gesture, welcome
+   carries the iPhone-shot statement, both are one-time "lessons"
+   the returning visitor doesn't need to re-read. Cards NOT listed
+   here re-appear on each visit, which is the right behaviour for
+   contact: the email / phone are useful to surface periodically
+   rather than being hidden forever after first sight. */
+const PERSISTENT_INTERLUDES   = ['share', 'welcome'];
+const SEEN_INTERLUDES_KEY     = 'ff_seen_interludes';
+const SEEN_INTERLUDES_VERSION = 1;
+
+function readSeenInterludes() {
+  try {
+    const raw = localStorage.getItem(SEEN_INTERLUDES_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!parsed || parsed.v !== SEEN_INTERLUDES_VERSION) return [];
+    if (!Array.isArray(parsed.seen)) return [];
+    /* Defensive filter: drop anything not in the current allowlist,
+       so removing a card from PERSISTENT_INTERLUDES forgets all its
+       stored "seen" entries on the next load rather than leaking. */
+    return parsed.seen.filter(s => PERSISTENT_INTERLUDES.includes(s));
+  } catch {
+    return [];
+  }
+}
+
+function writeSeenInterludes() {
+  try {
+    const toStore = [...seenInterludes].filter(s => PERSISTENT_INTERLUDES.includes(s));
+    localStorage.setItem(SEEN_INTERLUDES_KEY, JSON.stringify({
+      v: SEEN_INTERLUDES_VERSION,
+      seen: toStore,
+    }));
+  } catch {}
+}
+
+window.addEventListener('pagehide', writeSeenInterludes);
 
 /* ─────────────────────────────────────────────────────────────────────────
    COLOUR ANALYSIS
@@ -1248,12 +1442,9 @@ function scheduleTopPairs() {
    ───────────────────────────────────────────────────────────────────────── */
 
 function pairToHash(p) { return '#' + p.map(srcToId).join(','); }
-function hashToPair() {
-  const m = location.hash.match(/^#(v?\d+),(v?\d+)$/);
-  if (!m || m[1] === m[2]) return null;
-  const a = idToSrc(m[1]), b = idToSrc(m[2]);
-  return (validImages.includes(a) && validImages.includes(b)) ? [a, b] : null;
-}
+/* The hash → pair conversion is inlined at the start() IIFE rather
+   than as a helper, because it needs custom error handling for the
+   isReload-vs-fresh-entry case. No separate hashToPair() is exposed. */
 
 /* ─────────────────────────────────────────────────────────────────────────
    IMAGE LOADING & SWAPPING
@@ -1283,12 +1474,23 @@ function isRecent(src) {
    sibling declared in SIBLING_GROUPS. Without sibling propagation,
    near-duplicates like ff97/ff98 (same shoot, near-identical
    colour signature) could appear in adjacent clicks because the
-   scorer sees them as independent images. */
+   scorer sees them as independent images.
+
+   lastShown is updated for BOTH the shown sources AND their siblings —
+   otherwise a sibling's staleness stays high even though the user just
+   saw "essentially that image", and the guarantee branch would
+   preferentially surface it the moment recent[] expires. Updating
+   lastShown alongside recent keeps staleness in lockstep with the
+   user's actual experience. */
 function markPairRecent(pair) {
   for (const src of pair) {
     recent.set(src, clickCount);
+    lastShown.set(src, clickCount);
     const sibs = SIBLINGS.get(src);
-    if (sibs) for (const s of sibs) recent.set(s, clickCount);
+    if (sibs) for (const s of sibs) {
+      recent.set(s, clickCount);
+      lastShown.set(s, clickCount);
+    }
   }
 }
 
@@ -1406,9 +1608,18 @@ function pickPair(arr, opts) {
     available = available.filter(p => !isVideo(p.a) && !isVideo(p.b));
   }
   /* Fallback pool also respects allowVideos so a tiny early-session
-     pool doesn't smuggle a video into the first pair. */
+     pool doesn't smuggle a video into the first pair. Last-resort
+     fallback to unfiltered topPairs covers the pathological case
+     where !allowVideos but every pair in topPairs contains a video
+     (e.g. a catalogue with no photos discovered) — without this,
+     `pool` could end up empty and the final `finalPool[...]` access
+     would return undefined and crash on `chosen.a`. The allowVideos
+     contract is best-effort, not absolute: better to surface a video
+     pair than to crash. */
   const fallback  = allowVideos ? topPairs : topPairs.filter(p => !isVideo(p.a) && !isVideo(p.b));
-  const pool      = available.length > 0 ? available : fallback;
+  const pool      = available.length > 0
+    ? available
+    : (fallback.length > 0 ? fallback : topPairs);
 
   /* Probabilistic video selection with a minimum-gap guard. The
      gap check ensures videos never appear back-to-back; once past
@@ -1425,22 +1636,24 @@ function pickPair(arr, opts) {
     : pool.filter(p => !isVideo(p.a) && !isVideo(p.b));
   const finalPool = drawPool.length > 0 ? drawPool : pool;
 
-  /* Update the gap counter based on what we're actually going to
-     draw, not what we wanted — if drawPool collapsed and we fell
-     back to `pool`, the result may or may not include a video. */
-  const drawingVideo = finalPool === drawPool && wantVideo;
-  clicksSinceVideo   = drawingVideo ? 0 : clicksSinceVideo + 1;
-
+  /* Update the gap counter based on what we actually drew, not what
+     we wanted. If drawPool collapsed and we fell back to `pool`, the
+     chosen pair may or may not include a video — inspect it directly.
+     The previous version pre-computed this from `finalPool === drawPool
+     && wantVideo`, which read false in the fallback case even when a
+     video was actually selected, allowing VIDEO_MIN_GAP to be violated. */
   const poolSize  = Math.min(TOP_PAIRS_POOL, finalPool.length);
-  /* Quality-biased pick: squaring Math.random() stretches the
-     distribution toward 0 so the highest-scored pairs dominate.
-     With the current pool of 150, the top 10% (15 pairs) receives
-     ~32% of picks and the bottom half receives ~29%. The hard
-     floor on quality comes from TOP_PAIRS_POOL itself (no pair
-     ranked worse than 150 ever appears); this bias just shifts
-     the rotation toward the very top within that pool. Bump to
-     ** 3 for stronger top-emphasis, ** 1 for uniform. */
-  const chosen    = finalPool[Math.floor(Math.random() ** 2 * poolSize)];
+  /* Quality-biased pick: see QUALITY_BIAS_POWER constant declaration
+     near the top of this file for the full rationale and the math.
+     Briefly: raising Math.random() to a power > 1 concentrates picks
+     toward the top of the pool. At 1.5 (current), the top 10% gets
+     ~22% of picks and the top 50% gets ~63%; the bias favours the
+     top of the ranking without funnelling so hard that the same
+     handful of "front-runner" pairs dominate. */
+  const chosen    = finalPool[Math.floor(Math.random() ** QUALITY_BIAS_POWER * poolSize)];
+
+  const drewVideo  = isVideo(chosen.a) || isVideo(chosen.b);
+  clicksSinceVideo = drewVideo ? 0 : clicksSinceVideo + 1;
 
   return Math.random() < 0.5 ? [chosen.a, chosen.b] : [chosen.b, chosen.a];
 }
@@ -1614,27 +1827,85 @@ function randomizeLayerLayout(layerEl, sizeVhRequest) {
      but the bucket log still says "we just used a big size" so the
      next draw avoids the big bucket — which is what the rhythm
      scheme is meant to do. */
-  let sizePx = sizeVhRequest * winH / 100;
-  sizePx = Math.min(sizePx, winW / 2);
+  /* Decouple the height from the width clamp.
 
-  /* Express the chosen size in BOTH vh and vw — height-side ranges are
-     easier to reason about in vh, horizontal placement in vw. They
-     describe the same pixel square at this moment, but each unit
-     responds to its own axis on resize, which is the cheapest way to
-     keep the layout sensible between pair loads. */
-  const sizeVh = (sizePx / winH) * 100;
-  const sizeVw = (sizePx / winW) * 100;
+     Old behaviour: a single sizePx variable was computed from the
+     requested vh, then clamped to half the viewport width, then used
+     as BOTH the height and the width of the bounding box. On a
+     portrait phone (where 50vw is much smaller than 90vh in absolute
+     pixels), this clamp would fire for any request above ~23vh —
+     and since the same clamped pixel value was used for height too,
+     all "large" images collapsed to identical small squares. The
+     bucket-recency system was still picking diverse sizes; the
+     clamp was just flattening them.
+
+     Second iteration: switched to a rectangle box (height in vh,
+     width clamped to vw). This preserved height variation on
+     portrait — but all images ended up the SAME WIDTH (50vw cap),
+     producing tall strips of identical width. Visually the "same
+     size" perception persisted: width is the dominant cue on a
+     narrow viewport.
+
+     Current iteration: on portrait mobile, use the VIEWPORT WIDTH
+     as the size basis instead of viewport height. The picker still
+     returns values in [20, 90], but on portrait those values now
+     scale against winW rather than winH. Result: 20 → ~20% of
+     viewport width (small square), 50 → ~50vw (square that fills
+     the panel), 90 → tall rectangle (351px on iPhone 14, 195px
+     wide). The width axis now varies meaningfully across the
+     picker range — the bucket-recency rhythm becomes visible.
+
+     On desktop / landscape, baseDim is still winH (vh-based) and
+     the box can be a square up to 50vw wide, so the visual you
+     tuned for landscape stays intact. */
+  const isPortraitMobile = winH > winW && winW < 768;
+  const baseDim = isPortraitMobile ? winW : winH;
+
+  const sizeHeightPx = sizeVhRequest * baseDim / 100;
+  const sizeWidthPx  = Math.min(sizeHeightPx, winW / 2);
+
+  /* Express each axis in its own unit — vh for height, vw for width
+     — so the layout responds to each axis independently on resize.
+     With the decoupled clamp above, the two values may now describe
+     a rectangle rather than a square; that's intentional. */
+  const sizeVh = (sizeHeightPx / winH) * 100;
+  const sizeVw = (sizeWidthPx  / winW) * 100;
 
   /* Origin: anywhere such that the whole square stays inside the
-     panel. Top in [0, 100 − sizeVh] vh, left in [0, 50 − sizeVw] vw.
-     Math.max guards against the tiny case where rounding makes the
-     range negative — better a degenerate 0 than a NaN. */
-  const topVh  = Math.random() * Math.max(0, 100 - sizeVh);
-  const leftVw = Math.random() * Math.max(0,  50 - sizeVw);
+     panel's SAFE viewport area. The safe margin (3 units top and
+     bottom) keeps images from sitting flush against the visible
+     viewport edges — important especially on iPhone Safari where
+     content right at the bottom edge can crowd the toolbar's
+     transparent shadow zone, and at the top where the URL bar's
+     edge can feel uncomfortably close.
 
+     Math.max guards against the tiny case where rounding makes the
+     placement range negative (e.g. a 90-unit-tall image with 6
+     units of margin leaves no room to move — that's fine, the
+     image just gets pinned at the minimum top instead of producing
+     NaN). At max size the image is essentially fixed; smaller
+     images have proportionally more freedom. */
+  const SAFE_MARGIN = 3;
+  const topRange = Math.max(0, 100 - 2 * SAFE_MARGIN - sizeVh);
+  const topVh    = SAFE_MARGIN + Math.random() * topRange;
+  const leftVw   = Math.random() * Math.max(0, 50 - sizeVw);
+
+  /* Output uses dvh ("dynamic viewport height") instead of vh for
+     the vertical axis. The two units differ on mobile Safari and
+     Chrome: vh measures the LARGEST possible viewport (as if the
+     browser chrome were fully retracted), while dvh measures the
+     CURRENT visible viewport with chrome accounted for. A 50vh
+     image positioned at 50vh from the top extends from the visible
+     midpoint to BEHIND the browser toolbar on iPhone Safari —
+     visibly cropped. The same coordinates in dvh keep the image
+     fully inside the visible area. On desktop dvh equals vh
+     (no chrome), so this change is mobile-only in effect.
+
+     Horizontal (vw) stays unchanged — browsers don't have
+     left/right chrome that needs accounting for. */
   layerEl.style.setProperty('--img-w',    `${sizeVw}vw`);
-  layerEl.style.setProperty('--img-h',    `${sizeVh}vh`);
-  layerEl.style.setProperty('--img-top',  `${topVh}vh`);
+  layerEl.style.setProperty('--img-h',    `${sizeVh}dvh`);
+  layerEl.style.setProperty('--img-top',  `${topVh}dvh`);
   layerEl.style.setProperty('--img-left', `${leftVw}vw`);
 }
 
@@ -1791,13 +2062,11 @@ async function loadDiptych(forcedPair) {
        Doing this earlier (before await) marked preloaded-but-hidden
        interlude pairs as seen, thinning the candidate set unnecessarily.
        markPairRecent also propagates the block to any declared siblings
-       (SIBLING_GROUPS). lastShown drives the staleness weighting in
-       the guarantee branch: the more clicks since an image last
-       appeared, the more likely the guarantee will pick a pair
-       containing it next time. */
+       (SIBLING_GROUPS) AND updates lastShown for the pair plus its
+       siblings — staleness drives the guarantee branch's weighted
+       pick, so the sibling-update prevents a "ghost staleness" boost
+       on a near-duplicate the user effectively just saw. */
     markPairRecent(pair);
-    lastShown.set(pair[0], clickCount);
-    lastShown.set(pair[1], clickCount);
   });
 
   if (window.gaEnabled && typeof gtag !== 'undefined') {
@@ -1838,7 +2107,7 @@ function loadOne(src) {
       const format = FORMATS[attemptIdx++];
       const img = new Image();
       img.onload = () => {
-        if (!validImages.includes(src)) validImages.push(src);
+        addValid(src);
         const sig = analyzeImage(img);
         if (sig) {
           colorSignatures.set(src, sig);
@@ -1910,7 +2179,7 @@ function loadVideoPosterForAnalysis(src) {
     const img = new Image();
     img.onload = () => {
       try {
-        if (!validImages.includes(src)) validImages.push(src);
+        addValid(src);
         const sig = analyzeImage(img);
         if (sig) {
           colorSignatures.set(src, sig);
@@ -1967,7 +2236,7 @@ function loadVideoForAnalysis(src) {
          file existence is already verified by discovery, so this is
          safe even on failure. */
       if (!colorSignatures.has(src)) {
-        if (!validImages.includes(src)) validImages.push(src);
+        addValid(src);
         colorSignatures.set(src, fallbackSignature());
         scheduleTopPairs();
       }
@@ -1976,7 +2245,7 @@ function loadVideoForAnalysis(src) {
 
     const analyze = () => {
       try {
-        if (!validImages.includes(src)) validImages.push(src);
+        addValid(src);
         const sig = analyzeImage(v);
         if (sig) {
           colorSignatures.set(src, sig);
@@ -2049,12 +2318,17 @@ const INTERLUDES = ['contact', 'share', 'welcome'];
 
 /* Single-use interludes. Each card (contact, share, welcome) appears
    AT MOST ONCE per session — once shown, it's removed from the pool
-   and never returns. After all three have been seen the rotation
-   stops entirely and the gallery becomes a pure sequence of diptychs.
-   This makes the interludes feel like deliberate punctuation rather
-   than recurring interruptions: the visitor learns the share gesture,
-   sees the contact info, reads the iPhone-shot statement, and then
-   it's just photography from there. */
+   and never returns within that session. After all three have been
+   seen the rotation stops entirely and the gallery becomes a pure
+   sequence of diptychs.
+
+   ACROSS sessions, the share and welcome cards are also persisted
+   (see PERSISTENT_INTERLUDES near the cache infrastructure) — once
+   seen, they don't recur on future visits. Contact is deliberately
+   NOT persisted: the email and phone are useful information to
+   re-surface periodically rather than hide forever after the first
+   visit. So a returning visitor sees contact every visit, plus share
+   and welcome only on their first session. */
 const seenInterludes = new Set();
 
 function pickInterlude() {
@@ -2083,6 +2357,13 @@ function showInterlude() {
   const which = pickInterlude();
   if (!which) return;  /* All interludes seen — caller falls through to loadDiptych */
   seenInterludes.add(which);
+  /* Persist immediately rather than waiting for pagehide. If the user
+     sees the welcome card and then closes the tab in a way that skips
+     pagehide (rare — tab crash, OS terminating a backgrounded tab),
+     they'd see it again on their next visit. Writing here means each
+     "seen" event survives even those edge cases. The write is a small
+     localStorage set, cheap to do per interlude. */
+  writeSeenInterludes();
   currentInterlude = document.getElementById(which);
 
   currentInterlude.classList.add('visible');
@@ -2253,7 +2534,6 @@ document.querySelectorAll('.interlude').forEach(el => {
   const subtitleEl = splashEl.querySelector('.subtitle');
   const loadingEl  = splashEl.querySelector('.loading');
 
-  let target            = 300;
   let imageSrcs         = null;
   let splashFinished    = false;
   let splashSafetyTimer = null;
@@ -2302,7 +2582,7 @@ document.querySelectorAll('.interlude').forEach(el => {
      for video-containing pairs, but the gallery feels lazy-on-demand
      rather than waiting for tens of megabytes of MP4s up front. */
   for (const videoSrc of videoIndices.map(videoNumToSrc)) {
-    if (!validImages.includes(videoSrc)) validImages.push(videoSrc);
+    addValid(videoSrc);
     if (!colorSignatures.has(videoSrc)) colorSignatures.set(videoSrc, fallbackSignature());
   }
 
@@ -2319,18 +2599,18 @@ document.querySelectorAll('.interlude').forEach(el => {
     const sig = cachedSigs[imageSrc];
     if (sig) {
       colorSignatures.set(imageSrc, sig);
-      if (!validImages.includes(imageSrc)) validImages.push(imageSrc);
+      addValid(imageSrc);
     }
   }
 
-  /* Update the static subtitle to the real pair count if discovery
-     reveals a different total than the HTML's placeholder "300". */
+  /* Update the static subtitle to the real pair count. Unconditional —
+     the previous "skip if equal to initial JS target" optimization was
+     a config-drift hazard (no visible behaviour change today, but the
+     moment TOP_PAIRS_POOL landed on a value where realTotal matched
+     the initial JS target, the stale HTML placeholder would survive). */
   const unorderedPairs = totalCount * (totalCount - 1) / 2;
-  const realTotal      = Math.min(TOP_PAIRS_POOL, unorderedPairs) * 2;
-  if (realTotal !== target) {
-    target = realTotal;
-    subtitleEl.textContent = `${target} Random Diptychs`;
-  }
+  const target = Math.min(TOP_PAIRS_POOL, unorderedPairs) * 2;
+  subtitleEl.textContent = `${target} Random Diptychs`;
 
   /* Hash-driven entry loads JUST the deep-linked pair (which may
      include a video) and dismisses the splash immediately — the
@@ -2364,7 +2644,7 @@ document.querySelectorAll('.interlude').forEach(el => {
       /* Hash points to a missing/corrupt item — walk until 2 valid. */
       for (const src of images) {
         if (validImages.length >= 2) break;
-        if (!validImages.includes(src)) await loadOne(src);
+        if (!validImagesSet.has(src)) await loadOne(src);
       }
     }
     if (validImages.length < 2) {
@@ -2378,10 +2658,10 @@ document.querySelectorAll('.interlude').forEach(el => {
     /* Background-fill the rest of the IMAGES (videos stay lazy). */
     Promise.all(
       imageIndices.map(numToSrc)
-        .filter(src => !validImages.includes(src))
+        .filter(src => !validImagesSet.has(src))
         .map(loadOne)
     );
-    const startPair = firstPair.every(s => validImages.includes(s)) ? firstPair : null;
+    const startPair = firstPair.every(s => validImagesSet.has(s)) ? firstPair : null;
     finishSplash();
     /* First visit (consent still required) → show consent card on
        top of the loading diptych; consent's Accept/Decline handlers
@@ -2391,11 +2671,20 @@ document.querySelectorAll('.interlude').forEach(el => {
        gallery; the welcome statement now appears later as one of the
        rotation interludes. */
     if (consentEl && consentEl.isConnected) {
-      interludePreload = loadDiptych(startPair);
+      /* Consent card covers the diptych while it loads, so a click
+         can't reach the diptych — but we still gate on loadingDiptych
+         for consistency with the no-consent branch and to keep the
+         in-flight contract obvious. */
+      loadingDiptych  = true;
+      interludePreload = loadDiptych(startPair).finally(() => { loadingDiptych = false; });
       showAnalytics();
     } else {
       liftGate();
-      loadDiptych(startPair);
+      /* No consent card here — the diptych is reachable as soon as
+         liftGate() runs, so a rapid first tap could otherwise race
+         this initial decode. The guard mirrors advance()'s wrapper. */
+      loadingDiptych = true;
+      loadDiptych(startPair).finally(() => { loadingDiptych = false; });
     }
     return;
   }
@@ -2514,6 +2803,41 @@ document.querySelectorAll('.interlude').forEach(el => {
      terminating a backgrounded tab without notice). */
   writeSignatureCache();
 
+  /* Restore rotation state from the previous session. clickCount,
+     recent, and lastShown all hydrate from the same JSON blob — see
+     readRotationCache() near the cache infrastructure for the schema
+     and rationale. Done AFTER validImages is fully populated so we
+     can drop any stale entries for sources that aren't in the current
+     catalogue (deleted images would otherwise sit in the maps
+     forever, harmless but cluttering). The whole block is wrapped in
+     a null-check so a cold first visit (or a quota-exceeded localStorage)
+     proceeds with empty maps and clickCount = 0, the pre-persistence
+     behaviour. */
+  const rotation = readRotationCache();
+  if (rotation) {
+    clickCount = rotation.clickCount;
+    /* clicksSinceVideo restored if present; absent or null means
+       either an older cache schema or a freshly-initialised session
+       where the gap was Infinity. Either way, defaulting to Infinity
+       is the safe "eligible immediately" value — same as the at-module-
+       load initialisation. */
+    if (typeof rotation.clicksSinceVideo === 'number') {
+      clicksSinceVideo = rotation.clicksSinceVideo;
+    }
+    for (const [src, ct] of rotation.recent) {
+      if (validImagesSet.has(src)) recent.set(src, ct);
+    }
+    for (const [src, ct] of rotation.lastShown) {
+      if (validImagesSet.has(src)) lastShown.set(src, ct);
+    }
+  }
+
+  /* Restore the across-session set of interlude cards already seen
+     (subset listed in PERSISTENT_INTERLUDES). Contact card is
+     deliberately excluded from persistence and re-appears each
+     visit — see the constant declaration for the reasoning. */
+  for (const s of readSeenInterludes()) seenInterludes.add(s);
+
   /* scheduleTopPairs is rAF-debounced, so the latest analyses may
      not yet be reflected. Force a sync compute before picking — and
      cancel the pending rAF so it doesn't redundantly recompute the
@@ -2524,58 +2848,67 @@ document.querySelectorAll('.interlude').forEach(el => {
   }
   computeTopPairs();
 
-  /* First pair: lead with a favorite image when possible.
-     Walks FAVORITE_IMAGES in random order, picks the first one that's
-     a valid image (not video, has a signature), then pairs it with its
-     highest-scoring non-video partner from bestsPerImage. If no favorite
-     is loadable or no eligible partner exists (very rare — only if all
-     favorites failed analysis), falls back to the normal pickPair
-     selection so the gallery always opens with something.
+  /* First pair: with probability FIRST_PAIR_FAVORITE_PROB, lead with a
+     favorite image. Walks FAVORITE_IMAGES in random order, picks the
+     first one that's a valid image (not video, has a signature), then
+     pairs it with a random partner from its top-K bestsPerImage list.
+     With the remaining probability, falls through to the normal
+     pickPair selection so the gallery sometimes opens on a fresh
+     top-pool pair instead.
 
-     Why this is wanted: favorites are images you've explicitly marked
-     as ones you don't want to wait to see. Opening the gallery with
-     one signals the curation to anyone who refreshes or visits fresh,
-     and biases the first impression toward photography you stand by.
+     Previously hard-coded to "always favorite-first" (probability 1.0).
+     That meant the first-impression universe was at most
+     |FAVORITE_IMAGES| × bestsPerImage K — typically 15 × 5 = 75
+     compositions, the same pool every session. At 0.5, half of fresh
+     opens draw from the full top-N pool instead, giving the gallery
+     a meaningfully wider front door.
+
+     If the favorite branch runs but finds nothing usable (rare — only
+     if every favorite failed analysis), falls through to pickPair so
+     the gallery always opens with something.
 
      IMPORTANT: same allowVideos:false reasoning as the comment block
      above — first-pair videos would stall the consent card on the
      MP4 fetch. The favorite-pick is image-only by construction; the
-     partner is explicitly filtered to non-video too. */
+     partner is explicitly filtered to non-video too; pickPair honours
+     the option for the same reason. */
   let firstPair = null;
-  const favoriteSrcs = [...FAVORITE_IMAGES]
-    .map(numToSrc)
-    .filter(s => validImages.includes(s) && !isVideo(s) && colorSignatures.has(s));
-  if (favoriteSrcs.length > 0 && bestsPerImage.size > 0) {
-    /* Shuffle favorites so each refresh leads with a different one
-       (FAVORITE_BOOST handles long-term rotation; the first pair is
-       a single moment and benefits from randomness over staleness). */
-    for (let i = favoriteSrcs.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [favoriteSrcs[i], favoriteSrcs[j]] = [favoriteSrcs[j], favoriteSrcs[i]];
-    }
-    for (const favSrc of favoriteSrcs) {
-      const partners = bestsPerImage.get(favSrc);
-      if (!partners) continue;
-      /* Filter the favorite's top-K partners to non-videos. Then pick
-         randomly from those instead of taking [0] — otherwise every
-         session lands on the favorite's single highest-scoring partner,
-         and across refreshes the same one or two pairs dominate.
-         Random pick across the top-5 keeps the partner high-quality
-         (it's still in this favorite's top-5) while genuinely varying
-         per session. */
-      const eligible = partners.filter(p => !isVideo(p.a) && !isVideo(p.b));
-      if (eligible.length === 0) continue;
-      const partnerPair = eligible[Math.floor(Math.random() * eligible.length)];
-      /* Pair returns [favSrc, partner] — favSrc on the left if it's
-         the .a of the pair, otherwise on the right. Random orientation
-         50/50 to avoid favourites always anchoring the same side. */
-      const other = partnerPair.a === favSrc ? partnerPair.b : partnerPair.a;
-      firstPair = Math.random() < 0.5 ? [favSrc, other] : [other, favSrc];
-      break;
+  if (Math.random() < FIRST_PAIR_FAVORITE_PROB) {
+    const favoriteSrcs = [...FAVORITE_IMAGES]
+      .map(numToSrc)
+      .filter(s => validImagesSet.has(s) && !isVideo(s) && colorSignatures.has(s));
+    if (favoriteSrcs.length > 0 && bestsPerImage.size > 0) {
+      /* Shuffle favorites so each refresh leads with a different one
+         (FAVORITE_BOOST handles long-term rotation; the first pair is
+         a single moment and benefits from randomness over staleness). */
+      for (let i = favoriteSrcs.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [favoriteSrcs[i], favoriteSrcs[j]] = [favoriteSrcs[j], favoriteSrcs[i]];
+      }
+      for (const favSrc of favoriteSrcs) {
+        const partners = bestsPerImage.get(favSrc);
+        if (!partners) continue;
+        /* Filter the favorite's top-K partners to non-videos. Then pick
+           randomly from those instead of taking [0] — otherwise every
+           session lands on the favorite's single highest-scoring partner,
+           and across refreshes the same one or two pairs dominate.
+           Random pick across the top-5 keeps the partner high-quality
+           (it's still in this favorite's top-5) while genuinely varying
+           per session. */
+        const eligible = partners.filter(p => !isVideo(p.a) && !isVideo(p.b));
+        if (eligible.length === 0) continue;
+        const partnerPair = eligible[Math.floor(Math.random() * eligible.length)];
+        /* Pair returns [favSrc, partner] — favSrc on the left if it's
+           the .a of the pair, otherwise on the right. Random orientation
+           50/50 to avoid favourites always anchoring the same side. */
+        const other = partnerPair.a === favSrc ? partnerPair.b : partnerPair.a;
+        firstPair = Math.random() < 0.5 ? [favSrc, other] : [other, favSrc];
+        break;
+      }
     }
   }
-  /* Fallback: no favorites available, or none had a non-video partner.
-     Falls back to the normal selection logic with the same constraints. */
+  /* Either the favorite branch didn't run (probability roll), or it
+     ran but found nothing usable. Fall through to pickPair. */
   if (!firstPair) {
     firstPair = pickPair(validImages, { allowVideos: false });
   }
@@ -2587,11 +2920,19 @@ document.querySelectorAll('.interlude').forEach(el => {
      welcome statement now appears later as one of the rotation
      interludes (CONTACT_MIN..CONTACT_MAX clicks in). */
   if (consentEl && consentEl.isConnected) {
-    interludePreload = loadDiptych(firstPair);
+    /* Consent card covers the diptych while it loads — but we gate
+       on loadingDiptych for consistency with the no-consent branch
+       and to keep the in-flight contract obvious. */
+    loadingDiptych  = true;
+    interludePreload = loadDiptych(firstPair).finally(() => { loadingDiptych = false; });
     showAnalytics();
   } else {
     liftGate();
-    loadDiptych(firstPair);
+    /* No card covers the diptych — a rapid first tap can otherwise
+       race this initial decode and double-fire loadDiptych. The
+       guard mirrors advance()'s wrapper. */
+    loadingDiptych = true;
+    loadDiptych(firstPair).finally(() => { loadingDiptych = false; });
   }
 })();
 
@@ -2599,12 +2940,8 @@ document.querySelectorAll('.interlude').forEach(el => {
    CLICK / TAP HANDLING
    ───────────────────────────────────────────────────────────────────────── */
 
-/* In-flight guard for loadDiptych. Without this, a click landing while
-   a previous load is still awaiting img.decode would overwrite the
-   in-flight image's src and call history.replaceState twice with
-   potentially mismatched pairs — observable as flicker or a hash that
-   disagrees with what's painted. */
-let loadingDiptych = false;
+/* loadingDiptych is declared at the top of the file alongside other
+   top-level state — see the comment there. */
 
 /* Roll the first interlude target up front. clicksSinceInterlude
    counts user clicks since the last interlude (or since session
@@ -2756,10 +3093,9 @@ document.addEventListener('keydown', async (e) => {
    the reveal lands on a ready image rather than a blank panel.
    ───────────────────────────────────────────────────────────────────────── */
 
-const GA_ID       = 'G-F8Z6W7JPHQ';
-const CONSENT_KEY = 'ff-analytics-consent';
-const consentEl   = document.getElementById('consent');
-const privacyEl   = document.getElementById('privacy');
+/* GA_ID, CONSENT_KEY, consentEl, privacyEl are declared at the top of
+   the file alongside other top-level state, so the IIFE that references
+   them no longer relies on the await-timing forward-reference trick. */
 
 function loadAnalytics() {
   if (window.gaEnabled) return;
@@ -2951,10 +3287,18 @@ function shareCurrentPair() {
      opening is the success signal. */
   const isMobile = matchMedia('(hover: none) and (pointer: coarse)').matches;
   if (isMobile && navigator.share) {
-    navigator.share({ url, title }).catch(() => { /* user cancelled — silent */ });
-    if (window.gaEnabled && typeof gtag !== 'undefined') {
-      gtag('event', 'pair_shared', { url, source: 'shortcut-mobile' });
-    }
+    navigator.share({ url, title }).then(
+      () => {
+        /* Only log a share event on actual success. Without the
+           promise branching, the previous version fired gtag
+           unconditionally — counting every long-press that opened
+           the sheet, including ones the user cancelled. */
+        if (window.gaEnabled && typeof gtag !== 'undefined') {
+          gtag('event', 'pair_shared', { url, source: 'shortcut-mobile' });
+        }
+      },
+      () => { /* user cancelled or share failed — silent, no event */ }
+    );
     return;
   }
 
@@ -2965,25 +3309,28 @@ function shareCurrentPair() {
      deprecated, notoriously dishonest about success on some engines,
      and pollutes the DOM each call — so it's only the fallback for
      ancient browsers without navigator.clipboard. We only show
-     "Link copied" on a real success signal. */
+     "Link copied" — and only fire analytics — on a real success
+     signal. */
+  const logShare = () => {
+    if (window.gaEnabled && typeof gtag !== 'undefined') {
+      gtag('event', 'pair_shared', { url, source: 'shortcut' });
+    }
+  };
   if (navigator.clipboard && navigator.clipboard.writeText) {
     navigator.clipboard.writeText(url).then(
-      () => showShareToast('Link copied'),
+      () => { showShareToast('Link copied'); logShare(); },
       () => {
         /* Modern API rejected (permission, focus, lockdown). Try
            the legacy path as a last resort before giving up. */
-        if (legacyCopy(url)) showShareToast('Link copied');
-        else                 showShareToast('Couldn’t copy');
+        if (legacyCopy(url)) { showShareToast('Link copied'); logShare(); }
+        else                   showShareToast('Couldn’t copy');
       }
     );
   } else if (legacyCopy(url)) {
     showShareToast('Link copied');
+    logShare();
   } else {
     showShareToast('Couldn’t copy');
-  }
-
-  if (window.gaEnabled && typeof gtag !== 'undefined') {
-    gtag('event', 'pair_shared', { url, source: 'shortcut' });
   }
 }
 
