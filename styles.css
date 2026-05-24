@@ -239,11 +239,19 @@ html.gated #diptych { visibility: hidden; }
    cleanly in the middle of the viewport with no further work. */
 html.has-sig-cache #splash .line.loading { display: none; }
 
-/* Diptych: two 50vw panels side by side. Inside each panel a single
-   image floats at a random size (50vh–90vh, capped to 50vw) and a
-   random position — see randomizeLayerLayout() in app.js. The panels
-   themselves still butt up against the centerline; only the images
-   inside them no longer do. */
+/* Diptych: two 50vw panels side by side. Each panel is a flex
+   container that pins its child layer to the panel's CENTERLINE
+   edge — left panel's image hugs its right edge (= the viewport
+   centerline), right panel's image hugs its left edge. Both
+   images vertically centered. Result: the two images touch in
+   the middle of the screen, always.
+
+   This layout used to be done in JS (computing pixel sizes and
+   writing vw/dvh values per pair load) but that fought against
+   window resizes — the percentages were derived from a snapshot
+   of the viewport at load time and didn't recompute when the
+   browser rerendered. Pure CSS means the browser recomputes on
+   every layout pass for free. */
 #diptych {
   display: flex;
   width: 100vw;
@@ -260,25 +268,19 @@ html.has-sig-cache #splash .line.loading { display: none; }
 .panel .layer {
   position: absolute;
   inset: 0;
-  display: block;
+  /* Layer is a flex container — image hugs the panel's centerline
+     edge horizontally, sits vertically centered. The justify-content
+     differs per side (set below). */
+  display: flex;
+  align-items: center;
   opacity: 0;
-  /* Outgoing-direction transition. CSS transitions use the property
-     declared on the DESTINATION state, and removing .loaded makes
-     this rule the destination, so this is the curve+duration that
-     runs when a photo leaves the screen. Short duration (0.2s)
-     means the old image is at ~10% opacity by 80ms and gone by
-     200ms — too fast for the eye to register as "lingering at the
-     old position" while the new image arrives in a different one. */
   transition: opacity var(--fade-out-duration) var(--fade-out-curve);
   pointer-events: none;
 }
+.panel.left  .layer { justify-content: flex-end;   }  /* image's right edge at centerline */
+.panel.right .layer { justify-content: flex-start; }  /* image's left  edge at centerline */
 .panel .layer.loaded {
   opacity: 1;
-  /* Incoming-direction transition. Override the base rule's
-     transition so adding .loaded routes through the full
-     --fade-duration (0.8s) ease-out — the new image has time to
-     settle in gracefully while the outgoing one (much shorter
-     duration above) clears out fast. */
   transition: opacity var(--fade-duration) var(--fade-curve);
 }
 
@@ -293,30 +295,31 @@ html.has-sig-cache #splash .line.loading { display: none; }
    dismisses. The crossfade isn't lost — it's just deferred to the
    interlude's own fade-out, which IS the visible reveal. */
 html.has-interlude .panel .layer { transition: none; }
+
+/* The image (or video) inside a layer. Constraints only — actual
+   size is whatever the browser computes within these constraints,
+   preserving the image's natural aspect ratio:
+     - max long side: 50dvh (vertical viewport, dynamic so mobile
+       Safari accounts for browser chrome correctly)
+     - never wider than its panel (50vw)
+     - never taller than 50dvh
+   object-fit:contain handles the case where neither constraint is
+   binding (image takes its natural displayed size up to those caps).
+
+   The image keeps its native aspect ratio because we DON'T set both
+   width AND height to fixed values — only max-* and one auto. The
+   browser picks whichever dimension hits its cap first. */
 .panel .layer img,
 .panel .layer video {
-  position: absolute;
-  /* Position + size are randomised per pair load by randomizeLayerLayout()
-     in app.js, which sets the four custom properties below on the .layer
-     div before the cross-fade triggers. Each image gets a square bounding
-     box between 20vh and 90vh (capped to 50vw so the box never spills
-     into the opposite panel) placed anywhere inside the SAFE area of
-     its panel — a 3-unit margin top and bottom keeps content off the
-     viewport edges. The fallbacks below reproduce the old centred
-     50vw × 50dvh box so a layer that hasn't been randomised yet (cold
-     page-load before the first preparePanel call sets the vars) still
-     renders sensibly. dvh ("dynamic viewport height") is used instead
-     of vh on the vertical axis so the box respects the visible viewport
-     on mobile Safari — see the randomizeLayerLayout comment for why. */
-  top:    var(--img-top, 25dvh);
-  left:   var(--img-left, 0);
-  width:  var(--img-w, 50vw);
-  height: var(--img-h, 50dvh);
+  max-width:  50vw;
+  max-height: 50dvh;
+  /* On a landscape image the height cap (50dvh) bites first and the
+     width follows by aspect; on a portrait image the width cap (50vw)
+     bites first. Setting both as max-* lets the browser pick the
+     right one per image. */
+  width:  auto;
+  height: auto;
   object-fit: contain;
-  /* No longer pinned to the centerline — each image floats freely
-     inside its panel and the bounding box is sized to the image's
-     contain region, so centring inside the box is correct. */
-  object-position: center;
   display: block;
 }
 /* Reset UA-stylesheet contributions that apply to <video> but not
@@ -354,7 +357,7 @@ html.has-interlude .panel .layer { transition: none; }
    cap inside randomizeLayerLayout already keeps the box inside the
    panel on any aspect ratio, so small-landscape phones still get a
    usable image without the override; the trade-off is that the
-   minimum 50vh size becomes ~50vw on very short viewports, which
+   minimum 30vh size becomes ~30vw on very short viewports, which
    is the same constraint everywhere else and the right behaviour
    given the new layout rules. */
 
@@ -578,6 +581,63 @@ html.has-interlude .panel .layer { transition: none; }
      (see :root --accent), so a single property covers it. */
   color: var(--accent);
 }
+
+/* ─────────── ANALYTICS CONSENT BANNER ───────────
+   Non-blocking strip pinned 10px above the bottom safe edge,
+   centred horizontally. Inherits the .interlude visibility state
+   machine (.visible toggles opacity, aria-hidden for screen readers)
+   but resets all of .interlude's full-screen positioning so the
+   banner is small and lets the diptych breathe behind it. No
+   background — text inherits the body palette and reads against
+   whatever the diptych happens to show underneath; the trade-off
+   is occasional reduced legibility against busy photos, in
+   exchange for keeping the site's minimal aesthetic intact at the
+   bottom edge. See the ANALYTICS CONSENT BANNER section in app.js
+   for the JS flow. */
+#consent {
+  /* Reset the .interlude full-screen positioning. inset: 0 expands
+     to top/right/bottom/left = 0 — undo all four explicitly so the
+     box collapses to content size. */
+  inset: auto;
+  top: auto;
+  right: auto;
+  left: 50%;
+  /* Sit 10px above the bottom edge, with safe-area honoured on
+     devices with a home indicator (iPhones). max() picks the larger
+     so the banner never falls behind the home indicator strip. */
+  bottom: max(10px, env(safe-area-inset-bottom));
+  transform: translateX(-50%);
+  /* Override .interlude's flex centering — the banner is small
+     enough that its two text lines don't need layout help. */
+  display: block;
+  height: auto;
+  width: auto;
+  max-width: calc(100vw - 20px);
+  /* Zero padding overrides .interlude's safe-area insets, which
+     are meaningful only for full-screen overlays; for a small
+     bottom strip the bottom: max(...) above already handles the
+     safe area. */
+  padding: 0;
+  box-sizing: border-box;
+  background: transparent;
+  color: var(--fg);
+  text-align: center;
+}
+/* Faster fade for the banner than the full-card interludes — small
+   surface area, no ceremony. Match both the visible and base states
+   so appear and disappear feel symmetric. No background-color
+   transition since background is permanently transparent. */
+#consent,
+#consent.visible,
+html.theme-ready #consent,
+html.theme-ready #consent.visible {
+  transition: opacity 0.2s var(--fade-curve), color 1.2s ease;
+}
+/* Font-size and line-height are inherited from body (1.8vw, capped
+   to 18px on narrow viewports; line-height 1em) so the banner
+   reads as part of the site rather than as a separate UI surface.
+   Two .line spans stack via the .interlude .line { display: block }
+   rule above — no override needed here. */
 
 /* ─────────── ROTATE PROMPT ───────────
    The diptych is designed for portrait viewing on phones — the two

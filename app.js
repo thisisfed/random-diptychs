@@ -214,9 +214,9 @@ const DISCOVER_BATCH = 20;
    distinct diptychs. A hard floor: pairs ranked worse than N can
    never surface, no matter what the random roll does — so use this
    to set the worst-case quality you're willing to accept.
-   At 250, with ~110 items in the pool, that's the top ~4% of the
+   At 500, with ~110 items in the pool, that's the top ~8% of the
    ~6000 possible pairs — still strict curation but with more room.
-   Yields 500 distinct diptychs. Previous setting was 150 (300
+   Yields 1000 distinct diptychs. Previous setting was 150 (300
    diptychs); raised because long sessions were starting to feel
    repetitive as the recent-block filter narrowed the active pool.
    The scoring is calibrated tightly enough (OKLab, centre weighting,
@@ -388,8 +388,8 @@ const VIDEO_MIN_GAP = 1;
    dominate over those just shown — converting the guarantee from a
    coin flip into an active long-term rotation engine.
 
-   At 0.45, roughly 1 in 2 clicks rotates the catalogue while the
-   remaining ~1 in 2 follow the quality-biased top-150 selection.
+   At 0.50, roughly 1 in 2 clicks rotates the catalogue while the
+   remaining ~1 in 2 follow the quality-biased top-N selection.
    This keeps freshness high — most clicks bring back an under-shown
    image — without entirely abandoning the global quality ranking.
    Higher values surface rare images faster at the cost of pulling
@@ -419,16 +419,6 @@ function altFor(num) {
 
 let   images          = [];
 const validImages     = [];
-/* O(1) membership mirror of `validImages`. Both must stay in sync —
-   only ever mutated via `addValid()` below. Replaces hot-path
-   `validImages.includes(...)` calls, which were O(N) and ran inside
-   the analysis loops and the rotation-cache restore.  */
-const validImagesSet  = new Set();
-function addValid(src) {
-  if (validImagesSet.has(src)) return;
-  validImages.push(src);
-  validImagesSet.add(src);
-}
 const colorSignatures = new Map();    // src → { histogram, palette, avgSat }
 let   topPairs        = [];           // globally-ranked pair list (best first)
 let   imageBests      = [];           // per-image first-best pair (kept for debugging)
@@ -440,23 +430,6 @@ let   clicksSinceVideo = Infinity;  // gap counter for VIDEO_MIN_GAP
 let   interludePreload = null;
 let   currentInterlude = null;
 let   lastInterlude    = null;
-
-/* In-flight guard for loadDiptych. Hoisted up here (rather than alongside
-   the click handler) so the IIFE-driven first-pair load can also gate on
-   it — without this, a rapid first click can race the initial decode. */
-let loadingDiptych = false;
-
-/* Analytics gate elements — hoisted ABOVE the IIFE that references them.
-   Previously declared further down, which only worked because the IIFE's
-   first `await` happened before the references and the rest of the script's
-   synchronous top-level code (these declarations included) ran during that
-   await window. That arrangement broke the moment any refactor moved an
-   await around. Now the references are top-of-file constants, evaluated
-   before start() even begins. */
-const GA_ID       = 'G-F8Z6W7JPHQ';
-const CONSENT_KEY = 'ff-analytics-consent';
-const consentEl   = document.getElementById('consent');
-const privacyEl   = document.getElementById('privacy');
 
 /* ─────────────────────────────────────────────────────────────────────────
    PATH HELPERS
@@ -555,20 +528,15 @@ for (const group of SIBLING_GROUPS) {
 async function discoverBy(urlFor) {
   const found = [];
   let start = 1;
-  /* Number of consecutive empty batches we'll walk past before
-     declaring end of catalogue. With DISCOVER_BATCH = 20 and
-     MAX_GAP_BATCHES = 3, we tolerate single gaps of up to ~60 missing
-     items, and — unlike the old single-grace far-probe design —
-     multiple such gaps in the same catalogue.
-
-     Cost: in the true end-of-catalogue case we now spend MAX_GAP_BATCHES
-     extra empty batches (≈ 60 HEADs) before stopping. With HTTP/2
-     multiplexing that's a few hundred ms once, and only on cold visits
-     (warm visits hit the discovery cache). Worth the simplification and
-     the multi-gap robustness. */
-  const MAX_GAP_BATCHES = 3;
-  let emptyRun = 0;
-
+  /* Grace counter for empty batches following a successful far-probe.
+     When a partial batch's far probe confirms there's more catalogue
+     ahead, we know an item exists at start+DISCOVER_BATCH*2. The next
+     batch (start..start+DISCOVER_BATCH-1) may be entirely inside the
+     gap — without this grace, an empty batch would break the loop and
+     silently lose the catalogue past it. With grace=1 we tolerate one
+     empty batch before giving up, which covers any gap that ends
+     before the verified far position. */
+  let emptyGrace = 0;
   while (true) {
     const batch = Array.from({ length: DISCOVER_BATCH }, (_, i) => start + i);
     const results = await Promise.all(
@@ -582,12 +550,36 @@ async function discoverBy(urlFor) {
     found.push(...present);
 
     if (present.length === 0) {
-      emptyRun++;
-      if (emptyRun >= MAX_GAP_BATCHES) break;
+      /* Empty batch. If a previous partial batch's far probe told us
+         there's more catalogue past here, use up one grace and skip
+         ahead instead of breaking. Otherwise we're genuinely at the
+         end. */
+      if (emptyGrace > 0) {
+        emptyGrace--;
+        start += DISCOVER_BATCH;
+        continue;
+      }
+      break;
+    }
+
+    /* Partial-hit batch usually means we've crossed the end of the
+       catalogue, but it could also be a hole (e.g. ff100 deleted,
+       ff101-ff147 still present). Probe one item far ahead to tell
+       the two apart. If the far probe also 404s, we're at the end
+       and break — saves the ~20 wasted HEADs the old logic spent
+       on a confirming full batch. If it hits, there's genuinely a
+       hole; set emptyGrace=1 so the loop tolerates one empty batch
+       between here and the verified far position, then continues. */
+    if (present.length < batch.length) {
+      const farN = start + DISCOVER_BATCH * 2;
+      const farExists = await fetch(urlFor(farN), { method: 'HEAD' })
+        .then(r => r.ok).catch(() => false);
+      if (!farExists) break;
+      emptyGrace = 1;
     } else {
-      /* Any hit resets the run counter — gaps don't accumulate
-         across batches that contain even a single item. */
-      emptyRun = 0;
+      /* Full batch — definite catalogue, reset the grace counter so
+         a later gap doesn't get extra tolerance it didn't earn. */
+      emptyGrace = 0;
     }
 
     start += DISCOVER_BATCH;
@@ -672,11 +664,15 @@ const discoverVideos = () => discoverBy(n => `${VIDEO_BASE}/ff${n}.mp4`);
      a version mismatch as "no cache", so existing users transition
      cleanly the first time they reload after a deploy. */
 
-/* Schema version comes from window.SIG_CACHE_VERSION, set by an inline
-   script in index.html's <head> ABOVE the fast-path detector. Single
-   source of truth: bumping the algorithm only requires changing the
-   number in HTML, and the detector and app.js stay in lockstep. */
-const SIG_CACHE_VERSION = window.SIG_CACHE_VERSION;
+/* Bumped from 1 to 2 when aspect ratio was added to the signature
+   schema. Old cached signatures (v1) lacked the `aspect` field, which
+   the layout code would have interpreted as 1.0 (square box, the old
+   behaviour). Bumping invalidates those caches so every user benefits
+   from aspect-aware sizing on the next reload. (The current layout
+   does aspect-aware sizing in CSS, but the analyzeImage path still
+   uses the cached signatures and the field is still useful for any
+   future feature that needs to know an image's shape upfront.) */
+const SIG_CACHE_VERSION = 2;
 const SIG_CACHE_KEY     = 'ff_signatures';
 
 function readSignatureCache() {
@@ -820,19 +816,12 @@ function writeRotationCache() {
        doesn't natively handle Map, so we materialise as [[k,v],...]
        and rehydrate on read. Both maps are bounded in practice
        (recent capped by the click-block window, lastShown by the
-       catalogue size), so the total payload stays well under 10KB.
-
-       clicksSinceVideo is also persisted so VIDEO_MIN_GAP is honoured
-       across session boundaries — without this, the last click of one
-       session and the first of the next could both land a video. The
-       counter is a plain number; readers tolerate its absence (older
-       caches default to Infinity) so no version bump is needed. */
+       catalogue size), so the total payload stays well under 10KB. */
     localStorage.setItem(ROTATION_CACHE_KEY, JSON.stringify({
-      v:                ROTATION_CACHE_VERSION,
+      v:          ROTATION_CACHE_VERSION,
       clickCount,
-      clicksSinceVideo: Number.isFinite(clicksSinceVideo) ? clicksSinceVideo : null,
-      recent:           [...recent.entries()],
-      lastShown:        [...lastShown.entries()],
+      recent:     [...recent.entries()],
+      lastShown:  [...lastShown.entries()],
     }));
   } catch {
     /* Quota exceeded, private mode, or storage disabled. Silent —
@@ -1099,7 +1088,23 @@ function analyzeImage(img) {
        L2 norm of the histogram (for the tonalScore cosine), and the
        mean lightness (for lightness contrast). With N≈100 these add
        up: ~10k entropy calls, ~10k sqrt calls per full computeTopPairs
-       pass collapse to N each. */
+       pass collapse to N each.
+
+       aspect (width / height) is captured here for the layout code
+       to use — though under the current pure-CSS layout (max-width:
+       50vw / max-height: 50dvh / auto on the unbound axis) the
+       browser derives aspect from the rendered image directly. The
+       cached value is retained in case future features want to know
+       an image's shape before it's actually rendered. Reads
+       naturalWidth/Height for <img>, falls back to videoWidth/Height
+       for <video> elements that go through this same function (runtime
+       frame extraction path). Defaults to 1 (square) if neither is
+       available, which makes the new box logic degrade to the old
+       square-box behaviour for any source without dimension data. */
+    const w = img.naturalWidth  || img.videoWidth  || 0;
+    const h = img.naturalHeight || img.videoHeight || 0;
+    const aspect = (w > 0 && h > 0) ? w / h : 1;
+
     return {
       histogram,
       palette,
@@ -1107,6 +1112,7 @@ function analyzeImage(img) {
       meanL,
       density: histogramDensity(histogram),
       histMag: histogramMagnitude(histogram),
+      aspect,
     };
   } catch {
     return null;
@@ -1474,23 +1480,12 @@ function isRecent(src) {
    sibling declared in SIBLING_GROUPS. Without sibling propagation,
    near-duplicates like ff97/ff98 (same shoot, near-identical
    colour signature) could appear in adjacent clicks because the
-   scorer sees them as independent images.
-
-   lastShown is updated for BOTH the shown sources AND their siblings —
-   otherwise a sibling's staleness stays high even though the user just
-   saw "essentially that image", and the guarantee branch would
-   preferentially surface it the moment recent[] expires. Updating
-   lastShown alongside recent keeps staleness in lockstep with the
-   user's actual experience. */
+   scorer sees them as independent images. */
 function markPairRecent(pair) {
   for (const src of pair) {
     recent.set(src, clickCount);
-    lastShown.set(src, clickCount);
     const sibs = SIBLINGS.get(src);
-    if (sibs) for (const s of sibs) {
-      recent.set(s, clickCount);
-      lastShown.set(s, clickCount);
-    }
+    if (sibs) for (const s of sibs) recent.set(s, clickCount);
   }
 }
 
@@ -1658,271 +1653,38 @@ function pickPair(arr, opts) {
   return Math.random() < 0.5 ? [chosen.a, chosen.b] : [chosen.b, chosen.a];
 }
 
-/* ─────────── RANDOM PER-IMAGE LAYOUT ───────────
-   Replaces the old centerline-touching arrangement (two equal-sized
-   50vw × 50vh boxes pinned to the middle line) with one freely-placed
-   image per panel. Each image gets a square bounding box whose side
-   is a random value between 20vh and 90vh, capped to 50vw so it
-   can't span into the opposite panel, and an origin chosen so the
-   whole box fits inside that panel's 50vw × 100vh area. The wide
-   size range is deliberate — a 20vh image next to a 90vh image
-   reads as a 4.5× size contrast, which is most of what makes the
-   randomised composition interesting.
+/* ─────────── PER-IMAGE LAYOUT ───────────
+   Positioning and sizing is done entirely in CSS — see the
+   `.panel .layer` / `.panel .layer img,video` rules in styles.css.
+   Each layer is a flex container that pins its image to the panel's
+   centerline edge (left panel: flex-end, right panel: flex-start);
+   the image itself is constrained by max-width:50vw and
+   max-height:50dvh, keeping its native aspect ratio via auto on
+   the unbound axis. The browser handles all viewport math on every
+   layout pass, including window resizes — no JS recompute needed,
+   and the centerline pin is guaranteed regardless of viewport state.
 
-   The square sits anywhere within the panel; object-fit:contain on
-   the img/video keeps the photo's own aspect ratio inside that box.
-   Output is written to four CSS custom properties on the .layer div
-   (--img-w / --img-h / --img-top / --img-left) which the rule on
-   .panel .layer img/video consumes via var(). Using viewport units
-   (vw / vh) rather than pixels means the layout still tracks the
-   viewport if the user resizes between pair loads — the box will
-   stay roughly square in pixels at the moment it's generated but
-   the values themselves scale with the viewport.
-
-   Sizes are drawn through a bucket-recency filter to give the page
-   a rhythm rather than letting independent uniform draws clump on
-   similar values. The 20–90vh range is divided into seven 10vh-wide
-   buckets; the last SIZE_BUCKET_RECENT_CAP buckets used are excluded
-   from the next draw, so within any short window of pairs every
-   image lands in a noticeably different size band than its recent
-   neighbours. Crucially the two sizes inside a single pair are
-   filtered against each other too — the left panel's bucket gets
-   recorded before the right panel's draw — so a pair will never
-   show two near-equal squares, which was the main thing that read
-   as "missed compositions" with naive uniform sizing. */
-
-/* Bucket layout. Seven 10vh-wide buckets covering 20–90vh:
-   index 0 = 20–30, 1 = 30–40, … 6 = 80–90. RECENT_CAP=4 leaves three
-   buckets eligible for any given draw, which is enough randomness to
-   feel free but tight enough that you won't see two big-or-two-small
-   pairs in a row. Tune RECENT_CAP up for stricter rhythm (more
-   forced variety, less surprise) or down for looser. */
-const SIZE_BUCKET_MIN_VH    = 20;
-const SIZE_BUCKET_MAX_VH    = 90;
-const SIZE_BUCKET_STEP_VH   = 10;
-const SIZE_BUCKET_COUNT     = (SIZE_BUCKET_MAX_VH - SIZE_BUCKET_MIN_VH) / SIZE_BUCKET_STEP_VH;
-const SIZE_BUCKET_RECENT_CAP = 4;
-const recentSizeBuckets = [];
-
-function pickSizeVh() {
-  /* Available buckets = those not in the recent window. With CAP=4
-     and 7 buckets there are always at least 3 candidates, so the
-     fallback below (use the full set if recents have somehow swallowed
-     everything) never fires in normal operation — it's just defence
-     against future config changes that push CAP ≥ COUNT. */
-  const available = [];
-  for (let i = 0; i < SIZE_BUCKET_COUNT; i++) {
-    if (!recentSizeBuckets.includes(i)) available.push(i);
-  }
-  const pool = available.length
-    ? available
-    : Array.from({ length: SIZE_BUCKET_COUNT }, (_, i) => i);
-
-  const bucket = pool[Math.floor(Math.random() * pool.length)];
-  /* Uniform inside the bucket — the bucket gives the rhythm, the
-     intra-bucket jitter keeps consecutive draws from the same band
-     (across a longer window than RECENT_CAP) from looking identical. */
-  const lower = SIZE_BUCKET_MIN_VH + bucket * SIZE_BUCKET_STEP_VH;
-  const sizeVh = lower + Math.random() * SIZE_BUCKET_STEP_VH;
-
-  recentSizeBuckets.push(bucket);
-  if (recentSizeBuckets.length > SIZE_BUCKET_RECENT_CAP) recentSizeBuckets.shift();
-
-  return sizeVh;
-}
-
-/* Within-pair size contrast rule: the two images in any single pair
-   must differ by at least 25% in size (ratio, not absolute vh — the
-   smaller image is at most 75% of the larger). For the second draw
-   of a pair we therefore need a size that lies outside a "forbidden
-   band" centred on the first size, while still respecting bucket
-   recency when possible.
-
-   Expressed concretely with `o = otherVh` and RATIO = 0.75, the valid
-   range for the second size b is:
-
-       [SIZE_BUCKET_MIN_VH, o × RATIO]  ∪  [o / RATIO, SIZE_BUCKET_MAX_VH]
-
-   i.e. either b is the small one (≤ 0.75·o) or the big one (≥ 1.333·o).
-   We walk every bucket, intersect it with both halves of the valid
-   range, and collect each non-empty intersection as a candidate
-   (bucket, sub-range) tuple. A single bucket can contribute up to two
-   tuples if both halves clip it. The active size is drawn uniformly
-   inside the chosen sub-range so partial-bucket slices (typical when
-   the 25% rule cuts mid-bucket) still get used proportionally. */
-const PAIR_SIZE_DIFF_RATIO = 0.75;
-
-function pickSecondPairSizeVh(otherVh) {
-  const smallCap = otherVh * PAIR_SIZE_DIFF_RATIO;       // b ≤ smallCap → b is the smaller
-  const bigFloor = otherVh / PAIR_SIZE_DIFF_RATIO;       // b ≥ bigFloor → b is the larger
-
-  function tuples(skipRecent) {
-    const out = [];
-    for (let i = 0; i < SIZE_BUCKET_COUNT; i++) {
-      if (skipRecent && recentSizeBuckets.includes(i)) continue;
-      const bLo = SIZE_BUCKET_MIN_VH + i * SIZE_BUCKET_STEP_VH;
-      const bHi = bLo + SIZE_BUCKET_STEP_VH;
-      /* Lower-half overlap: [bucket_lo, smallCap] ∩ bucket */
-      const lo1 = bLo;
-      const hi1 = Math.min(bHi, smallCap);
-      if (hi1 > lo1) out.push([i, lo1, hi1]);
-      /* Upper-half overlap: [bigFloor, SIZE_BUCKET_MAX_VH] ∩ bucket */
-      const lo2 = Math.max(bLo, bigFloor);
-      const hi2 = bHi;
-      if (hi2 > lo2) out.push([i, lo2, hi2]);
-    }
-    return out;
-  }
-
-  /* Prefer the recency-respecting set; if 25%×recency leaves nothing,
-     drop the recency filter for this one draw — the size-contrast rule
-     is the firmer guarantee, the rhythm is the softer preference. The
-     unconstrained set is never empty for otherVh ∈ [20, 90] because at
-     least one half of the valid range always overlaps the bucket
-     domain (extreme otherVh values just lose the half that runs past
-     the edge — e.g. otherVh = 90 has no upper half but a full lower
-     half from 20 to 67.5). */
-  let pool = tuples(true);
-  if (pool.length === 0) pool = tuples(false);
-
-  const [bucket, lo, hi] = pool[Math.floor(Math.random() * pool.length)];
-  const sizeVh = lo + Math.random() * (hi - lo);
-
-  recentSizeBuckets.push(bucket);
-  if (recentSizeBuckets.length > SIZE_BUCKET_RECENT_CAP) recentSizeBuckets.shift();
-
-  return sizeVh;
-}
-
-/* Pair-level entry point. Draws size A through the regular rhythm
-   filter, then size B through the contrast-constrained filter against
-   A. Returned in [left, right] order — the assignment of "first" vs
-   "second" within a pair is arbitrary, both panels get the rhythm
-   benefit and exactly one of them honours the contrast constraint
-   against the other. */
-function pickPairSizesVh() {
-  const a = pickSizeVh();
-  const b = pickSecondPairSizeVh(a);
-  return [a, b];
-}
-
-function randomizeLayerLayout(layerEl, sizeVhRequest) {
-  const winH = window.innerHeight;
-  const winW = window.innerWidth;
-
-  /* Caller (loadDiptych via preparePanel) supplies the size so the two
-     panels of a pair can be drawn JOINTLY — pickPairSizesVh enforces
-     the within-pair contrast rule, which a sequence of independent
-     pickSizeVh() calls couldn't. If no size is passed (defensive — no
-     production callsite does this, but keeps the function callable
-     in isolation), fall back to a single-draw bucket pick. */
-  if (sizeVhRequest === undefined) sizeVhRequest = pickSizeVh();
-
-  /* Convert the chosen vh value to pixels, then clamp horizontally.
-     Clamping happens AFTER the bucket has been recorded (inside
-     pickSizeVh / pickPairSizesVh), which is the right order: the
-     rhythm of the composition is defined by the intent (the requested
-     vh value) not by how each viewport happens to render it. A
-     portrait phone where 80vh > 50vw will visually shrink to 50vw,
-     but the bucket log still says "we just used a big size" so the
-     next draw avoids the big bucket — which is what the rhythm
-     scheme is meant to do. */
-  /* Decouple the height from the width clamp.
-
-     Old behaviour: a single sizePx variable was computed from the
-     requested vh, then clamped to half the viewport width, then used
-     as BOTH the height and the width of the bounding box. On a
-     portrait phone (where 50vw is much smaller than 90vh in absolute
-     pixels), this clamp would fire for any request above ~23vh —
-     and since the same clamped pixel value was used for height too,
-     all "large" images collapsed to identical small squares. The
-     bucket-recency system was still picking diverse sizes; the
-     clamp was just flattening them.
-
-     Second iteration: switched to a rectangle box (height in vh,
-     width clamped to vw). This preserved height variation on
-     portrait — but all images ended up the SAME WIDTH (50vw cap),
-     producing tall strips of identical width. Visually the "same
-     size" perception persisted: width is the dominant cue on a
-     narrow viewport.
-
-     Current iteration: on portrait mobile, use the VIEWPORT WIDTH
-     as the size basis instead of viewport height. The picker still
-     returns values in [20, 90], but on portrait those values now
-     scale against winW rather than winH. Result: 20 → ~20% of
-     viewport width (small square), 50 → ~50vw (square that fills
-     the panel), 90 → tall rectangle (351px on iPhone 14, 195px
-     wide). The width axis now varies meaningfully across the
-     picker range — the bucket-recency rhythm becomes visible.
-
-     On desktop / landscape, baseDim is still winH (vh-based) and
-     the box can be a square up to 50vw wide, so the visual you
-     tuned for landscape stays intact. */
-  const isPortraitMobile = winH > winW && winW < 768;
-  const baseDim = isPortraitMobile ? winW : winH;
-
-  const sizeHeightPx = sizeVhRequest * baseDim / 100;
-  const sizeWidthPx  = Math.min(sizeHeightPx, winW / 2);
-
-  /* Express each axis in its own unit — vh for height, vw for width
-     — so the layout responds to each axis independently on resize.
-     With the decoupled clamp above, the two values may now describe
-     a rectangle rather than a square; that's intentional. */
-  const sizeVh = (sizeHeightPx / winH) * 100;
-  const sizeVw = (sizeWidthPx  / winW) * 100;
-
-  /* Origin: anywhere such that the whole square stays inside the
-     panel's SAFE viewport area. The safe margin (3 units top and
-     bottom) keeps images from sitting flush against the visible
-     viewport edges — important especially on iPhone Safari where
-     content right at the bottom edge can crowd the toolbar's
-     transparent shadow zone, and at the top where the URL bar's
-     edge can feel uncomfortably close.
-
-     Math.max guards against the tiny case where rounding makes the
-     placement range negative (e.g. a 90-unit-tall image with 6
-     units of margin leaves no room to move — that's fine, the
-     image just gets pinned at the minimum top instead of producing
-     NaN). At max size the image is essentially fixed; smaller
-     images have proportionally more freedom. */
-  const SAFE_MARGIN = 3;
-  const topRange = Math.max(0, 100 - 2 * SAFE_MARGIN - sizeVh);
-  const topVh    = SAFE_MARGIN + Math.random() * topRange;
-  const leftVw   = Math.random() * Math.max(0, 50 - sizeVw);
-
-  /* Output uses dvh ("dynamic viewport height") instead of vh for
-     the vertical axis. The two units differ on mobile Safari and
-     Chrome: vh measures the LARGEST possible viewport (as if the
-     browser chrome were fully retracted), while dvh measures the
-     CURRENT visible viewport with chrome accounted for. A 50vh
-     image positioned at 50vh from the top extends from the visible
-     midpoint to BEHIND the browser toolbar on iPhone Safari —
-     visibly cropped. The same coordinates in dvh keep the image
-     fully inside the visible area. On desktop dvh equals vh
-     (no chrome), so this change is mobile-only in effect.
-
-     Horizontal (vw) stays unchanged — browsers don't have
-     left/right chrome that needs accounting for. */
-  layerEl.style.setProperty('--img-w',    `${sizeVw}vw`);
-  layerEl.style.setProperty('--img-h',    `${sizeVh}dvh`);
-  layerEl.style.setProperty('--img-top',  `${topVh}dvh`);
-  layerEl.style.setProperty('--img-left', `${leftVw}vw`);
-}
+   An earlier version of this file computed pixel sizes here and
+   wrote vw/dvh values to CSS custom properties on the layer. That
+   approach captured a snapshot of the viewport at load time and
+   couldn't update if the user resized the window between pair
+   loads — the percentages stayed valid but didn't reflect the
+   intended FIXED_SIZE_VH long-side. Replacing it with pure CSS
+   removed the bug class entirely. */
 
 function preparePanel(panelEl, src, sizeVh) {
   const layers = panelEl.querySelectorAll('.layer');
   const active = panelEl.querySelector('.layer.loaded');
   const back   = (active === layers[0]) ? layers[1] : layers[0];
 
-  /* Apply the pre-picked random size and a fresh random position to
-     the back layer before the cross-fade triggers, so the new pose is
-     in place by the time opacity ramps up. Setting it on the .layer
-     div (rather than directly on the img/video) means the same custom
-     properties work for both element types and survive the picture/
-     video element rebuilds further down. The size comes from
-     pickPairSizesVh up in loadDiptych so the two panels of this pair
-     satisfy the within-pair contrast rule against each other. */
-  randomizeLayerLayout(back, sizeVh);
+  /* CSS handles all layout — see styles.css panel/layer rules. The
+     only per-pair work needed here is letting the cross-fade know
+     which layer is incoming (handled by the .loaded class flip below).
+
+     We still stash the src on the layer's dataset for future use
+     (analytics, debugging, possible side-channel features); it's
+     cheap and no current code depends on it being absent. */
+  back.dataset.src = src;
 
   if (isVideo(src)) {
     /* Reuse a video element in the back layer if one's already there,
@@ -2030,19 +1792,13 @@ async function loadDiptych(forcedPair) {
      which is the combination this site wants. */
   history.replaceState(null, '', pairToHash(pair));
 
-  /* Pick both panel sizes up front rather than letting each
-     preparePanel pick independently. The reason is the within-pair
-     contrast rule: the second size must be ≥25% different from the
-     first (ratio), which requires knowing the first when picking the
-     second. Doing the joint draw here keeps preparePanel ignorant of
-     pair-level semantics and means the bucket recency log records
-     exactly two buckets per pair, in a deterministic order, no
-     matter how the two preparePanel promises happen to interleave. */
-  const [sizeLeftVh, sizeRightVh] = pickPairSizesVh();
-
+  /* preparePanel doesn't need a size parameter — sizing is done in
+     CSS via max-width: 50vw / max-height: 50dvh on the image
+     element. Passing undefined keeps the function signature stable
+     for any other callers during the transition. */
   const sides = await Promise.all([
-    preparePanel(document.querySelector('.panel.left'),  pair[0], sizeLeftVh),
-    preparePanel(document.querySelector('.panel.right'), pair[1], sizeRightVh)
+    preparePanel(document.querySelector('.panel.left'),  pair[0]),
+    preparePanel(document.querySelector('.panel.right'), pair[1])
   ]);
 
   requestAnimationFrame(() => {
@@ -2062,17 +1818,121 @@ async function loadDiptych(forcedPair) {
        Doing this earlier (before await) marked preloaded-but-hidden
        interlude pairs as seen, thinning the candidate set unnecessarily.
        markPairRecent also propagates the block to any declared siblings
-       (SIBLING_GROUPS) AND updates lastShown for the pair plus its
-       siblings — staleness drives the guarantee branch's weighted
-       pick, so the sibling-update prevents a "ghost staleness" boost
-       on a near-duplicate the user effectively just saw. */
+       (SIBLING_GROUPS). lastShown drives the staleness weighting in
+       the guarantee branch: the more clicks since an image last
+       appeared, the more likely the guarantee will pick a pair
+       containing it next time. */
     markPairRecent(pair);
+    lastShown.set(pair[0], clickCount);
+    lastShown.set(pair[1], clickCount);
   });
 
   if (window.gaEnabled && typeof gtag !== 'undefined') {
     gtag('event', 'diptych_view', { left: pair[0], right: pair[1] });
   }
+
+  /* Prewarm video files that the picker is most likely to choose
+     next, so when the user clicks again the bytes are already in
+     the browser's HTTP cache and the <video src=...> transition is
+     near-instant instead of waiting on a full network round trip.
+
+     This addresses the laggy "click-then-wait-3-seconds" that
+     happens around pair 3-4 when a video is picked and its file
+     hasn't been touched since page load. Image-only pairs were
+     never slow because the splash preloads all images at boot.
+     This brings videos closer to that experience without paying
+     the full preload-all-videos cost upfront (which would balloon
+     the splash by 10-100×). */
+  prewarmLikelyVideos();
 }
+
+/* Prewarming uses hidden <video preload="auto"> elements rather than
+   fetch() because video files are streamed via HTTP Range requests
+   (the browser asks for byte ranges as it plays, not the whole file
+   upfront). A plain fetch() pulls the entire file as one response and
+   the browser's media cache doesn't always reuse those bytes for a
+   subsequent <video> request — different cache keys, different
+   semantics. A hidden <video> element with preload="auto", however,
+   issues exactly the same Range request pattern the live <video>
+   will, so the cache hit is guaranteed.
+
+   The hidden videos stay in the DOM throughout the session. Each
+   one is 1×1px, fully transparent, offscreen, muted, never plays —
+   so it costs essentially nothing to keep around. Memory cost is
+   bounded by the number of unique videos in the catalogue.
+
+   This also fixes the priority issue: <video preload="auto"> uses
+   the browser's default media-fetch priority (medium), which is
+   high enough to complete in a reasonable timeframe without
+   completely starving visible content. */
+const prewarmedVideos = new Map();  /* src → hidden <video> element */
+
+function warmVideoElement(src) {
+  if (prewarmedVideos.has(src)) return prewarmedVideos.get(src);
+  const v = document.createElement('video');
+  v.muted       = true;
+  v.playsInline = true;
+  v.preload     = 'auto';
+  v.setAttribute('aria-hidden', 'true');
+  /* Offscreen styling — same recipe as loadVideoForAnalysis above. */
+  v.style.cssText = 'position:fixed;left:-9999px;top:-9999px;width:1px;height:1px;opacity:0;pointer-events:none;';
+  v.src = src;
+  document.body.appendChild(v);
+  /* Force the browser to start fetching by calling load() — some
+     mobile browsers wait for a play() or interaction otherwise. */
+  try { v.load(); } catch {}
+  prewarmedVideos.set(src, v);
+  return v;
+}
+
+/* Called from the end of loadDiptych. Warms a small set of video
+   files that are likely to be picked next, biased toward stale
+   videos (which the picker prefers). Capped at PREWARM_BATCH per
+   call so we don't issue dozens of parallel media downloads, but
+   over a session of clicks the warm pool grows to cover most
+   videos in the catalogue. */
+const PREWARM_BATCH = 2;
+function prewarmLikelyVideos() {
+  const candidates = validImages.filter(src =>
+    isVideo(src) && !prewarmedVideos.has(src)
+  );
+  if (candidates.length === 0) return;
+
+  /* Staleness ranking — pick the videos least-recently shown, since
+     the picker's freshness weighting biases toward them. Videos
+     never shown have lastShown = undefined → treated as -Infinity =
+     highest priority. */
+  candidates.sort((a, b) => {
+    const lastA = lastShown.has(a) ? lastShown.get(a) : -Infinity;
+    const lastB = lastShown.has(b) ? lastShown.get(b) : -Infinity;
+    return lastA - lastB;
+  });
+
+  candidates.slice(0, PREWARM_BATCH).forEach(warmVideoElement);
+}
+
+/* Pre-splash priming. Right after the splash starts dismissing,
+   begin warming the FIRST few videos in the catalogue. This means
+   the first time a video pair is picked (typically pair 3-4 given
+   VIDEO_MIN_GAP), the bytes are already on the way down. Without
+   this, the very first video pick — which happens before any
+   prewarmLikelyVideos call can have run — was always slow.
+
+   Called from bootstrap after the splash dismisses. The order
+   doesn't matter (the picker will choose what it chooses), but
+   prioritising lower-numbered videos means analytics and tests
+   benefit from a predictable warming order. */
+function primeInitialVideoWarmup() {
+  const videos = validImages.filter(isVideo);
+  /* Warm up to PREWARM_INITIAL videos right out of the gate.
+     Higher than the per-click batch because we have a window of
+     several seconds before the user is likely to reach a video
+     pair, and parallel media downloads aren't as expensive as
+     they sound — most browsers cap concurrent connections per
+     origin at 6 and queue the rest. */
+  videos.slice(0, PREWARM_INITIAL).forEach(warmVideoElement);
+}
+const PREWARM_INITIAL = 6;
 
 /* Load an image or video for analysis. Images: tries each format in
    FORMATS until one succeeds, so the browser fetches AVIF first
@@ -2107,7 +1967,7 @@ function loadOne(src) {
       const format = FORMATS[attemptIdx++];
       const img = new Image();
       img.onload = () => {
-        addValid(src);
+        if (!validImages.includes(src)) validImages.push(src);
         const sig = analyzeImage(img);
         if (sig) {
           colorSignatures.set(src, sig);
@@ -2155,6 +2015,11 @@ function fallbackSignature() {
     meanL:     0.5,
     density:   histogramDensity(histogram),
     histMag:   histogramMagnitude(histogram),
+    /* Default to square (aspect=1) when we don't yet know the video's
+       real proportions. Once a poster image or runtime frame extraction
+       succeeds, the real signature replaces this one and carries the
+       actual aspect ratio. */
+    aspect:    1,
     /* Marker read by pairScore. Any pair where one side is a fallback
        signature gets FALLBACK_TRUST_PENALTY subtracted from its score
        so it doesn't sneak into the top-N pool on accidental neutral-
@@ -2179,7 +2044,7 @@ function loadVideoPosterForAnalysis(src) {
     const img = new Image();
     img.onload = () => {
       try {
-        addValid(src);
+        if (!validImages.includes(src)) validImages.push(src);
         const sig = analyzeImage(img);
         if (sig) {
           colorSignatures.set(src, sig);
@@ -2236,7 +2101,7 @@ function loadVideoForAnalysis(src) {
          file existence is already verified by discovery, so this is
          safe even on failure. */
       if (!colorSignatures.has(src)) {
-        addValid(src);
+        if (!validImages.includes(src)) validImages.push(src);
         colorSignatures.set(src, fallbackSignature());
         scheduleTopPairs();
       }
@@ -2245,7 +2110,7 @@ function loadVideoForAnalysis(src) {
 
     const analyze = () => {
       try {
-        addValid(src);
+        if (!validImages.includes(src)) validImages.push(src);
         const sig = analyzeImage(v);
         if (sig) {
           colorSignatures.set(src, sig);
@@ -2472,17 +2337,11 @@ function hideInterlude() {
    (desktop) or long-press (mobile), so any click on the share card
    simply dismisses it. Background clicks dismiss for most interludes.
 
-   Two exceptions:
-   - #consent never dismisses on background click — the user must
-     explicitly Accept or Decline (those handlers run their own
-     dismiss path). Privacy regulations and basic UX both want a
-     deliberate choice rather than an accidental dismissal.
-   - #welcome dismisses normally but, if consent is still needed,
-     hands off to the analytics card instead of revealing the
-     diptych. The diptych keeps loading behind both cards; the
-     interludePreload await happens at the *final* card before the
-     diptych is shown (analytics if consent is needed, welcome
-     otherwise). */
+   One exception: #consent never dismisses on background click. It's
+   now a non-blocking bottom banner with its own Accept / Decline /
+   Why? buttons (see the ANALYTICS CONSENT BANNER section); a stray
+   click on the banner should do nothing rather than silently accept
+   or decline by default. */
 document.querySelectorAll('.interlude').forEach(el => {
   el.addEventListener('click', async (e) => {
     if (el.id === 'consent') return;
@@ -2534,6 +2393,20 @@ document.querySelectorAll('.interlude').forEach(el => {
   const subtitleEl = splashEl.querySelector('.subtitle');
   const loadingEl  = splashEl.querySelector('.loading');
 
+  /* NOTE on forward references: this IIFE references `consentEl` later
+     (lines using `if (consentEl && consentEl.isConnected)`), and that
+     `const` is declared further down the file. This is safe because
+     the IIFE hits its first `await` (discovery) before reaching those
+     references — the rest of the script's top-level synchronous code
+     runs during that await window, including the consentEl declaration.
+     If a future refactor removes the awaits before the consentEl
+     references, this will start throwing ReferenceError at runtime. */
+
+  /* Initial target matches the HTML splash placeholder (1000) so the
+     if-check below correctly skips the DOM write when the discovered
+     pair count happens to coincide. Keep this in sync with the
+     subtitle text in index.html. */
+  let target            = 1000;
   let imageSrcs         = null;
   let splashFinished    = false;
   let splashSafetyTimer = null;
@@ -2582,7 +2455,7 @@ document.querySelectorAll('.interlude').forEach(el => {
      for video-containing pairs, but the gallery feels lazy-on-demand
      rather than waiting for tens of megabytes of MP4s up front. */
   for (const videoSrc of videoIndices.map(videoNumToSrc)) {
-    addValid(videoSrc);
+    if (!validImages.includes(videoSrc)) validImages.push(videoSrc);
     if (!colorSignatures.has(videoSrc)) colorSignatures.set(videoSrc, fallbackSignature());
   }
 
@@ -2599,18 +2472,41 @@ document.querySelectorAll('.interlude').forEach(el => {
     const sig = cachedSigs[imageSrc];
     if (sig) {
       colorSignatures.set(imageSrc, sig);
-      addValid(imageSrc);
+      if (!validImages.includes(imageSrc)) validImages.push(imageSrc);
     }
   }
+  /* Same for videos — upgrade the fallback signature registered just
+     above to the cached real one when a previous session managed to
+     analyse the poster (or extracted a runtime frame). writeSignatureCache
+     filters out isFallback, so anything cached for a video src is a
+     real signature, safe to overwrite the fallback with. */
+  for (const videoSrc of videoIndices.map(videoNumToSrc)) {
+    const sig = cachedSigs[videoSrc];
+    if (sig) colorSignatures.set(videoSrc, sig);
+  }
 
-  /* Update the static subtitle to the real pair count. Unconditional —
-     the previous "skip if equal to initial JS target" optimization was
-     a config-drift hazard (no visible behaviour change today, but the
-     moment TOP_PAIRS_POOL landed on a value where realTotal matched
-     the initial JS target, the stale HTML placeholder would survive). */
+  /* Background-analyse video posters for any video still on the
+     fallback signature. The poster is a small JPG (not an MP4), so
+     this costs the same as a single image load — well within the
+     "videos stay lazy" budget which was really about not fetching
+     tens-of-megabytes of MP4 data on startup. loadVideoPosterForAnalysis
+     resolves false silently when the poster file doesn't exist, so
+     this is a no-op for videos without posters. Successful analyses
+     overwrite the fallback signature, scheduleTopPairs re-runs, and
+     the new signature is persisted on pagehide for next visit. */
+  for (const videoSrc of videoIndices.map(videoNumToSrc)) {
+    const sig = colorSignatures.get(videoSrc);
+    if (sig && sig.isFallback) loadVideoPosterForAnalysis(videoSrc);
+  }
+
+  /* Update the static subtitle to the real pair count if discovery
+     reveals a different total than the HTML's placeholder "1000". */
   const unorderedPairs = totalCount * (totalCount - 1) / 2;
-  const target = Math.min(TOP_PAIRS_POOL, unorderedPairs) * 2;
-  subtitleEl.textContent = `${target} Random Diptychs`;
+  const realTotal      = Math.min(TOP_PAIRS_POOL, unorderedPairs) * 2;
+  if (realTotal !== target) {
+    target = realTotal;
+    subtitleEl.textContent = `${target} Random Diptychs`;
+  }
 
   /* Hash-driven entry loads JUST the deep-linked pair (which may
      include a video) and dismisses the splash immediately — the
@@ -2644,7 +2540,7 @@ document.querySelectorAll('.interlude').forEach(el => {
       /* Hash points to a missing/corrupt item — walk until 2 valid. */
       for (const src of images) {
         if (validImages.length >= 2) break;
-        if (!validImagesSet.has(src)) await loadOne(src);
+        if (!validImages.includes(src)) await loadOne(src);
       }
     }
     if (validImages.length < 2) {
@@ -2658,34 +2554,22 @@ document.querySelectorAll('.interlude').forEach(el => {
     /* Background-fill the rest of the IMAGES (videos stay lazy). */
     Promise.all(
       imageIndices.map(numToSrc)
-        .filter(src => !validImagesSet.has(src))
+        .filter(src => !validImages.includes(src))
         .map(loadOne)
     );
-    const startPair = firstPair.every(s => validImagesSet.has(s)) ? firstPair : null;
+    const startPair = firstPair.every(s => validImages.includes(s)) ? firstPair : null;
     finishSplash();
-    /* First visit (consent still required) → show consent card on
-       top of the loading diptych; consent's Accept/Decline handlers
-       await interludePreload before dismissing. Return visit → lift
-       the gate immediately so the diptych appears behind the splash
-       fade-out. Either way, no welcome card sits between splash and
-       gallery; the welcome statement now appears later as one of the
-       rotation interludes. */
-    if (consentEl && consentEl.isConnected) {
-      /* Consent card covers the diptych while it loads, so a click
-         can't reach the diptych — but we still gate on loadingDiptych
-         for consistency with the no-consent branch and to keep the
-         in-flight contract obvious. */
-      loadingDiptych  = true;
-      interludePreload = loadDiptych(startPair).finally(() => { loadingDiptych = false; });
-      showAnalytics();
-    } else {
-      liftGate();
-      /* No consent card here — the diptych is reachable as soon as
-         liftGate() runs, so a rapid first tap could otherwise race
-         this initial decode. The guard mirrors advance()'s wrapper. */
-      loadingDiptych = true;
-      loadDiptych(startPair).finally(() => { loadingDiptych = false; });
-    }
+    /* Lift the gate and start the diptych regardless of consent state
+       — the banner (if needed) is non-blocking and shows alongside the
+       first reveal rather than gating it. The welcome statement now
+       appears later as one of the rotation interludes, not between
+       splash and gallery. */
+    liftGate();
+    /* Start warming the first batch of videos in the background.
+       See the matching call on the no-hash path below for details. */
+    primeInitialVideoWarmup();
+    loadDiptych(startPair);
+    if (consentEl && consentEl.isConnected) showAnalytics();
     return;
   }
 
@@ -2793,7 +2677,7 @@ document.querySelectorAll('.interlude').forEach(el => {
   /* Loading complete (or safety-capped). Trigger the fade now so the
      gallery transition begins immediately, before computeTopPairs
      and pickPair do their work — those run in milliseconds and
-     finish well within the 1.8s fade. */
+     finish well within the 300ms fade (SPLASH_FADE_MS). */
   finishSplash();
 
   /* Persist the signatures computed during this session so the next
@@ -2816,19 +2700,11 @@ document.querySelectorAll('.interlude').forEach(el => {
   const rotation = readRotationCache();
   if (rotation) {
     clickCount = rotation.clickCount;
-    /* clicksSinceVideo restored if present; absent or null means
-       either an older cache schema or a freshly-initialised session
-       where the gap was Infinity. Either way, defaulting to Infinity
-       is the safe "eligible immediately" value — same as the at-module-
-       load initialisation. */
-    if (typeof rotation.clicksSinceVideo === 'number') {
-      clicksSinceVideo = rotation.clicksSinceVideo;
-    }
     for (const [src, ct] of rotation.recent) {
-      if (validImagesSet.has(src)) recent.set(src, ct);
+      if (validImages.includes(src)) recent.set(src, ct);
     }
     for (const [src, ct] of rotation.lastShown) {
-      if (validImagesSet.has(src)) lastShown.set(src, ct);
+      if (validImages.includes(src)) lastShown.set(src, ct);
     }
   }
 
@@ -2876,7 +2752,7 @@ document.querySelectorAll('.interlude').forEach(el => {
   if (Math.random() < FIRST_PAIR_FAVORITE_PROB) {
     const favoriteSrcs = [...FAVORITE_IMAGES]
       .map(numToSrc)
-      .filter(s => validImagesSet.has(s) && !isVideo(s) && colorSignatures.has(s));
+      .filter(s => validImages.includes(s) && !isVideo(s) && colorSignatures.has(s));
     if (favoriteSrcs.length > 0 && bestsPerImage.size > 0) {
       /* Shuffle favorites so each refresh leads with a different one
          (FAVORITE_BOOST handles long-term rotation; the first pair is
@@ -2912,36 +2788,31 @@ document.querySelectorAll('.interlude').forEach(el => {
   if (!firstPair) {
     firstPair = pickPair(validImages, { allowVideos: false });
   }
-  /* First visit (consent still required) → show consent card on top
-     of the loading diptych; consent's Accept/Decline handlers await
-     interludePreload before dismissing. Return visit → lift the gate
-     immediately so the diptych appears behind the splash fade-out.
-     Either way, no welcome card sits between splash and gallery; the
-     welcome statement now appears later as one of the rotation
-     interludes (CONTACT_MIN..CONTACT_MAX clicks in). */
-  if (consentEl && consentEl.isConnected) {
-    /* Consent card covers the diptych while it loads — but we gate
-       on loadingDiptych for consistency with the no-consent branch
-       and to keep the in-flight contract obvious. */
-    loadingDiptych  = true;
-    interludePreload = loadDiptych(firstPair).finally(() => { loadingDiptych = false; });
-    showAnalytics();
-  } else {
-    liftGate();
-    /* No card covers the diptych — a rapid first tap can otherwise
-       race this initial decode and double-fire loadDiptych. The
-       guard mirrors advance()'s wrapper. */
-    loadingDiptych = true;
-    loadDiptych(firstPair).finally(() => { loadingDiptych = false; });
-  }
+  /* Lift the gate and start the diptych regardless of consent state —
+     the banner (if needed) is non-blocking and shows alongside the
+     first reveal rather than gating it. The welcome statement now
+     appears later as one of the rotation interludes
+     (CONTACT_MIN..CONTACT_MAX clicks in). */
+  liftGate();
+  /* Start warming the first batch of videos in the background as the
+     gallery comes up. By the time the user reaches their first
+     video-containing pair (typically pair 3-4 given VIDEO_MIN_GAP),
+     the bytes are already mostly down. */
+  primeInitialVideoWarmup();
+  loadDiptych(firstPair);
+  if (consentEl && consentEl.isConnected) showAnalytics();
 })();
 
 /* ─────────────────────────────────────────────────────────────────────────
    CLICK / TAP HANDLING
    ───────────────────────────────────────────────────────────────────────── */
 
-/* loadingDiptych is declared at the top of the file alongside other
-   top-level state — see the comment there. */
+/* In-flight guard for loadDiptych. Without this, a click landing while
+   a previous load is still awaiting img.decode would overwrite the
+   in-flight image's src and call history.replaceState twice with
+   potentially mismatched pairs — observable as flicker or a hash that
+   disagrees with what's painted. */
+let loadingDiptych = false;
 
 /* Roll the first interlude target up front. clicksSinceInterlude
    counts user clicks since the last interlude (or since session
@@ -3040,29 +2911,15 @@ document.addEventListener('keydown', async (e) => {
     return;
   }
 
-  /* Consent card — like the privacy slide, requires an explicit
-     Accept or Decline choice. Absorb the keypress so it doesn't
-     leak through to anything underneath, but don't dismiss. */
-  if (currentInterlude && currentInterlude.id === 'consent') {
-    e.preventDefault();
-    return;
-  }
-
   /* Interlude visible — any handled key dismisses, mirroring the
      click-anywhere-to-dismiss behavior. Await the preloaded next
      pair so the photo behind is ready when the card fades out.
 
-     Welcome → analytics chain mirrors the click handler: if the
-     welcome is on screen and consent is still needed, dismiss the
-     welcome and bring up the consent card instead of awaiting the
-     preload and revealing the diptych. */
+     The consent banner is NOT a currentInterlude (non-blocking — see
+     ANALYTICS CONSENT BANNER section), so it never reaches this
+     branch; keys press through to the diptych underneath. */
   if (currentInterlude) {
     e.preventDefault();
-    if (currentInterlude.id === 'welcome' && consentEl && consentEl.isConnected) {
-      hideInterlude();
-      showAnalytics();
-      return;
-    }
     if (interludePreload) await interludePreload;
     hideInterlude();
     return;
@@ -3077,25 +2934,27 @@ document.addEventListener('keydown', async (e) => {
 });
 
 /* ─────────────────────────────────────────────────────────────────────────
-   ANALYTICS CONSENT GATE
+   ANALYTICS CONSENT BANNER
 
-   Originally a bottom banner; now a centered interlude-style card
-   that's shown after the welcome dismisses (only when consent
-   isn't yet stored). Flow:
+   Non-blocking bottom strip — appears alongside the first diptych
+   reveal rather than as a wall between splash and gallery. The user
+   can click through the diptych, share, etc. while the banner sits
+   there waiting for an Accept / Decline decision. Flow:
 
-     splash → welcome → [consent? if needed] → diptych
+     splash → diptych  (with consent banner at the bottom if needed)
 
-   The welcome's click handler (above) chains into showAnalytics
-   when consent is still needed. Once the user picks Accept or
-   Decline (either on the consent card directly, or via the
-   privacy slide reached via "Why?"), the choice is saved and the
-   card dismisses — awaiting the first-diptych preload first so
-   the reveal lands on a ready image rather than a blank panel.
+   Previously a centered interlude-style card. The change was made so
+   the gallery reveal isn't gated on a deliberate choice — consent is
+   a one-time decision the user can take whenever they notice the
+   banner. The "Why?" link still opens the full-screen privacy slide
+   for users who want the long explanation; the banner stays visible
+   behind that modal and resumes its role once the modal closes.
    ───────────────────────────────────────────────────────────────────────── */
 
-/* GA_ID, CONSENT_KEY, consentEl, privacyEl are declared at the top of
-   the file alongside other top-level state, so the IIFE that references
-   them no longer relies on the await-timing forward-reference trick. */
+const GA_ID       = 'G-F8Z6W7JPHQ';
+const CONSENT_KEY = 'ff-analytics-consent';
+const consentEl   = document.getElementById('consent');
+const privacyEl   = document.getElementById('privacy');
 
 function loadAnalytics() {
   if (window.gaEnabled) return;
@@ -3110,42 +2969,26 @@ function loadAnalytics() {
   gtag('config', GA_ID, { anonymize_ip: true });
 }
 
-/* Show the consent card as an interlude. Called by the welcome's
-   click handler when consent is still needed. Sets currentInterlude
-   so hideInterlude could dismiss it (though we don't use the
-   generic dismiss path for consent — see the click handler's early
-   return on el.id === 'consent'). The single-use removal of the
-   element from the DOM happens in dismissConsent after the fade. */
+/* Reveal the consent banner. Non-blocking: doesn't set currentInterlude
+   (so keyboard/click input still reaches the diptych underneath) and
+   doesn't capture focus (so the gallery stays the active surface). The
+   styling lives in styles.css under #consent overrides; this only
+   flips the visibility state. */
 function showAnalytics() {
   if (!consentEl) return;
-  currentInterlude = consentEl;
   consentEl.classList.add('visible');
   consentEl.setAttribute('aria-hidden', 'false');
-  captureFocus(consentEl);
 }
 
-/* Synchronous dismissal — fade out + DOM removal after the fade.
-   Callers await interludePreload BEFORE calling this so the diptych
-   is decoded and ready when the card disappears. The timeout (1s)
-   comfortably covers the .interlude fade-out (0.85s) plus a small
-   buffer; once removed, the gate's element references become stale
-   but no further code reads them. */
+/* Dismiss the banner. No interludePreload await — the diptych was
+   never gated on consent, so there's nothing to coordinate with.
+   setTimeout cleans the element from the DOM after the fade-out
+   completes (250ms covers the 0.2s transition with margin to spare). */
 function dismissConsent() {
   if (!consentEl) return;
-  /* Lift the initial gate BEFORE starting the consent fade-out. The
-     diptych becomes visibility:visible immediately, but is still
-     covered by the consent card at opacity 1; as the card fades, the
-     diptych is revealed smoothly underneath. Lifting AFTER the fade
-     would mean the diptych pops in at the moment the card finishes
-     disappearing — visible discontinuity. */
-  liftGate();
   consentEl.classList.remove('visible');
   consentEl.setAttribute('aria-hidden', 'true');
-  if (currentInterlude === consentEl) {
-    currentInterlude = null;
-    restoreFocus();
-  }
-  setTimeout(() => consentEl.remove(), 1000);
+  setTimeout(() => consentEl.remove(), 250);
 }
 
 function showPrivacy() {
@@ -3168,22 +3011,20 @@ if (stored === 'granted') {
   consentEl.remove();
   privacyEl.remove();
 } else {
-  /* No stored decision — consent card stays in the DOM, hidden
-     (opacity:0 via .interlude default), and will be revealed by
-     showAnalytics() after the welcome dismisses. Handlers below
-     wait for the first-pair preload before dismissing so the
-     diptych reveal lands cleanly. */
-  document.getElementById('consent-accept').addEventListener('click', async (e) => {
+  /* No stored decision — banner stays in the DOM, hidden (opacity:0
+     via the .interlude default), and gets revealed by showAnalytics()
+     as part of the initial gallery reveal. No first-pair preload to
+     wait on anymore — the banner is non-blocking, so dismissal is
+     immediate. */
+  document.getElementById('consent-accept').addEventListener('click', (e) => {
     e.stopPropagation();
     try { localStorage.setItem(CONSENT_KEY, 'granted'); } catch {}
     loadAnalytics();
-    if (interludePreload) await interludePreload;
     dismissConsent();
   });
-  document.getElementById('consent-decline').addEventListener('click', async (e) => {
+  document.getElementById('consent-decline').addEventListener('click', (e) => {
     e.stopPropagation();
     try { localStorage.setItem(CONSENT_KEY, 'denied'); } catch {}
-    if (interludePreload) await interludePreload;
     dismissConsent();
   });
   document.getElementById('consent-why').addEventListener('click', (e) => {
@@ -3192,8 +3033,8 @@ if (stored === 'granted') {
   });
 
   /* Privacy slide — clicking outside the action anchors dismisses
-     back to the consent card. The action anchors themselves complete
-     the consent flow (both the privacy slide and the consent card
+     back to the consent banner. The action anchors themselves complete
+     the consent flow (both the privacy slide and the consent banner
      go away). Action anchors live inside .privacy-actions so that
      selector is the differentiator — a click on the long privacy
      paragraph above shouldn't be mistaken for a button press. */
@@ -3201,18 +3042,16 @@ if (stored === 'granted') {
     if (e.target.closest('.privacy-actions a')) return;
     hidePrivacy();
   });
-  document.getElementById('privacy-accept').addEventListener('click', async (e) => {
+  document.getElementById('privacy-accept').addEventListener('click', (e) => {
     e.stopPropagation();
     try { localStorage.setItem(CONSENT_KEY, 'granted'); } catch {}
     loadAnalytics();
-    if (interludePreload) await interludePreload;
     hidePrivacy();
     dismissConsent();
   });
-  document.getElementById('privacy-decline').addEventListener('click', async (e) => {
+  document.getElementById('privacy-decline').addEventListener('click', (e) => {
     e.stopPropagation();
     try { localStorage.setItem(CONSENT_KEY, 'denied'); } catch {}
-    if (interludePreload) await interludePreload;
     hidePrivacy();
     dismissConsent();
   });
