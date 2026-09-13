@@ -1,3349 +1,4406 @@
-/* ─────────────────────────────────────────────────────────────────────────
-   CONFIG
-   ───────────────────────────────────────────────────────────────────────── */
+try {
+    window.__build = "v146"
+} catch (e) {}
+/* Startup timestamps, ms after navigation, printed with ?debug when the first
+   pair lands. First write wins, so a mark means "the first time this
+   happened". */
+const BOOT_T = { "app.js": Math.round(performance.now()) };
 
-/* Root path for all image files. Both `jpg` and `avif` subfolders are
-   expected to live inside this directory, each containing the
-   ff{number}.{ext} files. Change in one place if the layout moves. */
-const IMAGES_BASE = 'images';
+function bootMark(e) {
+    BOOT_T[e] || (BOOT_T[e] = Math.round(performance.now()))
+}
+const IMAGES_BASE = "images",
+    VIDEO_BASE = "videos",
+    FORMATS = ["avif", "jpg"],
+    SIZES = [600, 1e3, 1500],
+    /* The tallest an image can render, matching --image-height in the
+       stylesheet. It drives the srcset sizes hint, so overstating it makes
+       the browser fetch a rung larger than it can use. Change both together. */
+    IMAGE_VH = 75,
+    ANALYSIS_WIDTH = 256,
+    CONTACT_MIN = 4,
+    CONTACT_MAX = 7;
 
-/* Root path for video files. Looks for `${VIDEO_BASE}/ff{n}.mp4`
-   starting from 1, same batched discovery as images. Videos coexist
-   with images in the rotation — pairs can be photo+photo, photo+video,
-   or video+video, scored by the same colour-analysis on a single
-   representative frame extracted from each clip. */
-const VIDEO_BASE = 'videos';
-
-/* Image formats in preference order. The <picture> element auto-picks
-   the first format the browser supports; if no AVIF support, the JPG
-   fallback in <img> is used. loadOne tries the same order during
-   analysis so the cache is shared between analysis and display. */
-const FORMATS       = ['avif', 'jpg'];
-/* Responsive widths. The browser uses these together with `sizes="50vw"`
-   on each <picture> source/img to pick the smallest variant that still
-   covers `50vw × devicePixelRatio` device pixels. A 3× DPR phone at
-   430 CSS px wide needs ~645 device px for 50vw → grabs the 600w (and
-   looks fine, since AVIF compresses gracefully when slightly under
-   target). A retina laptop or large monitor reaches for 1000 or 1500.
-   Without this array `srcset` collapses to a single URL and every
-   visitor downloads the largest file regardless of screen size.
-   Must be sorted ascending — loadOne uses SIZES[0] as the analysis
-   variant assuming it's the smallest. Variants must exist on disk
-   at `images/{format}/ff{n}-{width}.{ext}` — see build-variants.mjs. */
-const SIZES         = [600, 1000, 1500];
-
-/* Interlude cadence — show a contact/share/welcome card every N user
-   clicks, with N randomised in [CONTACT_MIN, CONTACT_MAX] so the
-   interludes feel organic rather than clockwork. The next trigger
-   point is rolled fresh after every interlude (see nextInterludeAt
-   in advance()). Range is intentionally tight (4-7) so the visitor
-   encounters all three cards early in the session — each card is
-   a single-use punctuation, not a recurring beat. Set CONTACT_MIN
-   === CONTACT_MAX for the old fixed-cadence behaviour, or CONTACT_MIN
-   = 0 to disable interludes entirely. */
-const CONTACT_MIN   = 4;
-const CONTACT_MAX   = 7;
 function rollNextInterlude() {
-  if (CONTACT_MIN <= 0 || CONTACT_MAX <= 0) return Infinity;
-  return CONTACT_MIN + Math.floor(Math.random() * (CONTACT_MAX - CONTACT_MIN + 1));
+    return 4 + Math.floor(4 * Math.random())
+}
+/* How many clicks an image is held out for after being shown. Measured over
+   120-click sessions on this catalogue of 212 images:
+
+     25 (original)  ~139 images seen, busiest tenth took 32% of appearances
+     40 (current)   ~155 images seen, busiest tenth took roughly 24%
+     60             ~170 images seen, busiest tenth took 18%
+     100            all 212 seen, busiest tenth took 15%
+
+   The trade is pairing quality: the recency filter rejects candidate pairs,
+   so the longer the window, the more often pickPair is forced past its best
+   options into weaker ones. Lowering it hands those options back. 40 keeps
+   most of the variety 60 bought while leaving the scorer more room to choose
+   well; 25 is the original if the pairs still aren't strong enough. */
+const RECENT_CLICKS_BLOCK = 40,
+    SIBLING_GROUPS = [
+        ["97", "98"]
+    ],
+    FAVORITE_IMAGES = new Set(["11", "14", "17", "51", "58", "64", "69", "75", "81", "109", "112", "114", "117", "122", "124", "v24"]),
+    /* Photographs pulled from circulation. Excluded before scoring, so they
+       appear in no pair, no pool, no guarantee — the file stays on disk and
+       the caption stays in captions.json, so putting one back is deleting a
+       line here and rebuilding the pool. Excluding a weak single beats
+       inventing a clever partner for it.
+
+       Candidates looked at and left in, for now: ff126 (GREAT lorry side) and
+       ff138 (BARGAINS shop window) — found type, but each holds a wall on its
+       own; ff9 (tiled toilet wall) and ff139 (Victorian urinals) — bathroom
+       register but composed, not crude. */
+    EXCLUDE_IMAGES = new Set([
+        "74",   /* Mon Chéri wrapper flat on a void — a dead single */
+        "194",  /* Bethel church front — a snapshot; only its red ever paired */
+        "v16"   /* toilet from above — crude outside its own register */
+    ]),
+    /* Editorial tags. Derived from each caption (category, subject, light,
+       flags) by deriveTags below, so a new photograph is tagged the moment it
+       is captioned. An entry here REPLACES the derived set for that frame —
+       use it where the caption reads one way and the picture another. */
+    IMAGE_TAGS = {},
+    /* Subject collisions that never look intentional, whatever the colours
+       say. A pair carrying both tags of any row is rejected outright. */
+    BAN_TAG_PAIRS = [
+        ["bathroom", "food"],
+        ["bathroom", "hand"],
+        ["bathroom", "body"]
+    ],
+    /* Families that keep producing the strongest pairs: the same kind of
+       thing in two worlds, or a thing against the street it lives on. Small
+       additive nudges — the colour terms still decide. */
+    BOOST_TAG_PAIRS = [
+        ["light-fixture", "light-fixture", .14],
+        ["stairs", "stairs", .14],
+        ["object", "street", .12],
+        ["interior", "street", .12]
+    ],
+    /* Two found-type frames with no verbal spark is the same idea twice —
+       the GREAT lorry beside the BARGAINS window. Words that answer each
+       other (opposed, shared, echoed) are exempt: CLOSED against OPEN 7 DAYS
+       is the pair the site exists for. */
+    TYPE_TYPE_PENALTY = .35,
+    /* Known single pairs, by sorted ids joined with a bar: "7|31". Ban wins
+       over boost; both survive a pool rebuild. Filled by looking, not scored. */
+    PAIR_BAN = new Set([]),
+    PAIR_BOOST_SET = new Set([]),
+    PAIR_BOOST_BONUS = .15,
+    FAVORITE_BOOST = 2.5,
+    FIRST_PAIR_FAVORITE_PROB = .5,
+    PROGRESS_RATE_PER_SEC = 2e3,
+    SPLASH_FADE_MS = 300,
+    SPLASH_MAX_WAIT_MS = 3e4,
+    INTERLUDE_APPEAR_MS = 800,
+    VIDEO_DISPLAY_TIMEOUT_MS = 8e3,
+    VIDEO_ANALYSIS_TIMEOUT_MS = 1e4,
+    IMAGE_DECODE_TIMEOUT_MS = 1500,
+    DISCOVER_BATCH = 20,
+    SPLASH_PRELOAD_TARGET = 8,
+    BG_LOAD_CONCURRENCY = 4,
+    /* A pair has to be worth showing. pairScore returns -10 for a rejection and
+       negative values for pairs whose penalties outweigh everything they have
+       in common; neither belongs in front of anyone. */
+    MIN_SHOWN_SCORE = 0,
+    /* 800, not 500: the opening pool is the strongest stretch of the catalogue,
+       and it is what a visitor sees before the per-image partners take over. */
+    TOP_PAIRS_POOL = 800,
+    QUALITY_BIAS_POWER = 1.2,
+    TONAL_WEIGHT = .05,
+    PALETTE_WEIGHT = .38,
+    DENSITY_WEIGHT = .28,
+    LIGHTNESS_WEIGHT = .17,
+    SAT_WEIGHT = .05,
+    BUSYNESS_WEIGHT = .08,
+    ORIENTATION_WEIGHT = .08,
+    HORIZON_WEIGHT = .05,
+    EDGE_CONTRAST_NORM = .25,
+    HORIZON_ALIGN_TOL = .25,
+    PALETTE_CONTRAST_POWER = 2,
+    REPETITION_PENALTY = 1.1,
+    /* Caption-aware terms. These only apply when BOTH frames have a caption in
+       captions-manifest.json; without it the term is exactly 0 and scoring is
+       identical to before. Set any of them to 0 to switch that behaviour off. */
+    RHYME_BONUS = .16,          /* same subject, different context: reward */
+    COLLISION_PENALTY = .9,     /* same subject, same context: suppress */
+    /* Calibrated against this catalogue: with the surroundings held identical,
+       context distance runs 0.09 (p10) to 0.31 (p90); when light, surface and
+       placement all differ it runs 0.35 to 0.57. So below .30 a repeated
+       subject is the same picture twice, and by .52 it is unmistakably the
+       same thing seen somewhere else. Re-measure if the catalogue changes
+       character. */
+    RHYME_CONTEXT_MIN = .3,     /* below this much context difference it's a collision */
+    RHYME_CONTEXT_FULL = .52,   /* at or above this, the rhyme bonus is at full strength */
+    DISTANCE_BONUS = .07,       /* close against far */
+    LINE_BONUS = .06,           /* curved against vertical, etc. */
+    /* Two frames that both carry legible words. The strongest new signal:
+       a diptych where two unrelated signs answer each other is the thing a
+       person browsing would never find and the scorer can. Weighted above the
+       other caption terms for that reason. */
+    TEXT_PAIR_BONUS = .13,
+    /* ...unless they say the same thing, which reads as a duplicate rather
+       than a rhyme. */
+    TEXT_SAME_PENALTY = .25,
+    /* The words themselves, not just their presence. A shared word or an
+       opposed one is the rarest thing in the catalogue — CLOSED against OPEN 7
+       DAYS, or "Hold me" against "I just want you to hold me" — and the sort of
+       pair a person browsing would never assemble. Weighted above every other
+       caption term for that reason. */
+    TEXT_ECHO_BONUS = .3,
+    TEXT_OPPOSITION_BONUS = .42,
+    /* How good a caption reason has to be to survive the palette floor, and what
+       it forfeits for the weak contrast. Set WORD_OVERRIDE above
+       TEXT_PAIR_BONUS so merely having words on both sides is not enough — it
+       takes a shared word, an opposition, or a subject rhyme. */
+    /* Same form, different world. Two frames that share a dominant direction
+       and sit close on geometry, while belonging to unrelated categories — a
+       contrail and a handrail, a gable and a paper fold. The formal echo is
+       what a viewer notices; the gulf between the subjects is what makes it
+       worth noticing. Neither half is interesting alone, which is why both
+       conditions have to hold. */
+    /* Hands in both frames. Distinct from the people term because a hand is
+       the one body part that recurs across completely unrelated pictures — a
+       gloved hand on a lighter, a painted angel's fingers on a harp — and
+       reads as a rhyme rather than a repetition. */
+    /* Two frames built the same way — a lattice of poles against a lattice of
+       shelves, a tiled wall against a mosaic. The structure is what a viewer
+       recognises before they identify the objects, and none of the other
+       fields could see it: scaffolding and shelving share no noun, no line
+       direction and no category. Only assigned where the frame IS the
+       structure, so a match means something. */
+    /* The same small colour twice — a yellow sign against a yellow numberplate,
+       red graffiti against a red light. The palette in signatures.json cannot
+       see these: it keeps four swatches by area, and an accent is by
+       definition too small to make that list. LET'S FLY has no yellow in its
+       palette at all. So the accent is carried in the caption instead. */
+    /* The visual block. Five fields describing what kind of picture a frame is,
+       rather than what is in it. Weights are relative to the caption terms
+       above: depth is the heaviest because a facade beside a receding room is
+       the fastest way a diptych feels wrong, whatever else the two share.
+
+       Scaled to this scoring range, where a strong pair sits around .8. */
+    /* A shared geometry — two triangles, two circles — is a rhyme a viewer
+       sees before they identify either subject. Rectangles are excluded from
+       the bonus: in a catalogue of buildings and signs almost everything is a
+       rectangle, so matching on it means nothing. */
+    SHAPE_MATCH = .14,
+    DEPTH_MATCH = .12,
+    DENSE_MATCH = .10,
+    PEOPLE_MATCH = .10,
+    TEMP_MATCH = .08,
+    MOOD_MATCH = .06,
+    /* A clash is worse than a miss. Flat against deep, or an empty frame
+       against a crowded one, caps the pair no matter what else agrees —
+       these are the two that override a matching subject. */
+    CLASH_CAP = .65,
+    ACCENT_ECHO_BONUS = .12,
+    STRUCTURE_ECHO_BONUS = .13,
+    HANDS_ECHO_BONUS = .11,
+    FORM_RHYME_BONUS = .14,
+    WORD_OVERRIDE = .28,
+    WEAK_CONTRAST_COST = .12,
+    /* Real-world size, which the pixels know nothing about: a lighter framed
+       like a cathedral. Scored on the gap between the two scales. */
+    SCALE_JUMP_BONUS = .09,
+    /* A hand against a hand, doing different things, is a rhyme. Two whole
+       figures back to back read as a portrait sequence rather than a pairing,
+       so that one is discouraged. */
+    PEOPLE_ECHO_BONUS = .07,
+    PEOPLE_CROWDING_PENALTY = .12,
+    CAPTIONS_MAX_WAIT_MS = 1200,
+    JOINT_DESAT_PENALTY = .5,
+    JOINT_DESAT_THRESHOLD = .3,
+    JOINT_FULL_PENALTY = .45,
+    JOINT_FULL_THRESHOLD = .55,
+    JOINT_EMPTY_PENALTY = .3,
+    JOINT_EMPTY_THRESHOLD = .35,
+    FALLBACK_TRUST_PENALTY = .4,
+    MIN_PALETTE_CONTRAST = .25,
+    VIDEO_RATE = .35,
+    VIDEO_MIN_GAP = 1,
+    GUARANTEE_RATE = .5,
+    COLOR_SAMPLE_SIZE = 96,
+    PALETTE_SIZE = 4,
+    HIST_BINS = 7;
+
+function altFor(e) {
+    return `Federico Ferrari — Random Diptych ${e}`
+}
+let images = [];
+const validImages = [],
+    colorSignatures = new Map;
+/* Set by the boot code: tells the splash counter the first pair is on screen,
+   so it can run to 100% and let the splash go. Declared up here because the
+   boot code runs before the rest of the file has been evaluated. */
+var splashFinish = () => {};
+let topPairs = [],
+    imageBests = [],
+    bestsPerImage = new Map,
+    /* "srcA|srcB" for pairs that top each other's rankings; see computeTopPairs. */
+    mutualBests = new Set,
+    lastShown = new Map,
+    recent = new Map,
+    clickCount = 0,
+    clicksSinceVideo = 1 / 0,
+    interludePreload = null,
+    interludeLoadTrigger = null,
+    currentInterlude = null,
+    lastInterlude = null,
+    preparedNext = null,
+    prepInflightId = 0;
+
+function path(e, t, n) {
+    return n ? `images/${t}/ff${e}-${n}.${t}` : `images/${t}/ff${e}.${t}`
 }
 
-/* After an image appears in a diptych, block it from re-appearing for
-   this many clicks. Each click shows two images, so internally we keep
-   a buffer of the last 2 × RECENT_CLICKS_BLOCK image references. At
-   25, ~50 images stay off-limits at any time (in a ~100-image pool).
-   Higher values stretch out how often the same pair (or its swapped-
-   orientation twin) can re-appear, which matters when the pool is
-   small and the quality-bias concentrates picks at the top — without
-   this, the top ~10 pairs cycle through fast and feel repetitive
-   within a session. Tuning: above ~30 with a ~100-image pool starts
-   starving the guarantee branch (too many of each image's top-K
-   partners get filtered out as "recent"); below ~15 the same pair
-   can recur within 30 seconds of casual tapping. */
-const RECENT_CLICKS_BLOCK = 25;
-
-/* Sibling groups — declare images that should be treated as the
-   same image for recent-block purposes. When any image in a group
-   appears, all its siblings get marked recently-shown too, so they
-   can't appear together or in close succession. Use this for
-   near-duplicates from the same shoot, sequence shots, or any
-   pairing that's visually too similar for the colour algorithm
-   to catch. Format: each inner array is a group; entries are bare
-   numbers for images, 'v'-prefixed for videos (e.g. ['97','98']
-   or ['12','v3']). Group size is unlimited — you can chain three
-   or more siblings together. */
-const SIBLING_GROUPS = [
-  ['97', '98'],
-];
-
-/* Favorite images: get extra rotation priority. Their staleness is
-   multiplied by FAVORITE_BOOST inside the per-image guarantee branch,
-   so they cycle back more often than non-favorites would on the
-   algorithm's own judgement.
-
-   This is the right knob when the scorer "correctly" deprioritises
-   a photo you genuinely love — usually because it's hard to pair
-   (palette-narrow, very desaturated, very dark) and so its top-K
-   partners are mid-tier even though the photo itself is great. The
-   favorites mechanism doesn't override the scorer's choice of WHICH
-   partner to use; it just makes those favorite-led pairings come up
-   more often in rotation.
-
-   How it works in practice (rough math, ~100 image pool, GUARANTEE_RATE
-   at 0.50, FAVORITE_BOOST at 2.5):
-   - A non-favorite at average staleness gets ~1/100 of a guarantee
-     click, ≈ 0.50% of total clicks
-   - A favorite at the same staleness gets ~2.5/100 of a guarantee
-     click, ≈ 1.25% of total clicks — roughly one appearance every
-     ~80 clicks
-   - So a favorite appears ~2.5× as often as it would unprompted
-
-   Boost only applies AFTER the recent-block window has cleared, so it
-   doesn't force back-to-back appearances. It's a long-term rotation
-   tilt, not a "show this next" override.
-
-   Format: bare image numbers as strings (e.g. '11', '14'). Videos are
-   not currently supported — let me know if you want that too. Use
-   sparingly — listing 30+ favorites cancels the effect since they all
-   compete with each other for the same boosted weight. Previously 5.0;
-   reduced to 2.5 because with 15+ favorites the 5× multiplier was
-   funnelling roughly half of all guarantee-branch picks into the
-   favorites set, leaving non-favorites under-rotated. */
-const FAVORITE_IMAGES = new Set([
-  '11',  '14',  '17',  '51',
-  '58',  '64',  '69',  '75',  '81',
-  '109', '112', '114', '117', '122', '124',
-]);
-const FAVORITE_BOOST  = 2.5;
-
-/* First-pair selection: probability that the gallery opens with a
-   favorite-led pair (vs falling through to the normal pickPair logic
-   that draws from the full top-N pool). Previously hard-coded to 1.0
-   ("always lead with a favorite"), which meant the opening pair on
-   every refresh was drawn from FAVORITE_IMAGES × bestsPerImage —
-   roughly 15 × 5 = 75 distinct compositions. Across visits the same
-   first-impression pool kept surfacing.
-
-   At 0.5, half of fresh-session opens lead with a favorite (curated
-   first impression) and half draw from the full top-pool (variety).
-   Set to 1.0 to revert to old behaviour, or 0.0 to disable favorites
-   leading the first pair entirely. */
-const FIRST_PAIR_FAVORITE_PROB = 0.5;
-
-/* Splash timing.
-
-   PROGRESS_RATE_PER_SEC caps how fast the "Loading… X%" counter can
-   climb. The cap exists because on a cold first visit, actual image
-   loading can be bursty — 10 images resolve in one frame from HTTP/2
-   multiplexing, then 5 more a frame later — and a counter that jumped
-   from 8% to 47% to 100% in three frames would read as broken. The
-   cap smooths it into a legible climb.
-
-   But on a warm-cache reload (the case the user actually experiences
-   most often), the cap is the bottleneck. Browser has every image
-   ready, actualPct jumps to 100 in the first frame, and the counter
-   still spends a forced 0.4s climbing because it's pacing itself
-   regardless of how fast the load actually was. The earlier 60%/s
-   value made that 1.7s — long enough to register as deliberate, but
-   long enough to feel slow on a reload too.
-
-   2000%/s is essentially "no cap" — at this rate the counter snaps
-   to whatever actualPct reports within a single frame (~16ms),
-   which means warm cache reloads dismiss the splash within ~50ms
-   of all the cache hits resolving. Cold first visits are unaffected
-   because their actualPct climbs at the network's pace, not the
-   counter's — the cap was only ever active when actualPct moved
-   faster than the cap allowed, which only happens on warm cache.
-
-   SPLASH_FADE_MS is the opacity transition. The CSS `#splash` rule
-   must match this value; change in both places if retiming. 300ms
-   is a perceptible-but-not-deliberate fade — fast enough to feel
-   like "the splash is getting out of the way" rather than "the
-   gallery is opening".
-
-   SPLASH_MAX_WAIT_MS is a safety cap for stuck/slow connections.
-   After this many ms the splash fades anyway with whatever has
-   loaded — pair scoring gracefully degrades when fewer images
-   have signatures. */
-const PROGRESS_RATE_PER_SEC = 2000;
-const SPLASH_FADE_MS        = 300;
-const SPLASH_MAX_WAIT_MS    = 30000;
-
-/* Interlude appearance duration in milliseconds. Must match the
-   --fade-duration CSS token (0.8s = 800ms) — change in both places
-   if retiming. Used by showInterlude() to defer the next pair's
-   loadDiptych call until the interlude cover is fully opaque, so
-   the swap that happens behind it is invisible. Without this
-   matching delay, the snap-swap (suppressed by html.has-interlude)
-   becomes visible THROUGH the still-fading-in interlude, producing
-   the "I saw the next pair briefly before the interlude" effect. */
-const INTERLUDE_APPEAR_MS   = 800;
-
-/* Video load timeouts. Both paths (analysis and display) await media
-   events that can simply never fire — corrupt MP4, misconfigured
-   server, connection dropping between TCP handshake and data, etc.
-   Without these, the UI would silently hang forever. On timeout, we
-   resolve gracefully: the video is skipped for analysis (signature
-   never registered), or the display panel resolves with whatever
-   frame state the element has reached. */
-const VIDEO_DISPLAY_TIMEOUT_MS  = 8000;
-const VIDEO_ANALYSIS_TIMEOUT_MS = 10000;
-
-/* Image decode timeout. img.decode() can stop progressing indefinitely
-   when the page is suspended mid-load — phone screen locking, OS
-   suspending an idle tab, iOS Safari freezing a backgrounded page —
-   and may fail to resume cleanly when the page wakes up. Without a
-   timeout the entire load promise hangs, leaving loadingDiptych true
-   forever and silently disabling every subsequent click. The setTimeout
-   fires when the page is foregrounded again (browsers run overdue
-   timers shortly after restoring visibility), so recovery is automatic
-   from the user's perspective — the diptych just becomes responsive
-   again on the next click rather than appearing to be broken. */
-const IMAGE_DECODE_TIMEOUT_MS   = 5000;
-
-/* Image discovery: probe in parallel batches of this size; stop after a
-   batch returns nothing. Tolerates gaps in numbering up to this size.
-   Always probes the JPG path since that's the universal fallback —
-   every image is expected to have a JPG copy even if it also has AVIF. */
-const DISCOVER_BATCH = 20;
-
-/* Pair ranking. Of all the possible pairs (sorted by quality), the
-   picker chooses from the top N unordered pairs using a quality-biased
-   random (see pickPair). Each can appear in either left/right
-   orientation, so the visible catalogue ends up at TOP_PAIRS_POOL × 2
-   distinct diptychs. A hard floor: pairs ranked worse than N can
-   never surface, no matter what the random roll does — so use this
-   to set the worst-case quality you're willing to accept.
-   At 500, with ~110 items in the pool, that's the top ~8% of the
-   ~6000 possible pairs — still strict curation but with more room.
-   Yields 1000 distinct diptychs. Previous setting was 150 (300
-   diptychs); raised because long sessions were starting to feel
-   repetitive as the recent-block filter narrowed the active pool.
-   The scoring is calibrated tightly enough (OKLab, centre weighting,
-   paletteContrast^2, lightness contrast, joint penalties, fallback
-   trust, subject groups) that the top ~4% is still genuinely top-
-   tier. */
-const TOP_PAIRS_POOL   = 500;
-
-/* Quality bias for the main-draw pick. The chosen pair index is
-   `Math.floor(Math.random() ** QUALITY_BIAS_POWER * poolSize)` — a
-   power > 1 stretches the distribution toward 0 so higher-scored
-   pairs dominate. P(picked in top fraction x) = x^(1/POWER), so:
-
-     POWER = 1.0  → uniform (no bias)
-     POWER = 1.5  → top 10% gets ~22% of picks, top 50% gets ~63%
-     POWER = 2.0  → top 10% gets ~32% of picks, top 50% gets ~71%
-     POWER = 3.0  → top 10% gets ~46% of picks, top 50% gets ~79%
-
-   Was 2.0 originally and tuned for TOP_PAIRS_POOL = 150. With the
-   pool raised to 500 the 2.0 bias funnelled too hard into the very
-   top of the ranking, making the same handful of "obvious winner"
-   pairs dominate. 1.5 keeps the top of the ranking favoured without
-   the front-runner concentration — top decile drops from ~32% to
-   ~22% of picks, top quartile from ~50% to ~40%. */
-const QUALITY_BIAS_POWER = 1.5;
-
-/* ─── RANKING WEIGHTS ───
-   The ranker rewards two kinds of contrast that must BOTH be
-   present: palette contrast (different dominant colours) and
-   compositional density contrast (busy + uniform). Crucially,
-   density contrast is multiplied by palette contrast in pairScore
-   — a pair with strong density difference but a shared palette
-   gets little reward, because that's where "fake contrast"
-   pairings come from (e.g. two pale-blue-dominated images, one
-   busier than the other).
-
-   Lightness contrast is a separate reward — explicit "one bright,
-   one dark" preference, since two pairs with identical palette/
-   density signatures can read very differently if one is light-
-   and-light vs. one bright + one dim. Captures the "up and down"
-   editorial dimension that pure hue/density don't.
-
-   Tonal cohesion is kept as a faint tiebreaker, deliberately low.
-   It directly conflicts with what the eye values here (contrast
-   over cohesion), so we don't want it competing with the contrast
-   signals — but a small weight stops perfectly tonal-similar
-   pairs from being penalised for that alone. Sum ≈ 1.0. */
-const TONAL_WEIGHT     = 0.05;
-const PALETTE_WEIGHT   = 0.45;
-const DENSITY_WEIGHT   = 0.35;
-const LIGHTNESS_WEIGHT = 0.20;
-const SAT_WEIGHT       = 0.05;
-
-/* Palette-contrast curve. The raw paletteContrast value is in [0, 1].
-   Powering it by an exponent > 1 concentrates reward at the top:
-   pairs with weak-to-moderate contrast lose more ground, pairs with
-   strong contrast are barely affected. With exponent 2.0:
-     1.0 → 1.0  (full reward)
-     0.8 → 0.64 (20% lower)
-     0.5 → 0.25 (50% lower — halves)
-     0.3 → 0.09 (70% lower)
-   At this setting, only pairs with strong palette contrast meaningfully
-   score on the palette term — moderate similarity (warm-on-warm,
-   cool-on-cool) gets pushed firmly below the surface threshold and
-   relies on density or lightness contrast to qualify. Set to 1.0 to
-   disable and revert to a flat linear reward. 1.5 is a gentler
-   intermediate. 3.0 would be very aggressive — only near-opposite
-   palettes would clear the palette gate. */
-const PALETTE_CONTRAST_POWER = 2.0;
-
-/* How hard to penalise pairs whose dominant colour matches (whether
-   that's a saturated palette[0] sharing a hue family, or a blank-canvas
-   neutral background). 0 disables; 1.1 is firm — pushes two-brick /
-   two-blue / two-red pairs cleanly out of the top pool. Previously
-   was 0.9, which let some near-misses through (oranges paired with
-   golds, where hue families overlap at the boundary). */
-const REPETITION_PENALTY = 1.1;
-
-/* Joint-desaturation penalty. Fires when BOTH images are overall low
-   in saturation; the diptych wants colour life from at least one
-   panel. Threshold lifted from 0.25 to 0.30 so it catches more
-   "everything is dust-grey" cases that just barely cleared the old
-   bar. One colourful side is still enough to keep the pair alive. */
-const JOINT_DESAT_PENALTY = 0.5;
-const JOINT_DESAT_THRESHOLD = 0.30;
-
-/* Joint-fullness penalty. Mirrors jointDesat for the density axis —
-   when BOTH images are highly busy (above the threshold), penalise.
-   Two-full pairs feel claustrophobic regardless of palette contrast;
-   the eye wants somewhere to rest in at least one panel. Ramp starts
-   at density 0.55 (firmly "full") and reaches full penalty by 1.0.
-   Without this, two busy compositions could surface on palette
-   contrast alone, even when there's no negative space anywhere. */
-const JOINT_FULL_PENALTY   = 0.45;
-const JOINT_FULL_THRESHOLD = 0.55;
-
-/* Joint-emptiness penalty. The other end of the density axis —
-   two near-empty frames (single subject on void, abstract texture,
-   monochrome surface with sparse detail) read as repetitive even
-   when palettes differ. Milder than fullness because some
-   minimalist pairs work; the penalty is meant to suppress the
-   "two empty similar surfaces with text/object" cases. Ramp starts
-   at density 0.35 (firmly "empty") and reaches full by 0. */
-const JOINT_EMPTY_PENALTY   = 0.30;
-const JOINT_EMPTY_THRESHOLD = 0.35;
-
-/* Trust penalty for signatures without real colour data — videos
-   that haven't had a poster generated yet (see videoPosterUrl) and
-   fall back to the neutral-grey signature. The fallback's
-   mid-saturation, mid-lightness, flat-histogram values can
-   "accidentally" pair well with achromatic photos under the OKLab
-   colour distance — neither side has any strong colour signal, so
-   `paletteContrast` reads as moderate, no `jointDesat` fires
-   (fallback avgSat is 0.3, exactly at threshold), and the pair
-   sneaks into the top pool with no real basis for the matching.
-   This penalty pushes any pair involving a fallback signature out
-   of the global top-N ranking — they can still appear via the
-   per-image guarantee branch (which doesn't read pair scores), so
-   videos still rotate, just less likely to surface via the main
-   draw until you give them a real signature via poster image.
-   0.40 is firm: a pair with otherwise solid scoring (~0.30) goes
-   firmly negative once this fires. Set to 0 to disable the
-   safeguard entirely. */
-const FALLBACK_TRUST_PENALTY = 0.40;
-
-/* Hard palette-contrast floor. Pairs whose paletteContrast falls
-   below this threshold are unconditionally excluded from selection
-   by returning a deeply-negative score that nothing else can clear.
-
-   Why a hard floor on top of the graduated reward? The shaped
-   palette reward (paletteContrast^PALETTE_CONTRAST_POWER × weight)
-   only DEPRIORITISES similar-palette pairs — it doesn't exclude
-   them. With the guarantee branch picking each image's top-K best
-   partners, a narrow-palette source (mostly white, mostly one hue)
-   can find that all of its top-K partners are similar-palette pairs
-   that score moderately rather than strongly. The guarantee branch
-   then surfaces these because they're the "best available" for that
-   source, even though the absolute pair quality is weak.
-
-   The floor cuts those pairs off completely. A narrow-palette image
-   that has no genuinely-contrasting partner just appears less often
-   (only via the main draw, where it gets outranked by stronger
-   pairs). Better than surfacing the bad pair just to give that
-   image airtime.
-
-   At 0.25: pairs need at least moderate palette difference to
-   qualify. Most photo pairs in a varied catalogue clear this
-   easily — typical "good" pairs sit at 0.5–0.8. White-on-white,
-   pale-on-pale, monochrome-on-monochrome are reliably excluded.
-   Raise to 0.30 or 0.35 if even moderate-contrast pairs still feel
-   too similar; drop to 0.20 if too many subtle pairs are being
-   filtered out. Set to 0 to disable the floor entirely. */
-const MIN_PALETTE_CONTRAST = 0.25;
-
-/* Video pacing — probabilistic, with a minimum gap between videos so
-   they never appear back-to-back. VIDEO_RATE is the per-click chance
-   once eligible; VIDEO_MIN_GAP is how many photo-only clicks must
-   follow a video before another can land. Average gap with the
-   defaults is ~1 + 1/0.35 ≈ 3.9 clicks, so videos feel "every few
-   duos" without being mechanical and without ever clustering. Set
-   VIDEO_RATE = 0 to disable videos entirely. */
-const VIDEO_RATE    = 0.35;
-const VIDEO_MIN_GAP = 1;
-
-/* Per-image guarantee. With this probability per click, the picker
-   draws from a per-image-best list (each image's highest-scored pair)
-   instead of the global top-N. Inside the guarantee branch the pick
-   is staleness-weighted, so images that haven't appeared in a while
-   dominate over those just shown — converting the guarantee from a
-   coin flip into an active long-term rotation engine.
-
-   At 0.50, roughly 1 in 2 clicks rotates the catalogue while the
-   remaining ~1 in 2 follow the quality-biased top-N selection.
-   This keeps freshness high — most clicks bring back an under-shown
-   image — without entirely abandoning the global quality ranking.
-   Higher values surface rare images faster at the cost of pulling
-   more weight from the quality-ranked main pool. */
-const GUARANTEE_RATE = 0.50;
-
-/* Colour analysis. COLOR_SAMPLE_SIZE is the side length of the
-   downsampled canvas each image is drawn to before histogram /
-   palette / saturation extraction. Larger = more accurate (small
-   subjects represented by more pixels, palette filter sees finer
-   colour distinctions), but quadratic in cost. 64 was the original
-   compromise; 128 quadruples the pixel count (4,096 → 16,384) with
-   analysis still running comfortably under 20ms per image and a
-   noticeable improvement in catching small-area dominant colours.
-   Going to 256+ is diminishing returns for top-4 palette extraction. */
-const COLOR_SAMPLE_SIZE = 128;
-const PALETTE_SIZE      = 4;
-const HIST_BINS         = 7;
-
-function altFor(num) {
-  return `Federico Ferrari — Random Diptych ${num}`;
+function srcset(e, t) {
+    return SIZES.length ? SIZES.map(n => `${path(e,t,n)} ${n}w`).join(", ") : path(e, t)
 }
 
-/* ─────────────────────────────────────────────────────────────────────────
-   STATE
-   ───────────────────────────────────────────────────────────────────────── */
-
-let   images          = [];
-const validImages     = [];
-const colorSignatures = new Map();    // src → { histogram, palette, avgSat }
-let   topPairs        = [];           // globally-ranked pair list (best first)
-let   imageBests      = [];           // per-image first-best pair (kept for debugging)
-let   bestsPerImage   = new Map();    // src → top K best pairs, used by pickPair guarantee branch
-let   lastShown       = new Map();    // src → clickCount when last appeared; drives staleness weighting
-let   recent          = new Map();    // src → clickCount when last marked recent; checked via isRecent()
-let   clickCount       = 0;
-let   clicksSinceVideo = Infinity;  // gap counter for VIDEO_MIN_GAP
-let   interludePreload = null;
-let   currentInterlude = null;
-let   lastInterlude    = null;
-
-/* ─────────────────────────────────────────────────────────────────────────
-   PATH HELPERS
-   ───────────────────────────────────────────────────────────────────────── */
-
-function path(num, format, width) {
-  return width
-    ? `${IMAGES_BASE}/${format}/ff${num}-${width}.${format}`
-    : `${IMAGES_BASE}/${format}/ff${num}.${format}`;
-}
-function srcset(num, format) {
-  if (!SIZES.length) return path(num, format);
-  return SIZES.map(w => `${path(num, format, w)} ${w}w`).join(', ');
-}
-/* Pick the variant width this device will most likely display. The
-   image renders at most 50vw wide (`object-fit: contain` in a
-   50vw × 50vh box). devicePixelRatio converts CSS px to device px.
-   Returning the smallest variant ≥ that target matches what the
-   browser's own srcset algorithm picks given `sizes="50vw"`, so the
-   startup preload warms the SAME URL the <picture> element will
-   later fetch — no wasted bandwidth, no second download on first
-   display. If nothing covers the need, fall back to the largest
-   available. Returns null when SIZES is empty (single-size mode). */
-function pickDisplayVariant() {
-  if (!SIZES.length) return null;
-  const dpr    = window.devicePixelRatio || 1;
-  const needed = (window.innerWidth * 0.5) * dpr;
-  return SIZES.find(w => w >= needed) || SIZES[SIZES.length - 1];
-}
-/* Match canonical or variant URLs across any image format. Previously
-   this only matched `ff{n}.jpg`, which silently returned null for any
-   variant- or AVIF-suffixed path. Today every caller passes canonical
-   JPGs, but it was one future code path away from breaking quietly. */
-function srcToNum(src) { const m = src && src.match(/ff(\d+)(?:-\d+)?\.(?:jpg|avif|webp)$/i); return m ? m[1] : null; }
-function numToSrc(n)   { return `${IMAGES_BASE}/jpg/ff${n}.jpg`; }
-
-/* Video helpers. Videos live at `${VIDEO_BASE}/ff{n}.mp4` and share
-   no numeric namespace with images (ff1.mp4 is a different asset
-   than ff1.jpg). The hash uses a 'v' prefix to distinguish — e.g.
-   `#5,v12` means image 5 paired with video 12. Bare-number hashes
-   still parse as images, so existing share links keep working. */
-function isVideo(src)     { return /\.mp4$/i.test(src); }
-function videoNumToSrc(n) { return `${VIDEO_BASE}/ff${n}.mp4`; }
-
-/* Poster companion image for a video — same directory, same name,
-   '-poster.jpg' suffix. The site loads and analyses this with the
-   regular image-analysis path (analyzeImage) so videos get a real
-   colour signature derived from the same algorithm as the photos,
-   instead of the neutral grey fallback. Reliable on every browser
-   — none of iOS Safari's offscreen-video / canvas-tainting issues
-   that plague runtime frame extraction.
-
-   Generate one per video with ffmpeg. Pick a representative frame
-   roughly 25% in:
-
-     for f in videos/ff*.mp4; do
-       N="${f%.mp4}"
-       ffmpeg -ss 1 -i "$f" -frames:v 1 -q:v 3 "${N}-poster.jpg"
-     done
-
-   Videos without a poster fall back to runtime frame extraction
-   (loadVideoForAnalysis), then to the neutral signature on failure.
-   So adding posters is opt-in per video; everything still works
-   without them, just with worse pairing for those videos. */
-function videoPosterUrl(videoSrc) {
-  return videoSrc.replace(/\.mp4$/i, '-poster.jpg');
-}
-function srcToId(src) {
-  if (isVideo(src)) {
-    const m = src.match(/ff(\d+)\.mp4$/i);
-    return m ? 'v' + m[1] : null;
-  }
-  return srcToNum(src);
-}
-function idToSrc(id) {
-  if (!id) return null;
-  return id[0] === 'v' ? videoNumToSrc(id.slice(1)) : numToSrc(id);
+function srcToNum(e) {
+    const t = e && e.match(/ff(\d+)(?:-\d+)?\.(?:jpg|avif|webp)$/i);
+    return t ? t[1] : null
 }
 
-/* SIBLINGS — flat src → [sibling srcs] lookup derived from
-   SIBLING_GROUPS. Built once at script init since the groups are
-   static config. Used in markPairRecent() to extend the recent[]
-   block to every sibling of an image when its pair is shown. */
-const SIBLINGS = new Map();
-for (const group of SIBLING_GROUPS) {
-  const srcs = group.map(idToSrc).filter(Boolean);
-  for (const s of srcs) {
-    SIBLINGS.set(s, srcs.filter(x => x !== s));
-  }
+function numToSrc(e) {
+    return `images/jpg/ff${e}.jpg`
 }
 
-/* ─────────────────────────────────────────────────────────────────────────
-   IMAGE DISCOVERY
-   ───────────────────────────────────────────────────────────────────────── */
+function isVideo(e) {
+    return /\.mp4$/i.test(e)
+}
 
-async function discoverBy(urlFor) {
-  const found = [];
-  let start = 1;
-  /* Grace counter for empty batches following a successful far-probe.
-     When a partial batch's far probe confirms there's more catalogue
-     ahead, we know an item exists at start+DISCOVER_BATCH*2. The next
-     batch (start..start+DISCOVER_BATCH-1) may be entirely inside the
-     gap — without this grace, an empty batch would break the loop and
-     silently lose the catalogue past it. With grace=1 we tolerate one
-     empty batch before giving up, which covers any gap that ends
-     before the verified far position. */
-  let emptyGrace = 0;
-  while (true) {
-    const batch = Array.from({ length: DISCOVER_BATCH }, (_, i) => start + i);
-    const results = await Promise.all(
-      batch.map(n =>
-        fetch(urlFor(n), { method: 'HEAD' })
-          .then(r => (r.ok ? n : null))
-          .catch(() => null)
-      )
-    );
-    const present = results.filter(n => n !== null);
-    found.push(...present);
+function videoNumToSrc(e) {
+    return `videos/ff${e}.mp4`
+}
 
-    if (present.length === 0) {
-      /* Empty batch. If a previous partial batch's far probe told us
-         there's more catalogue past here, use up one grace and skip
-         ahead instead of breaking. Otherwise we're genuinely at the
-         end. */
-      if (emptyGrace > 0) {
-        emptyGrace--;
-        start += DISCOVER_BATCH;
-        continue;
-      }
-      break;
+function videoPosterUrl(e) {
+    return e.replace(/\.mp4$/i, "-poster.jpg")
+}
+
+function srcToId(e) {
+    if (isVideo(e)) {
+        const t = e.match(/ff(\d+)\.mp4$/i);
+        return t ? "v" + t[1] : null
     }
-
-    /* Partial-hit batch usually means we've crossed the end of the
-       catalogue, but it could also be a hole (e.g. ff100 deleted,
-       ff101-ff147 still present). Probe one item far ahead to tell
-       the two apart. If the far probe also 404s, we're at the end
-       and break — saves the ~20 wasted HEADs the old logic spent
-       on a confirming full batch. If it hits, there's genuinely a
-       hole; set emptyGrace=1 so the loop tolerates one empty batch
-       between here and the verified far position, then continues. */
-    if (present.length < batch.length) {
-      const farN = start + DISCOVER_BATCH * 2;
-      const farExists = await fetch(urlFor(farN), { method: 'HEAD' })
-        .then(r => r.ok).catch(() => false);
-      if (!farExists) break;
-      emptyGrace = 1;
-    } else {
-      /* Full batch — definite catalogue, reset the grace counter so
-         a later gap doesn't get extra tolerance it didn't earn. */
-      emptyGrace = 0;
-    }
-
-    start += DISCOVER_BATCH;
-  }
-  return found.sort((a, b) => a - b);
+    return srcToNum(e)
 }
 
-const discoverImages = () => discoverBy(n => `${IMAGES_BASE}/jpg/ff${n}.jpg`);
-const discoverVideos = () => discoverBy(n => `${VIDEO_BASE}/ff${n}.mp4`);
-
-/* ─────────── DISCOVERY CACHE ───────────
-   discoverBy probes the catalogue with ~8 batches of 20 HEAD requests
-   per kind (images + videos). Even on warm cache, HEADs are usually
-   revalidated against the server, so the discovery phase costs
-   ~300-600ms every page load — the user pays it for nothing on reloads
-   where the catalogue hasn't changed.
-
-   The cache stores the discovered index arrays in localStorage under a
-   versioned key. On reload, we read it instantly (~1ms) and return
-   the cached values straight away; in parallel we kick off a real
-   discoverBy run whose result overwrites the cache for next time. So
-   the user sees zero discovery latency on every reload after the first,
-   and changes to the catalogue (new images uploaded, old ones deleted)
-   propagate on the visit AFTER they happen. Acceptable: this is a
-   personal portfolio, not a live feed.
-
-   Robustness:
-   - Reads and writes are wrapped in try/catch. localStorage throws on
-     iOS private browsing, when storage quota is exceeded, and when
-     the user has disabled site data. In any of those cases the wrapper
-     falls back to the original uncached behaviour — the splash is
-     slow but the site still works.
-   - The cache value is a JSON-encoded {v, indices} object. Bumping
-     DISCO_CACHE_VERSION below invalidates every stored value at once,
-     useful if the array format ever changes (e.g. adding sub-paths
-     for grouped images).
-   - Stale cache entries pointing at deleted images cause loadOne
-     calls that 404; loadOne already handles those silently, so the
-     worst case is one missing image in the rotation until the next
-     reload, when the background refresh has corrected the cache. */
-
-/* ─────────── SIGNATURE CACHE ───────────
-   The real bottleneck on warm-cache reloads isn't discovery — it's
-   analyzeImage() running on every image to compute its colour
-   histogram, OKLab palette, and average saturation. ~30-80ms per
-   image × ~150 images, spread across browser concurrency, dominates
-   the splash time. But analyzeImage is deterministic: the same image
-   always produces the same signature. So we cache them.
-
-   The cache stores all signatures in a single localStorage key as
-   one JSON blob: { v, sigs: { [src]: signature } }. A single read
-   and a single write is cheaper than 150 individual operations,
-   and signatures are small enough (~1 KB each, ~150 KB total) to
-   sit well under the typical 5-10 MB origin quota.
-
-   On reload, init reads the blob and pre-populates colorSignatures
-   for every src whose signature is cached. Those images are skipped
-   in the load loop — no fetch, no decode, no analyzeImage. The
-   splash dismisses as soon as any uncached new images finish loading
-   (typically zero on a reload).
-
-   Persistence:
-   - Written on `pagehide` (fires on tab close, refresh, navigation
-     away) so signatures computed during a session always survive to
-     the next visit, even if the user leaves before the splash
-     finished. pagehide is more reliable than `beforeunload` and
-     fires even on iOS Safari and mobile background-switching.
-   - Also written when the splash finishes loading, as belt-and-
-     suspenders for the case where pagehide doesn't fire (rare —
-     e.g. a tab crash).
-
-   Tradeoffs:
-   - Image files aren't refetched during the splash on a warm
-     reload, so HTTP cache warming is no longer guaranteed. Effect:
-     if the HTTP cache has been purged but localStorage hasn't,
-     the first click on a fresh image incurs a network round-trip.
-     Acceptable — the common case (warm cache + warm signatures)
-     is now essentially instant.
-   - Bumping SIG_CACHE_VERSION invalidates every stored signature
-     at once — necessary whenever analyzeImage's algorithm changes
-     in a way that affects pair scoring. The wrapper silently treats
-     a version mismatch as "no cache", so existing users transition
-     cleanly the first time they reload after a deploy. */
-
-/* Bumped from 1 to 2 when aspect ratio was added to the signature
-   schema. Old cached signatures (v1) lacked the `aspect` field, which
-   the layout code would have interpreted as 1.0 (square box, the old
-   behaviour). Bumping invalidates those caches so every user benefits
-   from aspect-aware sizing on the next reload. (The current layout
-   does aspect-aware sizing in CSS, but the analyzeImage path still
-   uses the cached signatures and the field is still useful for any
-   future feature that needs to know an image's shape upfront.) */
-const SIG_CACHE_VERSION = 2;
-const SIG_CACHE_KEY     = 'ff_signatures';
+function idToSrc(e) {
+    if (!e) return null;
+    const t = String(e);
+    /* Must be v + digits, not "any string starting with v". */
+    if (/^v\d+$/i.test(t)) return videoNumToSrc(t.slice(1));
+    if (/^\d+$/.test(t)) return numToSrc(t);
+    return null;
+}
+const SIBLINGS = new Map;
+for (const e of SIBLING_GROUPS) {
+    const t = e.map(idToSrc).filter(Boolean);
+    for (const e of t) SIBLINGS.set(e, t.filter(t => t !== e))
+}
+async function discoverBy(e) {
+    const t = [];
+    let n = 1,
+        a = 0;
+    for (;;) {
+        const o = Array.from({
+                length: 20
+            }, (e, t) => n + t),
+            i = (await Promise.all(o.map(t => fetch(e(t), {
+                method: "HEAD"
+            }).then(e => e.ok ? t : null).catch(() => null)))).filter(e => null !== e);
+        if (t.push(...i), 0 === i.length) {
+            if (a > 0) {
+                a--, n += 20;
+                continue
+            }
+            break
+        }
+        if (i.length < o.length) {
+            const t = n + 40;
+            if (!await fetch(e(t), {
+                    method: "HEAD"
+                }).then(e => e.ok).catch(() => !1)) break;
+            a = 1
+        } else a = 0;
+        n += 20
+    }
+    return t.sort((e, t) => e - t)
+}
+const discoverImages = () => discoverBy(e => `images/jpg/ff${e}.jpg`),
+    discoverVideos = () => discoverBy(e => `videos/ff${e}.mp4`),
+    SIG_CACHE_VERSION = 4,
+    SIG_CACHE_KEY = "ff_signatures";
 
 function readSignatureCache() {
-  try {
-    const raw = localStorage.getItem(SIG_CACHE_KEY);
-    if (!raw) return {};
-    const parsed = JSON.parse(raw);
-    if (!parsed || parsed.v !== SIG_CACHE_VERSION) return {};
-    if (!parsed.sigs || typeof parsed.sigs !== 'object') return {};
-    return parsed.sigs;
-  } catch {
-    return {};
-  }
+    try {
+        const e = localStorage.getItem(SIG_CACHE_KEY);
+        if (!e) return {};
+        const t = JSON.parse(e);
+        return t && 4 === t.v && (t.sigs && "object" == typeof t.sigs) ? t.sigs : {}
+    } catch {
+        return {}
+    }
 }
 
 function writeSignatureCache() {
-  try {
-    /* Serialise the current colorSignatures Map, excluding any video
-       fallback signatures (marked with isFallback: true) — those are
-       computed-from-nothing placeholders that should be re-applied
-       fresh on each visit, not preserved as if they were real
-       analysis output. Without this filter, a cached fallback would
-       block the real analysis from running if a video poster image
-       later becomes available. */
-    const sigs = {};
-    for (const [src, sig] of colorSignatures) {
-      if (sig && !sig.isFallback) sigs[src] = sig;
+    try {
+        const e = {},
+            t = {};
+        for (const [n, a] of colorSignatures) a && !a.isFallback && (e[n] = a, isVideo(n) || !(a.aspect > 0) || (t[srcToNum(n)] = a.aspect));
+        localStorage.setItem(SIG_CACHE_KEY, JSON.stringify({
+            v: 4,
+            sigs: e
+        })), localStorage.setItem("ff_sig_meta", JSON.stringify({
+            v: 4,
+            n: Object.keys(e).length
+        })), localStorage.setItem("ff_aspects", JSON.stringify(t))
+    } catch {}
+}
+window.addEventListener("pagehide", writeSignatureCache);
+document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") writeSignatureCache();
+    else if (typeof startVisibleVideos === "function") startVisibleVideos();
+});
+
+function writeNextPair() {
+    try {
+        if (!preparedNext || !preparedNext.pair) return void localStorage.removeItem("ff_next_pair");
+        const [e, t] = preparedNext.pair;
+        if (isVideo(e) || isVideo(t)) return void localStorage.removeItem("ff_next_pair");
+        localStorage.setItem("ff_next_pair", JSON.stringify([srcToNum(e), srcToNum(t)]))
+    } catch {}
+}
+
+function readNextPair() {
+    try {
+        const e = localStorage.getItem("ff_next_pair");
+        if (localStorage.removeItem("ff_next_pair"), !e) return null;
+        const t = JSON.parse(e);
+        return Array.isArray(t) && 2 === t.length && t[0] && t[1] && t[0] !== t[1] ? t : null
+    } catch {
+        return null
     }
-    localStorage.setItem(SIG_CACHE_KEY, JSON.stringify({ v: SIG_CACHE_VERSION, sigs }));
-  } catch {
-    /* Quota exceeded, private mode, or storage disabled. Silent —
-       cache is an optimisation, not a correctness requirement. */
-  }
+}
+window.addEventListener("pagehide", writeNextPair);
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") writeNextPair(); });
+const DISCO_CACHE_VERSION = 1,
+    DISCO_CACHE_KEY_IMAGES = "ff_disco_images",
+    DISCO_CACHE_KEY_VIDEOS = "ff_disco_videos";
+
+function readDiscoCache(e) {
+    try {
+        const t = localStorage.getItem(e);
+        if (!t) return null;
+        const n = JSON.parse(t);
+        return n && 1 === n.v && Array.isArray(n.indices) ? n.indices : null
+    } catch {
+        return null
+    }
 }
 
-/* pagehide fires reliably on tab close, refresh, and navigation
-   away across every modern browser, including iOS Safari (where
-   beforeunload is unreliable). Captures signatures computed during
-   the session even if the user leaves before the load loop finished. */
-window.addEventListener('pagehide', writeSignatureCache);
+function writeDiscoCache(e, t) {
+    try {
+        localStorage.setItem(e, JSON.stringify({
+            v: 1,
+            indices: t
+        }))
+    } catch {}
+}
+const SEED_IMAGE_INDICES = [],
+    SEED_VIDEO_INDICES = [],
+    DISCO_REFRESH_MS = 216e5;
 
-const DISCO_CACHE_VERSION    = 1;
-const DISCO_CACHE_KEY_IMAGES = 'ff_disco_images';
-const DISCO_CACHE_KEY_VIDEOS = 'ff_disco_videos';
-
-function readDiscoCache(key) {
-  try {
-    const raw = localStorage.getItem(key);
-    if (!raw) return null;
-    const parsed = JSON.parse(raw);
-    /* Reject entries from a previous cache schema. Returning null
-       falls back through to live discovery, which then overwrites
-       the stale entry with the current version. */
-    if (!parsed || parsed.v !== DISCO_CACHE_VERSION) return null;
-    if (!Array.isArray(parsed.indices)) return null;
-    return parsed.indices;
-  } catch {
-    return null;
-  }
+function discoSeed(e) {
+    return "ff_disco_images" === e ? SEED_IMAGE_INDICES : "ff_disco_videos" === e ? SEED_VIDEO_INDICES : []
 }
 
-function writeDiscoCache(key, indices) {
-  try {
-    localStorage.setItem(key, JSON.stringify({ v: DISCO_CACHE_VERSION, indices }));
-  } catch {
-    /* Quota exceeded, private mode, or storage disabled. Silent — the
-       cache is an optimisation, not a correctness requirement. */
-  }
+function discoStamp(e) {
+    try {
+        localStorage.setItem(e + "_ts", String(Date.now()))
+    } catch {}
 }
 
-/* Returns the cached indices immediately when available, kicking off
-   a live discoverBy run in the background to refresh the cache for
-   next time. On a cold visit (no cache), awaits real discovery and
-   writes the result before returning. The two-arg shape lets us reuse
-   the helper for both images and videos without duplicating logic. */
-function discoverWithCache(cacheKey, runDiscover) {
-  const cached = readDiscoCache(cacheKey);
-  if (cached) {
-    /* Background refresh — runs after the synchronous return below.
-       The user gets the cached list this visit; the cache gets
-       updated to whatever the real catalogue looks like for next
-       visit. Errors silently ignored: a failed refresh just means
-       the existing cache stays in place, which is fine. */
-    runDiscover()
-      .then(indices => writeDiscoCache(cacheKey, indices))
-      .catch(() => {});
-    return Promise.resolve(cached);
-  }
-  /* Cold path — wait for real discovery, then cache and return. */
-  return runDiscover().then(indices => {
-    writeDiscoCache(cacheKey, indices);
-    return indices;
-  });
+function discoRefreshDue(e) {
+    try {
+        return Date.now() - (+localStorage.getItem(e + "_ts") || 0) > DISCO_REFRESH_MS
+    } catch {
+        return !0
+    }
 }
 
-/* ─────────── ROTATION CACHE ───────────
-   `recent` and `lastShown` drive the per-image rotation: which images
-   are currently blocked from re-appearing, and which haven't surfaced
-   in a while (so the guarantee branch should favour them). Without
-   persistence these reset every visit, which means a returning visitor
-   sees the same handful of first-impression pairs every time — the
-   guarantee branch favours never-shown images, so on a fresh session
-   the first ~15 clicks always pull from the same small pool of
-   "high-staleness, high-boost" candidates.
+function discoTailIndices(e) {
+    const t = e && e.length ? e.reduce((e, t) => t > e ? t : e, 0) : 0;
+    return Array.from({
+        length: DISCOVER_BATCH
+    }, (e, n) => t + 1 + n)
+}
 
-   Persisting carries that state across sessions: an image shown on
-   yesterday's visit is still in `recent` today (until clickCount
-   advances past the RECENT_CLICKS_BLOCK window), and an image
-   under-shown over many sessions gets a real long-term staleness
-   advantage rather than being reset to "never seen" each time.
+function mergeNewImages(e) {
+    window.__discoImages = e;
+    const t = e.map(numToSrc).filter(e => !images.includes(e));
+    t.length && (images = images.concat(t), backgroundLoadRest(t))
+}
 
-   The whole rotation state is one JSON blob keyed on
-   ROTATION_CACHE_KEY: { v, clickCount, recent, lastShown }. clickCount
-   itself persists too — without it, the relative click-distances in
-   `recent` and `lastShown` would be meaningless across sessions
-   (`clickCount - last` only works if both come from the same numbering).
+function mergeNewVideos(e) {
+    window.__discoVideos = e;
+    const t = e.map(videoNumToSrc).filter(e => !images.includes(e));
+    if (!t.length) return;
+    images = images.concat(t);
+    for (const e of t) validImages.includes(e) || validImages.push(e), colorSignatures.has(e) || colorSignatures.set(e, fallbackSignature()), loadVideoPosterForAnalysis(e);
+    scheduleTopPairs(!0)
+}
 
-   Bumping ROTATION_CACHE_VERSION discards stored state on the next
-   load — useful if the rotation algorithm itself changes in ways that
-   would make old click-count values misleading. */
-const ROTATION_CACHE_VERSION = 1;
-const ROTATION_CACHE_KEY     = 'ff_rotation';
+function discoRefresh(e, t, n, a, o) {
+    const i = () => Promise.all(discoTailIndices(a).map(e => fetch(n(e), {
+        method: "HEAD"
+    }).then(e => e.ok).catch(() => !1))).then(e => e.some(Boolean) ? t() : null).then(t => {
+        t && t.length && (writeDiscoCache(e, t), o && o(t)), discoStamp(e)
+    }).catch(() => {});
+    setTimeout(() => {
+        "function" == typeof requestIdleCallback ? requestIdleCallback(i, {
+            timeout: 1e4
+        }) : i()
+    }, 4e3)
+}
+async function loadBootstrap() {
+    try {
+        if ("1" === localStorage.getItem("ff_boot_missing")) return null
+    } catch {}
+    try {
+        const e = await fetch("signatures.json");
+        if (!e.ok) {
+            try {
+                localStorage.setItem("ff_boot_missing", "1")
+            } catch {}
+            return null
+        }
+        const t = await e.json();
+        return t && t.sigs && "object" == typeof t.sigs ? t : null
+    } catch {
+        return null
+    }
+}
+window.__exportSignatures = function() {
+    const e = {};
+    let t = 0;
+    for (const [n, a] of colorSignatures) a && !a.isFallback && (e[n] = a, t++);
+    const o = new Set(window.__discoImages || []),
+        i = new Set(window.__discoVideos || []);
+    for (const t in e) {
+        const n = isVideo(t),
+            a = n ? (srcToId(t) || "v").slice(1) : srcToNum(t);
+        a && (n ? i : o).add(+a)
+    }
+    const s = [...o].sort((e, t) => e - t),
+        l = [...i].sort((e, t) => e - t),
+        c = JSON.stringify({
+            v: 4,
+            images: s,
+            videos: l,
+            sigs: e
+        }, (e, t) => "number" == typeof t && !Number.isInteger(t) ? +t.toPrecision(6) : t),
+        d = document.createElement("a"),
+        h = URL.createObjectURL(new Blob([c], {
+            type: "application/json"
+        }));
+    return d.href = h, d.download = "signatures.json", document.body.appendChild(d), d.click(), d.remove(), setTimeout(() => URL.revokeObjectURL(h), 5e3), t + " signatures / " + s.length + " images / " + l.length + " videos, " + Math.round(c.length / 1024) + " KB"
+};
+
+
+window.__exportCaptions = function() {
+    const out = { __meta__: { version: 1 } };
+    const keys = new Set();
+    for (const k of subjects.keys()) keys.add(k);
+    for (const src of colorSignatures.keys()) {
+        const id = srcToId(src);
+        if (id == null) continue;
+        keys.add(isVideo(src) ? String(id) : ("ff" + id));
+    }
+    const list = [...keys].sort((a, b) => {
+        const av = /^v/i.test(a), bv = /^v/i.test(b);
+        if (av !== bv) return av ? 1 : -1;
+        return parseInt(String(a).replace(/\D/g, ""), 10) - parseInt(String(b).replace(/\D/g, ""), 10);
+    });
+    for (const key of list) {
+        const cap = subjects.get(key) || {};
+        const src = captionKeyToSrc(key);
+        const sig = src && colorSignatures.get(src);
+        const entry = Object.assign({ kind: /^v/i.test(key) ? "video" : "image" }, cap);
+        if (sig && !sig.isFallback) {
+            entry.signature = {
+                histogram: sig.histogram,
+                palette: sig.palette,
+                averageSaturation: sig.avgSat,
+                meanLight: sig.meanL,
+                density: sig.density,
+                histogramMagnitude: sig.histMag,
+                aspect: sig.aspect,
+                edgeEnergy: sig.edgeEnergy,
+                vertical: sig.vertical,
+                centerX: sig.cx,
+                centerY: sig.cy
+            };
+        }
+        out[key] = entry;
+    }
+    const blob = new Blob([JSON.stringify(out, (k, v) => typeof v === "number" && !Number.isInteger(v) ? +v.toPrecision(6) : v, 2)], { type: "application/json" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "captions.json";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    return Object.keys(out).length - 1 + " frames";
+};
+
+function discoverWithCache(e, t, n, a) {
+    const o = readDiscoCache(e),
+        i = o && o.length ? o : discoSeed(e);
+    return i && i.length ? (discoRefreshDue(e) && discoRefresh(e, t, n, i, a), Promise.resolve(i)) : t().then(t => (writeDiscoCache(e, t), discoStamp(e), t))
+}
+const ROTATION_CACHE_VERSION = 1,
+    ROTATION_CACHE_KEY = "ff_rotation";
 
 function readRotationCache() {
-  try {
-    const raw = localStorage.getItem(ROTATION_CACHE_KEY);
-    if (!raw) return null;
-    const parsed = JSON.parse(raw);
-    if (!parsed || parsed.v !== ROTATION_CACHE_VERSION) return null;
-    if (typeof parsed.clickCount !== 'number') return null;
-    if (!Array.isArray(parsed.recent) || !Array.isArray(parsed.lastShown)) return null;
-    return parsed;
-  } catch {
-    return null;
-  }
+    try {
+        const e = localStorage.getItem("ff_rotation");
+        if (!e) return null;
+        const t = JSON.parse(e);
+        return t && 1 === t.v ? "number" != typeof t.clickCount ? null : Array.isArray(t.recent) && Array.isArray(t.lastShown) ? t : null : null
+    } catch {
+        return null
+    }
 }
 
 function writeRotationCache() {
-  try {
-    /* Serialise the live Maps via [...entries] — JSON.stringify
-       doesn't natively handle Map, so we materialise as [[k,v],...]
-       and rehydrate on read. Both maps are bounded in practice
-       (recent capped by the click-block window, lastShown by the
-       catalogue size), so the total payload stays well under 10KB. */
-    localStorage.setItem(ROTATION_CACHE_KEY, JSON.stringify({
-      v:          ROTATION_CACHE_VERSION,
-      clickCount,
-      recent:     [...recent.entries()],
-      lastShown:  [...lastShown.entries()],
-    }));
-  } catch {
-    /* Quota exceeded, private mode, or storage disabled. Silent —
-       same fallback semantics as the other caches: rotation will
-       simply reset to "fresh session" on the next load, which is the
-       pre-persistence behaviour and still works. */
-  }
+    try {
+        localStorage.setItem("ff_rotation", JSON.stringify({
+            v: 1,
+            clickCount: clickCount,
+            recent: [...recent.entries()],
+            lastShown: [...lastShown.entries()]
+        }))
+    } catch {}
 }
-
-/* Same pagehide-write strategy as signatures: fires reliably on tab
-   close / refresh / navigate-away on all modern browsers including
-   iOS Safari. The rotation state at session end is what matters for
-   the next visit. */
-window.addEventListener('pagehide', writeRotationCache);
-
-/* ─────────── SEEN INTERLUDES CACHE ───────────
-   The three interlude cards (share, welcome, contact) are single-use
-   within a session — once shown, removed from the pool. By default
-   that resets each visit; this cache persists a subset of "seen"
-   across sessions for cards that genuinely shouldn't recur.
-
-   PERSISTENT_INTERLUDES is the allowlist. Entries listed here will
-   be remembered across visits — share teaches a gesture, welcome
-   carries the iPhone-shot statement, both are one-time "lessons"
-   the returning visitor doesn't need to re-read. Cards NOT listed
-   here re-appear on each visit, which is the right behaviour for
-   contact: the email / phone are useful to surface periodically
-   rather than being hidden forever after first sight. */
-const PERSISTENT_INTERLUDES   = ['share', 'welcome'];
-const SEEN_INTERLUDES_KEY     = 'ff_seen_interludes';
-const SEEN_INTERLUDES_VERSION = 1;
+window.addEventListener("pagehide", writeRotationCache);
+/* Interludes remembered across visits, so a returning visitor isn't shown
+   them again. "share" is deliberately NOT here: it carries the instructions
+   (how to share, how to see why a pair was chosen), and those are worth
+   repeating every session — someone who saw them once three months ago has
+   not retained them, and without this they could never see them again. */
+const PERSISTENT_INTERLUDES = ["welcome"],
+    SEEN_INTERLUDES_KEY = "ff_seen_interludes",
+    SEEN_INTERLUDES_VERSION = 1;
 
 function readSeenInterludes() {
-  try {
-    const raw = localStorage.getItem(SEEN_INTERLUDES_KEY);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    if (!parsed || parsed.v !== SEEN_INTERLUDES_VERSION) return [];
-    if (!Array.isArray(parsed.seen)) return [];
-    /* Defensive filter: drop anything not in the current allowlist,
-       so removing a card from PERSISTENT_INTERLUDES forgets all its
-       stored "seen" entries on the next load rather than leaking. */
-    return parsed.seen.filter(s => PERSISTENT_INTERLUDES.includes(s));
-  } catch {
-    return [];
-  }
+    try {
+        const e = localStorage.getItem(SEEN_INTERLUDES_KEY);
+        if (!e) return [];
+        const t = JSON.parse(e);
+        return t && 1 === t.v && Array.isArray(t.seen) ? t.seen.filter(e => PERSISTENT_INTERLUDES.includes(e)) : []
+    } catch {
+        return []
+    }
 }
 
 function writeSeenInterludes() {
-  try {
-    const toStore = [...seenInterludes].filter(s => PERSISTENT_INTERLUDES.includes(s));
-    localStorage.setItem(SEEN_INTERLUDES_KEY, JSON.stringify({
-      v: SEEN_INTERLUDES_VERSION,
-      seen: toStore,
-    }));
-  } catch {}
+    try {
+        const e = [...seenInterludes].filter(e => PERSISTENT_INTERLUDES.includes(e));
+        localStorage.setItem(SEEN_INTERLUDES_KEY, JSON.stringify({
+            v: 1,
+            seen: e
+        }))
+    } catch {}
 }
 
-window.addEventListener('pagehide', writeSeenInterludes);
-
-/* ─────────────────────────────────────────────────────────────────────────
-   COLOUR ANALYSIS
-   Per image: a normalised lightness histogram, a small filtered palette,
-   and the average saturation. These three signals feed pairScore.
-   ───────────────────────────────────────────────────────────────────────── */
-
-function rgbToHsl(r, g, b) {
-  r /= 255; g /= 255; b /= 255;
-  const max = Math.max(r, g, b), min = Math.min(r, g, b);
-  const l = (max + min) / 2;
-  if (max === min) return { h: 0, s: 0, l };
-  const d = max - min;
-  const s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
-  let h;
-  switch (max) {
-    case r: h = ((g - b) / d + (g < b ? 6 : 0)); break;
-    case g: h = ((b - r) / d + 2);               break;
-    default: h = ((r - g) / d + 4);
-  }
-  return { h: h * 60, s, l };
-}
-
-/* OKLab — a perceptually uniform colour space (Björn Ottosson, 2020).
-   Euclidean distance between two points in OKLab tracks how the eye
-   actually reads the difference between the two colours, unlike HSL
-   where a soft pink and a deep red can look "close" by hue but read
-   as unrelated, and two greys at different lightnesses can score as
-   "far" despite both being grey. This is what powers colorSimilarity,
-   so the precision of the entire pair score depends on it.
-
-   Pipeline: sRGB (0–255) → normalised → linearised (inverse gamma) →
-   LMS cone response matrix → cube-root non-linearity → OKLab matrix.
-   Constants are the canonical ones from the OKLab spec. Output L is
-   roughly [0, 1] (black to white); a is roughly [-0.4, +0.4] (green
-   to red); b is roughly [-0.4, +0.4] (blue to yellow). Maximum
-   Euclidean distance between sRGB-renderable points is ~1 (black/
-   white axis); typical "very different" photo colours sit at ~0.4. */
-function rgbToOklab(r, g, b) {
-  /* sRGB normalize + linearize (undo the gamma curve). */
-  const lin = c => {
-    c /= 255;
-    return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
-  };
-  const lr = lin(r), lg = lin(g), lb = lin(b);
-
-  /* Linear-RGB → LMS cone responses. */
-  const l = 0.4122214708 * lr + 0.5363325363 * lg + 0.0514459929 * lb;
-  const m = 0.2119034982 * lr + 0.6806995451 * lg + 0.1073969566 * lb;
-  const s = 0.0883024619 * lr + 0.2817188376 * lg + 0.6299787005 * lb;
-
-  /* Cube-root for the perceptual non-linearity. */
-  const l_ = Math.cbrt(l), m_ = Math.cbrt(m), s_ = Math.cbrt(s);
-
-  /* LMS' → OKLab. */
-  return {
-    L: 0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_,
-    a: 1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_,
-    b: 0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_
-  };
-}
-
-/* Compositional density via lightness-histogram entropy. Returns
-   [0, 1] — 0 = all pixels in one tonal bin (uniform / "empty"),
-   1 = pixels perfectly spread across all bins ("full" / busy).
-   Real photos fall roughly between 0.2 (sky / wall) and 0.85
-   (varied scene). Used by pairScore to reward density CONTRAST,
-   not density itself. Precomputed once per image and cached on
-   the signature — pairScore reads sig.density. */
-function histogramDensity(histogram) {
-  let H = 0;
-  for (const p of histogram) {
-    if (p > 0) H -= p * Math.log2(p);
-  }
-  return H / Math.log2(HIST_BINS);
-}
-
-/* L2 norm of the histogram, cached so pairScore's cosine similarity
-   doesn't recompute it on every pair. The sqrt is paid once per image
-   instead of twice per pair. */
-function histogramMagnitude(histogram) {
-  let m = 0;
-  for (const p of histogram) m += p * p;
-  return Math.sqrt(m);
-}
-
-function analyzeImage(img) {
-  try {
-    const N = COLOR_SAMPLE_SIZE;
-    const canvas = document.createElement('canvas');
-    canvas.width = N; canvas.height = N;
-    const ctx = canvas.getContext('2d');
-    ctx.drawImage(img, 0, 0, N, N);
-    const data = ctx.getImageData(0, 0, N, N).data;
-
-    const histogram = new Array(HIST_BINS).fill(0);
-    const buckets   = new Map();
-    let totalWeight = 0, satWeighted = 0, lumWeighted = 0;
-
-    /* Centre-weighting parameters. Subject of a photo is almost always
-       near the middle of the frame; edges carry background or peripheral
-       content. Giving centre pixels more vote in palette / histogram /
-       avgSat / meanL construction makes the colour signature better
-       reflect what the photo is *about*, not just what it has the most
-       surface area of. Linear ramp from CENTER_WEIGHT at the centre
-       down to 1.0 at the corners, measured by max(|dx|, |dy|) — a
-       square gradient that matches the rectangular pixel grid (rounder
-       L2 distance would over-penalise the corners). 1.6 was chosen as
-       a moderate setting: meaningfully changes pairing for portraits
-       and centred subjects without overpowering background colour when
-       that genuinely matters (wide landscapes, full-bleed textures).
-       Set to 1.0 to disable centre weighting entirely. */
-    const CENTER_WEIGHT = 1.6;
-    const half = N / 2;
-
-    for (let i = 0, px = 0; i < data.length; i += 4, px++) {
-      const r = data[i], g = data[i + 1], b = data[i + 2];
-
-      /* Centre-weighted pixel vote. px = pixel index in row-major
-         order; x and y reconstructed from it. Distance from centre
-         normalised to [0, 1] via max-axis. */
-      const x = px % N;
-      const y = (px / N) | 0;
-      const dx = Math.abs(x - half) / half;
-      const dy = Math.abs(y - half) / half;
-      const distFromCenter = Math.max(dx, dy);                  // 0 = centre, 1 = edge
-      const w = 1 + (CENTER_WEIGHT - 1) * (1 - distFromCenter); // CENTER_WEIGHT → 1
-      totalWeight += w;
-
-      const lum = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
-      histogram[Math.min(HIST_BINS - 1, Math.floor(lum * HIST_BINS))] += w;
-      lumWeighted += lum * w;
-
-      const key = (r >> 3) << 10 | (g >> 3) << 5 | (b >> 3);
-      buckets.set(key, (buckets.get(key) || 0) + w);
-
-      const mx = Math.max(r, g, b), mn = Math.min(r, g, b);
-      const L = (mx + mn) / 510;
-      const sat = mx === mn ? 0 : (L > 0.5 ? (mx - mn) / (510 - mx - mn) : (mx - mn) / (mx + mn));
-      satWeighted += sat * w;
+function rgbToHsl(e, t, n) {
+    e /= 255, t /= 255, n /= 255;
+    const a = Math.max(e, t, n),
+        o = Math.min(e, t, n),
+        i = (a + o) / 2;
+    if (a === o) return {
+        h: 0,
+        s: 0,
+        l: i
+    };
+    const r = a - o,
+        s = i > .5 ? r / (2 - a - o) : r / (a + o);
+    let l;
+    switch (a) {
+        case e:
+            l = (t - n) / r + (t < n ? 6 : 0);
+            break;
+        case t:
+            l = (n - e) / r + 2;
+            break;
+        default:
+            l = (e - t) / r + 4
     }
-    for (let i = 0; i < HIST_BINS; i++) histogram[i] /= totalWeight;
-    const avgSat = satWeighted / totalWeight;
-    const meanL  = lumWeighted / totalWeight;   // mean lightness, [0, 1]
-
-    const sorted  = [...buckets.entries()].sort((a, b) => b[1] - a[1]);
-    const palette = [];
-
-    for (const [key, count] of sorted) {
-      if (palette.length >= PALETTE_SIZE) break;
-      const r = ((key >> 10) & 31) << 3;
-      const g = ((key >>  5) & 31) << 3;
-      const b =  (key        & 31) << 3;
-      const hsl = rgbToHsl(r, g, b);
-
-      if (hsl.l < 0.06 || hsl.l > 0.94 || hsl.s < 0.08) continue;
-
-      let merged = false;
-      for (const p of palette) {
-        let hueDiff = Math.abs(p.hsl.h - hsl.h);
-        if (hueDiff > 180) hueDiff = 360 - hueDiff;
-        if (hueDiff < 18 && Math.abs(p.hsl.l - hsl.l) < 0.12) {
-          p.weight += count / totalWeight;
-          merged = true;
-          break;
-        }
-      }
-      /* Each palette entry carries BOTH coordinate systems:
-         - hsl: used by the palette-merge heuristic above and by
-           dominantRepetition's hue-family detection (hue distance
-           is the right idea there — two reds at different lightnesses
-           ARE related as a "red repetition", which is what we want
-           to catch).
-         - oklab: used by colorSimilarity in pair scoring, where
-           perceptual distance is what matters. */
-      if (!merged) palette.push({
-        hsl,
-        oklab: rgbToOklab(r, g, b),
-        weight: count / totalWeight,
-      });
-    }
-
-    if (palette.length === 0) {
-      /* Edge case: every dominant bucket was filtered out by the
-         too-dark / too-light / too-desaturated gate. Use the overall
-         mean colour as a last-resort palette of one. Uses simple
-         pixel-count means (not centre-weighted) for robustness — it's
-         already a fallback path. */
-      let tr = 0, tg = 0, tb = 0, n = 0;
-      for (let i = 0; i < data.length; i += 4) {
-        tr += data[i]; tg += data[i + 1]; tb += data[i + 2]; n++;
-      }
-      const mr = tr / n, mg = tg / n, mb = tb / n;
-      palette.push({
-        hsl:    rgbToHsl(mr, mg, mb),
-        oklab:  rgbToOklab(mr, mg, mb),
-        weight: 1,
-      });
-    }
-    const wTotal = palette.reduce((s, p) => s + p.weight, 0);
-    palette.forEach(p => p.weight /= wTotal);
-
-    /* Cache per-image scalars that pairScore would otherwise recompute
-       O(N²) times — entropy of the lightness histogram (density), the
-       L2 norm of the histogram (for the tonalScore cosine), and the
-       mean lightness (for lightness contrast). With N≈100 these add
-       up: ~10k entropy calls, ~10k sqrt calls per full computeTopPairs
-       pass collapse to N each.
-
-       aspect (width / height) is captured here for the layout code
-       to use — though under the current pure-CSS layout (max-width:
-       50vw / max-height: 50dvh / auto on the unbound axis) the
-       browser derives aspect from the rendered image directly. The
-       cached value is retained in case future features want to know
-       an image's shape before it's actually rendered. Reads
-       naturalWidth/Height for <img>, falls back to videoWidth/Height
-       for <video> elements that go through this same function (runtime
-       frame extraction path). Defaults to 1 (square) if neither is
-       available, which makes the new box logic degrade to the old
-       square-box behaviour for any source without dimension data. */
-    const w = img.naturalWidth  || img.videoWidth  || 0;
-    const h = img.naturalHeight || img.videoHeight || 0;
-    const aspect = (w > 0 && h > 0) ? w / h : 1;
-
     return {
-      histogram,
-      palette,
-      avgSat,
-      meanL,
-      density: histogramDensity(histogram),
-      histMag: histogramMagnitude(histogram),
-      aspect,
-    };
-  } catch {
-    return null;
-  }
-}
-
-/* Pure similarity measure between two palette entries. 1 = effectively
-   the same colour, 0 = at opposite ends of the perceivable gamut.
-   Uses Euclidean distance in OKLab — a perceptually uniform space
-   where distance correlates with how the eye reads the difference.
-   This replaces the previous HSL hue/lightness mix, which gave
-   misleading scores in both directions (e.g. soft pink vs deep red
-   reading as close because hue agrees; two greys at different
-   lightnesses reading as far despite both being grey).
-
-   Normalisation: max practical distance between sRGB-renderable
-   points is ~1.0 (black to white axis). Typical "very different"
-   photo colours sit around 0.3–0.5. Clamping at 1.0 means similarity
-   = max(0, 1 - dist) maps the full sensible range to [0, 1] without
-   needing a custom curve. */
-function colorSimilarity(c1, c2) {
-  const dL = c1.oklab.L - c2.oklab.L;
-  const da = c1.oklab.a - c2.oklab.a;
-  const db = c1.oklab.b - c2.oklab.b;
-  const dist = Math.sqrt(dL * dL + da * da + db * db);
-  return Math.max(0, 1 - dist);
-}
-
-/* Detects "blank canvas" repetition — both images are mostly dominated
-   by the same low-saturation tone (pale sky, white wall, grey backdrop),
-   with that tone often too desaturated for the palette filter to
-   register it as the dominant colour. Catches the case dominantRepetition
-   misses, where palette[0] ends up being a tiny accent colour while the
-   actual visual dominant is a neutral.
-
-   The saturation gate is SOFT — it scales linearly from full effect at
-   avgSat 0 down to no effect at avgSat 0.3 — so borderline cases
-   (knife photo with a small saturated handle on a pale wall, sky with
-   wispy clouds) still get caught when they share the same tonal cluster
-   with another image. A hard cutoff at 0.15 was missing these. */
-function blankCanvasRepetition(a, b) {
-  const satGateA = Math.max(0, 1 - a.avgSat / 0.3);
-  const satGateB = Math.max(0, 1 - b.avgSat / 0.3);
-  const satGate  = Math.min(satGateA, satGateB);
-  if (satGate === 0) return 0;
-
-  /* Find each image's strongest 2-adjacent-bin slab and its position. */
-  const concentration = sig => {
-    let best = 0, bestIdx = 0;
-    for (let i = 0; i < HIST_BINS - 1; i++) {
-      const adjacent = sig.histogram[i] + sig.histogram[i + 1];
-      if (adjacent > best) { best = adjacent; bestIdx = i; }
+        h: 60 * l,
+        s: s,
+        l: i
     }
-    return { val: best, idx: bestIdx };
-  };
-
-  const ca = concentration(a);
-  const cb = concentration(b);
-
-  /* Both must be heavily dominated by their neutral mass (>50% in two
-     adjacent bins) AND that mass must sit at roughly the same lightness. */
-  if (ca.val < 0.5 || cb.val < 0.5) return 0;
-  if (Math.abs(ca.idx - cb.idx) > 1) return 0;
-
-  return Math.min(ca.val, cb.val) * satGate;
 }
 
-/* Detects when both images share essentially the same predominant
-   colour. PART 1 catches saturated palette[0] matches by hue family —
-   a deep blue paired with a pale blue still counts as "two blues",
-   regardless of lightness difference. PART 2 catches blank-canvas
-   images where the dominant area is a neutral the palette filter
-   stripped out. */
-function dominantRepetition(a, b) {
-  const cA = a.palette[0];
-  const cB = b.palette[0];
-
-  /* PART 1: palette[0] hue-family match */
-  let palRep = 0;
-  if (cA && cB) {
-    let hueDiff = Math.abs(cA.hsl.h - cB.hsl.h);
-    if (hueDiff > 180) hueDiff = 360 - hueDiff;
-
-    const satGate = Math.min(cA.hsl.s, cB.hsl.s);
-
-    /* Saturated dominants: same hue family (within 30°) = repetition,
-       regardless of lightness. Desaturated dominants (greys): fall
-       back to lightness proximity, since hue is meaningless. */
-    const closeness = satGate > 0.15
-      ? Math.max(0, 1 - hueDiff / 30)
-      : Math.max(0, 1 - Math.abs(cA.hsl.l - cB.hsl.l) / 0.15);
-
-    /* Weight by prominence — a tiny matching patch doesn't qualify. */
-    palRep = closeness * Math.min(cA.weight, cB.weight);
-  }
-
-  /* PART 2: blank-canvas neutral match */
-  const blankRep = blankCanvasRepetition(a, b);
-
-  return Math.max(palRep, blankRep);
+function rgbToOklab(e, t, n) {
+    const a = e => (e /= 255) <= .04045 ? e / 12.92 : Math.pow((e + .055) / 1.055, 2.4),
+        o = a(e),
+        i = a(t),
+        r = a(n),
+        s = .4122214708 * o + .5363325363 * i + .0514459929 * r,
+        l = .2119034982 * o + .6806995451 * i + .1073969566 * r,
+        c = .0883024619 * o + .2817188376 * i + .6299787005 * r,
+        d = Math.cbrt(s),
+        h = Math.cbrt(l),
+        u = Math.cbrt(c);
+    return {
+        L: .2104542553 * d + .793617785 * h - .0040720468 * u,
+        a: 1.9779984951 * d - 2.428592205 * h + .4505937099 * u,
+        b: .0259040371 * d + .7827717662 * h - .808675766 * u
+    }
 }
 
-/* Pair score: rewards palette contrast (perceptual, OKLab-based),
-   compositional density contrast (full-vs-empty), lightness contrast
-   (bright-vs-dark), tonal cohesion as a faint signal, and saturation
-   match as a tiebreaker. Minus penalties for predominant-colour
-   repetition, two-empty pairs (joint-desat, joint-empty-density),
-   and two-full pairs (joint-full-density). */
-function pairScore(a, b) {
-  if (!a || !b) return 0;
-
-  /* Tonal cohesion via histogram cosine similarity. Kept as a low
-     weight — it directly conflicts with density contrast, since a
-     full scene and an empty sky have very different histograms.
-     Magnitudes are precomputed once per image (see histogramMagnitude
-     in analyzeImage), so only the dot product runs per pair. */
-  let dot = 0;
-  for (let i = 0; i < HIST_BINS; i++) {
-    dot += a.histogram[i] * b.histogram[i];
-  }
-  const tonalScore = (a.histMag && b.histMag) ? dot / (a.histMag * b.histMag) : 0;
-
-  /* Palette overlap: for each colour in A, find its best match in B
-     and weight by A's weight. Symmetric average over both directions.
-     colorSimilarity reads .oklab from each palette entry. */
-  const directional = (pA, pB) => {
-    let total = 0;
-    for (const cA of pA) {
-      let best = 0;
-      for (const cB of pB) {
-        const s = colorSimilarity(cA, cB);
-        if (s > best) best = s;
-      }
-      total += best * cA.weight;
-    }
-    return total;
-  };
-  const paletteOverlap  = (directional(a.palette, b.palette) + directional(b.palette, a.palette)) / 2;
-  const paletteContrast = 1 - paletteOverlap;
-
-  /* Hard floor — pair score is forced to -10 (well below any natural
-     pair score) if palettes are too similar. See MIN_PALETTE_CONTRAST
-     declaration for the full rationale. Returning early also short-
-     circuits the rest of the computation for failed pairs. */
-  if (paletteContrast < MIN_PALETTE_CONTRAST) return -10;
-
-  /* Concentrate reward at the top of the contrast range. With
-     PALETTE_CONTRAST_POWER = 2.0: a pair scoring 1.0 keeps full
-     reward, a pair at 0.5 drops to 0.25 (halves), at 0.3 drops to
-     0.09. Effect: only pairs with strong palette contrast score
-     meaningfully on the palette term; moderate palette similarity
-     (warm-on-warm, cool-on-cool, near-tonal-match pairs) drops
-     hard. See the constant declaration above for the full curve. */
-  const paletteContrastShaped = Math.pow(paletteContrast, PALETTE_CONTRAST_POWER);
-
-  /* Compositional density contrast: Shannon entropy of each image's
-     lightness histogram, normalised to [0, 1]. Cached on the signature
-     (a.density / b.density) so this is just a subtraction per pair
-     instead of two entropy passes. The score rewards the ABSOLUTE
-     DIFFERENCE — pairing one full and one empty image gets a strong
-     boost, while two-full or two-empty pairs contribute nothing from
-     this term. Multiplying by paletteContrast (not its shaped form)
-     keeps the original interlock: density bonus only when there's
-     also some palette difference, to avoid the "two-blue / one busy
-     one calm" fake-contrast trap. */
-  const densityContrast = Math.abs(a.density - b.density);
-
-  /* Lightness contrast — perceptual mean L (from OKLab pipeline,
-     stored as meanL [0, 1]). Rewards "one bright, one dark" pairings
-     independently of palette and density. Two photos can have the
-     same warm palette and similar density yet read very differently
-     if one is high-key (bright noon) and the other low-key (golden
-     hour); this term captures that "up-and-down" dimension explicitly.
-     Unlike densityContrast it is NOT gated by paletteContrast — a
-     bright-dark pair with a shared family of colours still scores
-     well here, since the lightness shift alone creates visual
-     dialogue. Max value ~0.8 (white-vs-black photo); typical
-     "noticeable" lightness contrast is 0.25–0.4. */
-  const lightnessContrast = Math.abs(a.meanL - b.meanL);
-
-  const satMatch = 1 - Math.abs(a.avgSat - b.avgSat);
-
-  const repetition = dominantRepetition(a, b);
-
-  /* Joint-desaturation penalty: fires when BOTH images sit below
-     JOINT_DESAT_THRESHOLD avgSat. Threshold raised from 0.25 → 0.30
-     so it catches more "everything is dust-grey" cases. One
-     colourful side is enough to keep the pair alive. */
-  const maxSat     = Math.max(a.avgSat, b.avgSat);
-  const jointDesat = Math.max(0, 1 - maxSat / JOINT_DESAT_THRESHOLD);
-
-  /* Joint-fullness penalty: ramps up when BOTH images are busy —
-     i.e. the minimum of the two densities is above the threshold.
-     Two highly-composed images compete for the eye; somewhere
-     should be quiet. Uses min(a, b) so the penalty fires only when
-     BOTH cross into "full" territory — a busy image paired with
-     an empty one is exactly what densityContrast rewards. */
-  const minDensity = Math.min(a.density, b.density);
-  const jointFull  = Math.max(0, (minDensity - JOINT_FULL_THRESHOLD) /
-                                 (1 - JOINT_FULL_THRESHOLD));
-
-  /* Joint-emptiness penalty: mirror of fullness, ramps up when
-     BOTH images are near-empty — max(a, b) below the threshold.
-     Catches "two minimal surfaces with sparse detail" pairs that
-     are technically distinct in palette/saturation but feel
-     visually similar (both quiet). Milder than fullness because
-     some minimalist pairs work intentionally. */
-  const maxDensity = Math.max(a.density, b.density);
-  const jointEmpty = Math.max(0, (JOINT_EMPTY_THRESHOLD - maxDensity) /
-                                 JOINT_EMPTY_THRESHOLD);
-
-  /* Fallback-signature trust penalty. Either side carrying the
-     isFallback marker (video without a poster yet) deducts a fixed
-     amount, large enough to keep the pair out of the global top-N
-     pool. See FALLBACK_TRUST_PENALTY declaration for rationale.
-     Boolean OR — penalty doesn't double up if both sides are
-     fallback (extremely rare anyway since first pair is photo-only). */
-  const trustPenalty = (a.isFallback || b.isFallback) ? FALLBACK_TRUST_PENALTY : 0;
-
-  return tonalScore                                * TONAL_WEIGHT
-       + paletteContrastShaped                     * PALETTE_WEIGHT
-       + paletteContrast * densityContrast         * DENSITY_WEIGHT
-       + lightnessContrast                         * LIGHTNESS_WEIGHT
-       + satMatch                                  * SAT_WEIGHT
-       - repetition                                * REPETITION_PENALTY
-       - jointDesat                                * JOINT_DESAT_PENALTY
-       - jointFull                                 * JOINT_FULL_PENALTY
-       - jointEmpty                                * JOINT_EMPTY_PENALTY
-       - trustPenalty;
+function histogramDensity(e) {
+    let t = 0;
+    for (const n of e) n > 0 && (t -= n * Math.log2(n));
+    return t / Math.log2(7)
 }
 
-function computeTopPairs() {
-  if (validImages.length < 2) { topPairs = []; imageBests = []; bestsPerImage = new Map(); return; }
-  const arr   = validImages.filter(s => colorSignatures.has(s));
-  const pairs = [];
-  for (let i = 0; i < arr.length; i++) {
-    for (let j = i + 1; j < arr.length; j++) {
-      pairs.push({
-        a: arr[i],
-        b: arr[j],
-        score: pairScore(colorSignatures.get(arr[i]), colorSignatures.get(arr[j]))
-      });
+function histogramMagnitude(e) {
+    let t = 0;
+    for (const n of e) t += n * n;
+    return Math.sqrt(t)
+}
+window.addEventListener("pagehide", writeSeenInterludes);
+const _analysisCanvas = "undefined" != typeof document ? document.createElement("canvas") : null,
+    _analysisCtx = _analysisCanvas ? _analysisCanvas.getContext("2d", {
+        willReadFrequently: !0
+    }) : null,
+    _colourBuckets = new Float64Array(32768);
+
+const PALETTE_WIDTH = 48;
+const _paletteCanvas = document.createElement("canvas");
+const _paletteCtx = _paletteCanvas.getContext("2d", { willReadFrequently: !0 });
+
+function analyzeImage(e) {
+    try {
+        const t = 96;
+        _analysisCanvas.width !== t && (_analysisCanvas.width = t, _analysisCanvas.height = t);
+        const n = _analysisCtx;
+        n.drawImage(e, 0, 0, t, t);
+        const a = n.getImageData(0, 0, t, t).data,
+            o = new Array(7).fill(0),
+            i = _colourBuckets;
+        i.fill(0);
+        const r = new Float32Array(t * t);
+        let s = 0,
+            l = 0,
+            c = 0;
+        const d = 1.6,
+            h = t / 2;
+        for (let e = 0, n = 0; e < a.length; e += 4, n++) {
+            const u = a[e],
+                m = a[e + 1],
+                g = a[e + 2],
+                p = n % t,
+                f = n / t | 0,
+                y = Math.abs(p - h) / h,
+                w = Math.abs(f - h) / h,
+                b = 1 + (d - 1) * (1 - Math.max(y, w));
+            s += b;
+            const S = (.2126 * u + .7152 * m + .0722 * g) / 255;
+            r[n] = S, o[Math.min(6, Math.floor(7 * S))] += b, c += S * b;
+            i[u >> 3 << 10 | m >> 3 << 5 | g >> 3] += b;
+            const E = Math.max(u, m, g),
+                v = Math.min(u, m, g);
+            l += (E === v ? 0 : (E + v) / 510 > .5 ? (E - v) / (510 - E - v) : (E - v) / (E + v)) * b
+        }
+        for (let e = 0; e < 7; e++) o[e] /= s;
+        const u = l / s,
+            m = c / s;
+        let g = 0,
+            p = 0,
+            f = 0,
+            y = 0,
+            w = 0;
+        for (let e = 1; e < t - 1; e++)
+            for (let n = 1; n < t - 1; n++) {
+                const a = e * t + n,
+                    o = r[a - t - 1],
+                    i = r[a - t],
+                    s = r[a - t + 1],
+                    l = r[a - 1],
+                    c = r[a + 1],
+                    d = r[a + t - 1],
+                    h = r[a + t],
+                    u = r[a + t + 1],
+                    m = s + 2 * c + u - (o + 2 * l + d),
+                    b = d + 2 * h + u - (o + 2 * i + s),
+                    S = Math.sqrt(m * m + b * b);
+                g += S, p += Math.abs(m), f += Math.abs(b), y += S * n, w += S * e
+            }
+        const b = g / ((t - 2) * (t - 2)),
+            S = p + f > 0 ? (p - f) / (p + f) : 0,
+            E = g > 0 ? y / g / t : .5,
+            v = g > 0 ? w / g / t : .5,
+            T = [];
+        /* The palette is taken from a 48px copy rather than the 96px analysis
+           canvas. Downscaling is a box blur, and blurring first is what makes
+           a textured surface resolve into its actual colour: grass photographed
+           in sun and shade spreads across dozens of bins at 96px and none of
+           them is ever large enough to place, so a smooth sky wins every time.
+           A whole green field was reading as blue for this reason.
+
+           The histogram, density, edge and lightness figures still come from
+           the 96px pass — only the palette moves. */
+        _paletteCanvas.width !== PALETTE_WIDTH && (_paletteCanvas.width = PALETTE_WIDTH, _paletteCanvas.height = PALETTE_WIDTH);
+        _paletteCtx.drawImage(e, 0, 0, PALETTE_WIDTH, PALETTE_WIDTH);
+        const B = _paletteCtx.getImageData(0, 0, PALETTE_WIDTH, PALETTE_WIDTH).data,
+            k2 = new Map();
+        let px = 0;
+        for (let e = 0; e < B.length; e += 4) {
+            const t = B[e] >> 3 << 10 | B[e + 1] >> 3 << 5 | B[e + 2] >> 3;
+            k2.set(t, (k2.get(t) || 0) + 1), px++
+        }
+        for (const [e, t] of k2) T.push([e, t / px * s]);
+        T.sort((e, t) => t[1] - e[1]);
+        const I = [];
+        /* Scan far more bins than there are slots, merging as we go, and only
+           then keep the six heaviest.
+
+           Stopping at six meant the six biggest bins won outright, so a single
+           textured colour could fill every slot before a smaller one was
+           reached: a photograph of red roses in foliage came back with six
+           greens and no red at all, and was then described as having low
+           colour on both sides. */
+        for (const [e, t] of T) {
+            if (I.length >= 24) break;
+            const n2 = (e >> 10 & 31) << 3,
+                a2 = (e >> 5 & 31) << 3,
+                o2 = (31 & e) << 3,
+                i = rgbToHsl(n2, a2, o2);
+            if (i.l < .06 || i.l > .94 || i.s < .08) continue;
+            let r = !1;
+            for (const e of I) {
+                let n = Math.abs(e.hsl.h - i.h);
+                /* Lightness tolerance .55, not .12. Sunlit grass and shaded
+                   grass are one colour to a viewer and must merge into one
+                   swatch; the narrow window kept them apart and split the
+                   weight that should have made green dominant. */
+                if (n > 180 && (n = 360 - n), n < 22 && Math.abs(e.hsl.l - i.l) < .55) {
+                    /* Keep the member with the most chroma, not the most HSL
+                       saturation. Saturation peaks at near-black — a red at
+                       lightness .06 reads as 100% saturated — so choosing on it
+                       dragged merged swatches into the shadows: a terracotta
+                       wall came back as an almost-black red and the frame was
+                       then said to have no colour. Chroma is perceptual and
+                       picks the swatch a viewer would call the colour. */
+                    const c2 = rgbToOklab(n2, a2, o2),
+                        ch2 = Math.hypot(c2.a, c2.b),
+                        chE = Math.hypot(e.oklab.a, e.oklab.b);
+                    e.weight += t / s, ch2 > chE && (e.hsl = i, e.oklab = c2), r = !0;
+                    break
+                }
+            }
+            r || I.push({
+                hsl: i,
+                oklab: rgbToOklab(n2, a2, o2),
+                weight: t / s
+            })
+        }
+        if (0 === I.length) {
+            let e = 0,
+                t = 0,
+                n = 0,
+                o = 0;
+            for (let i = 0; i < a.length; i += 4) e += a[i], t += a[i + 1], n += a[i + 2], o++;
+            const i = e / o,
+                r = t / o,
+                s = n / o;
+            I.push({
+                hsl: rgbToHsl(i, r, s),
+                oklab: rgbToOklab(i, r, s),
+                weight: 1
+            })
+        }
+        I.sort((e, t) => t.weight - e.weight), I.length = Math.min(I.length, 6);
+        const P = I.reduce((e, t) => e + t.weight, 0);
+        I.forEach(e => e.weight /= P);
+        const A = e.naturalWidth || e.videoWidth || e.width || 0,
+            _ = e.naturalHeight || e.videoHeight || e.height || 0,
+            L = A > 0 && _ > 0 ? A / _ : 1;
+        return {
+            histogram: o,
+            palette: I,
+            avgSat: u,
+            meanL: m,
+            density: histogramDensity(o),
+            histMag: histogramMagnitude(o),
+            aspect: L,
+            edgeEnergy: b,
+            vertical: S,
+            cx: E,
+            cy: v
+        }
+    } catch {
+        return null
     }
-  }
-  pairs.sort((x, y) => y.score - x.score);
-  topPairs = pairs;
-
-  /* Per-image best pairs. Two parallel structures from one pass:
-     - bestsPerImage: Map<src, Pair[]> with each image's top
-       BESTS_PER_IMAGE highest-scoring partner-pairs. The guarantee
-       branch consults this so an image with a single popular best
-       partner (often in recent[]) still has fallback options. With
-       K=1 (the previous design), modest-scoring images whose top
-       partner was a heavy-hitter got systematically starved: their
-       single imageBests row was filtered out whenever the partner
-       appeared recently, and they weren't in the global top-N pool
-       either. K=5 means recent[] would need to block five separate
-       best-pairings before an image disappears from the guarantee
-       pool — much less common.
-     - imageBests: flat list of first-pair-per-image, kept purely
-       for debugging via window.__imageBests so existing console
-       workflows still work. Not consulted by pickPair anymore. */
-  const BESTS_PER_IMAGE = 5;
-  bestsPerImage = new Map();
-  for (const pair of pairs) {
-    for (const src of [pair.a, pair.b]) {
-      /* Skip fallback-signature sources entirely. The guarantee branch
-         iterates bestsPerImage keys to find candidate "lead" images for
-         each click — and if a fallback-signed video (one without a
-         poster) is a key, the algorithm picks IT as the lead, then
-         pairs it with whichever of its top-K partners is least-bad.
-         The FALLBACK_TRUST_PENALTY in pairScore deducts equally from
-         all pairs involving that video, so the relative ranking among
-         its partners is unchanged — meaning the "best" partner is still
-         a moderately-similar palette match, which is exactly the kind
-         of pair we don't want to surface.
-
-         By excluding fallback-signed sources from bestsPerImage, those
-         videos can no longer lead the guarantee branch. They still
-         appear via the main draw (with the trust penalty pushing them
-         down in topPairs) and they can still be the PARTNER side of
-         another image's guarantee draw, but only if a non-fallback
-         image picks them — which only happens if they're genuinely
-         in that image's top-K best partners despite the trust penalty.
-
-         The fix is self-disabling: once a video gets a poster image
-         and its signature is replaced by a real one (no isFallback
-         marker), it joins bestsPerImage normally on the next compute.
-         No code change needed when posters arrive. */
-      const srcSig = colorSignatures.get(src);
-      if (srcSig && srcSig.isFallback) continue;
-
-      const list = bestsPerImage.get(src);
-      if (!list) bestsPerImage.set(src, [pair]);
-      else if (list.length < BESTS_PER_IMAGE) list.push(pair);
-    }
-  }
-
-  const seen  = new Set();
-  const bests = [];
-  for (const pair of pairs) {
-    if (!seen.has(pair.a) || !seen.has(pair.b)) {
-      bests.push(pair);
-      seen.add(pair.a);
-      seen.add(pair.b);
-    }
-    if (seen.size >= arr.length) break;
-  }
-  imageBests = bests;
-
-  window.__topPairs      = topPairs;
-  window.__imageBests    = imageBests;
-  window.__bestsPerImage = bestsPerImage;
 }
 
-/* Debounced wrapper. During initial parallel discovery, every image
-   that finishes loading would trigger a full O(N²) recompute — with
-   30 images that's 30 back-to-back recomputes of ~400 pair scores
-   each, all on the main thread. Coalescing into one recompute per
-   frame keeps the splash animation smooth without changing semantics:
-   pickPair only consults topPairs after the splash dismisses anyway. */
-let topPairsPending = 0;
-function scheduleTopPairs() {
-  if (topPairsPending) return;
-  topPairsPending = requestAnimationFrame(() => {
-    topPairsPending = 0;
+function colorSimilarity(e, t) {
+    const n = e.oklab.L - t.oklab.L,
+        a = e.oklab.a - t.oklab.a,
+        o = e.oklab.b - t.oklab.b,
+        i = Math.sqrt(n * n + a * a + o * o);
+    return Math.max(0, 1 - i)
+}
+
+function blankCanvasRepetition(e, t) {
+    const n = Math.max(0, 1 - e.avgSat / .3),
+        a = Math.max(0, 1 - t.avgSat / .3),
+        o = Math.min(n, a);
+    if (0 === o) return 0;
+    const i = e => {
+            let t = 0,
+                n = 0;
+            for (let a = 0; a < 6; a++) {
+                const o = e.histogram[a] + e.histogram[a + 1];
+                o > t && (t = o, n = a)
+            }
+            return {
+                val: t,
+                idx: n
+            }
+        },
+        r = i(e),
+        s = i(t);
+    return r.val < .5 || s.val < .5 || Math.abs(r.idx - s.idx) > 1 ? 0 : Math.min(r.val, s.val) * o
+}
+
+function dominantRepetition(e, t) {
+    const n = "undefined" != typeof window && window.__useRepDedup,
+        a = e.palette[n ? representativeSwatchIndex(e) : 0],
+        o = t.palette[n ? representativeSwatchIndex(t) : 0];
+    let i = 0;
+    if (a && o) {
+        let e = Math.abs(a.hsl.h - o.hsl.h);
+        e > 180 && (e = 360 - e);
+        i = (Math.min(a.hsl.s, o.hsl.s) > .15 ? Math.max(0, 1 - e / 30) : Math.max(0, 1 - Math.abs(a.hsl.l - o.hsl.l) / .15)) * Math.min(a.weight, o.weight)
+    }
+    const r = blankCanvasRepetition(e, t);
+    return Math.max(i, r)
+}
+
+/* ── CAPTION-AWARE SCORING ────────────────────────────────────────────────
+   pairScore works on colour, light and structure. The caption manifest adds
+   things the pixels can't express: what the subject IS, how far away it is,
+   and which way the composition runs. Four terms use it.
+
+   Both captions must be present or every term returns 0, so a half-filled
+   manifest never skews one part of the catalogue against another. Until
+   coverage is complete, captioned pairs can score marginally higher than
+   uncaptioned ones simply by being eligible for the bonuses — worth finishing
+   the run before judging the results.
+   ───────────────────────────────────────────────────────────────────────── */
+
+/* "Staircases" and "a spiral staircase" reduce to the same token. Crude on
+   purpose: a real stemmer would be far more code for no gain at this size. */
+function captionNoun(e) {
+    if (!e) return "";
+    let t = (e.short || "").trim().toLowerCase();
+    if (!t) t = String(e.subject || "").toLowerCase().replace(/^(a|an|the)\s+/, "").split(/\s+/).pop() || "";
+    t = t.replace(/[^a-z]/g, "");
+    return t.length > 3 && t.charAt(t.length - 1) === "s" && t.charAt(t.length - 2) !== "s" ? t.slice(0, -1) : t
+}
+
+function captionSubject(e) {
+    return e ? String(e.subject || "").toLowerCase().replace(/^(a|an|the)\s+/, "").replace(/[^a-z ]/g, "").trim() : ""
+}
+
+/* How different is everything AROUND the subject? 0 = same picture twice,
+   1 = nothing in common. Drives whether a repeated subject reads as a rhyme
+   or as a mistake. */
+function captionContextDistance(e, t, n, a) {
+    const o = paletteContrastOf(e, t),
+        i = Math.min(1, Math.abs(e.meanL - t.meanL) / .35),
+        r = Math.min(1, Math.abs(e.density - t.density) / .3),
+        s = n.light && a.light && n.light !== a.light ? 1 : 0,
+        l = n.surface && a.surface && n.surface !== a.surface ? 1 : 0,
+        c = n.placement && a.placement && n.placement !== a.placement ? 1 : 0;
+    return Math.min(1, .42 * o + .2 * i + .12 * r + .12 * s + .09 * l + .05 * c)
+}
+const DISTANCE_RANK = {
+    close: 0,
+    mid: 1,
+    far: 2
+};
+/* Which line directions play off each other. Symmetric; anything not listed
+   (including a shared direction, and anything involving "none") scores 0. */
+/* Diagonal is gone from here as well as from the prose. Reading a frame's
+   inclination proved unreliable, so it no longer earns or loses a pair any
+   score; only the play between upright, flat and curved remains. */
+const LINE_PLAY = {
+    "horizontal|vertical": 1,
+    "curved|vertical": .8,
+    "curved|horizontal": .6
+};
+
+function linePlay(e, t) {
+    return !e || !t || "none" === e || "none" === t ? 0 : LINE_PLAY[[e, t].sort().join("|")] || 0
+}
+
+const SCALE_PHRASE = {
+    handheld: "something you could hold",
+    furniture: "something you could lift",
+    room: "a space you stand in",
+    building: "a whole building",
+    landscape: "open ground"
+};
+const SCALE_RANK = {
+    handheld: 0,
+    furniture: 1,
+    room: 2,
+    building: 3,
+    landscape: 4
+};
+
+/* Words are compared on their letters alone, so "CHAMPAGNE" and "champagne."
+   count as the same thing. */
+function textKey(e) {
+    return String(e || "").toLowerCase().replace(/[^a-z0-9 ]/g, "").replace(/\s+/g, " ").trim()
+}
+
+/* Words too common to mean anything when two signs happen to share them. */
+const TEXT_STOP = new Set("the a an of to and for on in is it with by we this all at from".split(" "));
+
+function textWords(e) {
+    return new Set(textKey(e).split(" ").filter(e => e.length > 1 && !TEXT_STOP.has(e)))
+}
+
+/* Opposed words. Deliberately short and literal — these are read off signs, so
+   the pairs that matter are the ones shop fronts and warnings actually use. */
+const TEXT_OPPOSITES = [
+    ["closed", "open"],
+    ["stop", "go"],
+    ["empty", "full"],
+    ["in", "out"],
+    ["up", "down"],
+    ["on", "off"],
+    ["yes", "no"],
+    ["start", "end"],
+    ["push", "pull"],
+    ["enter", "exit"],
+    ["naked", "dressed"],
+    ["day", "night"],
+    ["dead", "alive"],
+    ["fast", "slow"],
+    ["hot", "cold"],
+    ["new", "old"],
+    ["free", "paid"],
+    ["private", "public"],
+    ["arrive", "depart"],
+    ["hello", "goodbye"],
+    ["never", "always"],
+    ["lost", "found"],
+    ["silence", "noise"],
+    ["danger", "safe"],
+    ["first", "last"],
+    ["more", "less"],
+    ["big", "small"],
+    ["war", "peace"],
+    ["love", "hate"],
+    ["life", "death"]
+];
+
+/* Does either side carry a word the other opposes? */
+function textOpposed(e, t) {
+    for (const [n, a] of TEXT_OPPOSITES)
+        if (e.has(n) && t.has(a) || e.has(a) && t.has(n)) return !0;
+    return !1
+}
+
+/* Categories far enough apart to count as different worlds. Adjacent ones —
+   a building and a room, a plant and the sky — share too much context for the
+   pairing to surprise anyone. */
+const NEIGHBOURS = {
+    build: ["room", "sign"],
+    room: ["build", "object"],
+    plant: ["sky", "water"],
+    sky: ["plant", "water"],
+    water: ["sky", "plant", "liquid"],
+    liquid: ["water", "food"],
+    machine: ["object", "vehicle"],
+    object: ["machine", "room"],
+    vehicle: ["machine"],
+    sign: ["build", "text"],
+    /* Writing as the subject — graffiti, a label, an inscription — rather than
+       a sign. It gets no line of its own: "Words in both" already says it. */
+    text: ["sign"],
+    light: [],
+    food: [],
+    person: [],
+    animal: []
+};
+
+function formRhyme(e, t, n, a) {
+    const o = n.lines,
+        i = a.lines;
+    if (!o || o !== i || "none" === o || "unclear" === o) return 0;
+    const r = n.category,
+        s = a.category;
+    if (!r || !s || r === s) return 0;
+    if ((NEIGHBOURS[r] || []).includes(s)) return 0;
+    /* Curves only, now that diagonal has been withdrawn. Vertical and
+       horizontal are the default states of almost everything photographed, so
+       sharing one rewards coincidence rather than rhyme; a shared curve is a
+       decision someone made with the camera.
+
+       Geometry has to agree too, on both axes: a shared label alone would mean
+       every curved thing rhymes with every other. */
+    if ("curved" !== o) return 0;
+    return Math.abs(e.aspect - t.aspect) < .15 && Math.abs(e.density - t.density) < .1 ? FORM_RHYME_BONUS : 0
+}
+
+/* The tag families a caption puts a frame in. Editorial, not measured: every
+   word here was written by hand while looking at the photograph, so deriving
+   from it is reading the archive's own notes. IMAGE_TAGS overrides the whole
+   set for a frame when the caption reads one way and the picture another. */
+function deriveTags(e) {
+    if (!e) return null;
+    const t = new Set,
+        n = (e.subject || "") + " " + (e.detail || ""),
+        a = e.light || "",
+        o = e.category;
+    return ("text" === o || "sign" === o) && t.add("type"),
+        e.sky && t.add("sky"),
+        "food" === o && t.add("food"),
+        "vehicle" === o && t.add("vehicle"),
+        ("room" === o || /interior|indoor|gallery|shop light|strip|fluoresc|kitchen|bathroom|workshop|studio/i.test(a)) && t.add("interior"),
+        ("person" === o || e.people && "none" !== e.people) && t.add("body"),
+        e.hands && t.add("hand"),
+        /toilet|urinal|bathroom|\bsink\b|\bwc\b|bidet/i.test(n) && t.add("bathroom"),
+        ("light" === o || /\blamp\b|lantern|pendant|chandelier|light fitting|street light|neon/i.test(n)) && t.add("light-fixture"),
+        /stair|escalator|\bsteps\b|\bladder\b/i.test(n) && t.add("stairs"),
+        /church|chapel|virgin|madonna|shrine|angel|\bcross\b|cathedral|altar|icon\b/i.test(n) && t.add("sacred"),
+        ("build" === o || /street|pavement|shopfront|facade|hoarding|scaffold/i.test(n)) && t.add("street"),
+        "object" === o && t.add("object"),
+        t
+}
+
+function tagsFor(e, t) {
+    const n = IMAGE_TAGS[e];
+    return n ? new Set(n) : deriveTags(t)
+}
+
+/* The editorial layer over pairScore: hand bans and boosts by id, tag-pair
+   bans, family boosts, and the found-type penalty. Returns null for a banned
+   pair — the caller turns that into the same -10 a rejected pair gets. */
+function editorialTerm(srcA, srcB, capA, capB) {
+    let e = 0;
+    if (srcA && srcB) {
+        const t = [srcToId(srcA), srcToId(srcB)].sort().join("|");
+        if (PAIR_BAN.has(t)) return null;
+        PAIR_BOOST_SET.has(t) && (e += PAIR_BOOST_BONUS)
+    }
+    const t = tagsFor(srcA && srcToId(srcA), capA),
+        n = tagsFor(srcB && srcToId(srcB), capB);
+    if (!t || !n) return e;
+    for (const [a, o] of BAN_TAG_PAIRS.map(e2 => e2))
+        if (t.has(a) && n.has(o) || t.has(o) && n.has(a)) return null;
+    for (const [a, o, i] of BOOST_TAG_PAIRS)(t.has(a) && n.has(o) || t.has(o) && n.has(a)) && (e += i);
+    if (t.has("type") && n.has("type") && capA && capB) {
+        const a = textWords(capA.text),
+            o = textWords(capB.text),
+            i = textOpposed(a, o) || textKey(capA.text) && textKey(capA.text) === textKey(capB.text) || [...a].some(e2 => o.has(e2));
+        i || (e -= TYPE_TYPE_PENALTY)
+    }
+    return e
+}
+
+function captionScore(e, t, n, a) {
+    if (!n || !a) return 0;
+    let o = formRhyme(e, t, n, a);
+    const tA = textKey(n.text),
+        tB = textKey(a.text);
+    if (tA && tB) {
+        const wA = textWords(n.text),
+            wB = textWords(a.text),
+            shared = [...wA].some(e => wB.has(e));
+        if (textOpposed(wA, wB)) o += TEXT_OPPOSITION_BONUS;
+        else if (tA === tB) {
+            /* The same words twice. Duplication when the two frames are alike,
+               a rhyme when they are not: EUROPA on a drying t-shirt and EUROPA
+               worn on a chest is the second case, and the earlier flat penalty
+               was suppressing exactly the pair worth finding. */
+            const ctx = captionContextDistance(e, t, n, a);
+            o += ctx >= RHYME_CONTEXT_MIN ? TEXT_ECHO_BONUS * Math.min(1, (ctx - RHYME_CONTEXT_MIN) / Math.max(.01, RHYME_CONTEXT_FULL - RHYME_CONTEXT_MIN)) : -TEXT_SAME_PENALTY * (1 - ctx / RHYME_CONTEXT_MIN)
+        } else o += shared ? TEXT_ECHO_BONUS : TEXT_PAIR_BONUS
+    }
+    const sA = SCALE_RANK[n.scale],
+        sB = SCALE_RANK[a.scale];
+    if (void 0 !== sA && void 0 !== sB) {
+        const e = Math.abs(sA - sB);
+        o += SCALE_JUMP_BONUS * (e >= 3 ? 1 : 2 === e ? .5 : 0)
+    }
+    /* Judged on the hands flag, not the people field: a painting whose people
+       value is "figure" can still be a photograph of hands. */
+    if (n.hands && a.hands) o += HANDS_ECHO_BONUS;
+    /* Same construction, different thing. Requires different subjects, or two
+       photographs of the same tiled wall would score as a rhyme. */
+    if (n.structure && n.structure === a.structure && (n.short || "").toLowerCase() !== (a.short || "").toLowerCase()) o += STRUCTURE_ECHO_BONUS;
+    if (n.accent && n.accent === a.accent && (n.short || "").toLowerCase() !== (a.short || "").toLowerCase()) o += ACCENT_ECHO_BONUS;
+    /* Agreement on the visual block. Each field pays only when both frames
+       carry it, so a frame annotated later never loses by comparison with one
+       annotated earlier. */
+    n.shape && n.shape === a.shape && "rectangle" !== n.shape && (o += SHAPE_MATCH);
+    n.depth && a.depth && n.depth === a.depth && (o += DEPTH_MATCH);
+    n.dense && a.dense && n.dense === a.dense && (o += DENSE_MATCH);
+    n.people && a.people && n.people === a.people && (o += PEOPLE_MATCH);
+    n.temp && a.temp && n.temp === a.temp && (o += TEMP_MATCH);
+    n.mood && a.mood && n.mood === a.mood && (o += MOOD_MATCH);
+    if (n.people && a.people && "unclear" !== n.people && "unclear" !== a.people) {
+        const e = n.people,
+            t = a.people;
+        e === t && "none" !== e ? o += "figure" === e || "crowd" === e ? -PEOPLE_CROWDING_PENALTY : PEOPLE_ECHO_BONUS : "none" !== e && "none" !== t && ("figure" === e || "crowd" === e) && ("figure" === t || "crowd" === t) && (o -= PEOPLE_CROWDING_PENALTY)
+    }
+    const i = captionNoun(n),
+        r = captionNoun(a);
+    if (i && i === r) {
+        /* Same subject twice. An identical full subject line ("the PALACE
+           building sign" both sides) needs more separation before it reads as
+           deliberate, so the threshold moves up. */
+        const s = captionSubject(n) === captionSubject(a),
+            l = captionContextDistance(e, t, n, a),
+            c = s ? RHYME_CONTEXT_MIN + .1 : RHYME_CONTEXT_MIN;
+        o += l < c ? -COLLISION_PENALTY * (1 - l / c) : RHYME_BONUS * Math.min(1, (l - c) / Math.max(.01, RHYME_CONTEXT_FULL - c))
+    }
+    const s = DISTANCE_RANK[n.distance],
+        l = DISTANCE_RANK[a.distance];
+    if (void 0 !== s && void 0 !== l) {
+        const e = Math.abs(s - l);
+        o += DISTANCE_BONUS * (2 === e ? 1 : 1 === e ? .35 : 0)
+    }
+    return o + LINE_BONUS * linePlay(n.lines, a.lines)
+}
+
+function pairScore(e, t, n_capA, n_capB, srcA, srcB) {
+    if (!e || !t) return 0;
+    /* The editorial layer first: a banned pair is out whatever its colours. */
+    const edTerm = editorialTerm(srcA, srcB, n_capA, n_capB);
+    if (null === edTerm) return -10;
+    let n = 0;
+    for (let a = 0; a < 7; a++) n += e.histogram[a] * t.histogram[a];
+    const a = e.histMag && t.histMag ? n / (e.histMag * t.histMag) : 0,
+        o = (e, t) => {
+            let n = 0;
+            for (const a of e) {
+                let e = 0;
+                for (const n of t) {
+                    const t = colorSimilarity(a, n);
+                    t > e && (e = t)
+                }
+                n += e * a.weight
+            }
+            return n
+        },
+        i = 1 - (o(e.palette, t.palette) + o(t.palette, e.palette)) / 2;
+    /* The palette-contrast floor exists to throw out pairs whose colours sit too
+       close to hold any tension. It ran before the caption terms, so a pair the
+       captions had a strong reason for — words that answer each other, the same
+       object seen elsewhere — was discarded before that reason was ever
+       considered. CLOSED against OPEN 7 DAYS sat at #3690 of 27,261 for exactly
+       this reason.
+
+       A caption reason above WORD_OVERRIDE now survives the floor. It still
+       pays for the weak contrast, so it has to be a genuinely strong reason to
+       come out ahead; ordinary pairs are rejected as before. */
+    const capScore = captionScore(e, t, n_capA, n_capB);
+    if (i < MIN_PALETTE_CONTRAST) return capScore >= WORD_OVERRIDE ? capScore - WEAK_CONTRAST_COST + edTerm : -10;
+    const r = Math.pow(i, 2),
+        s = Math.abs(e.density - t.density),
+        l = Math.abs(e.meanL - t.meanL),
+        c = 1 - Math.abs(e.avgSat - t.avgSat),
+        d = dominantRepetition(e, t),
+        h = Math.max(e.avgSat, t.avgSat),
+        u = Math.max(0, 1 - h / .3),
+        m = Math.min(e.density, t.density),
+        g = Math.max(0, (m - .55) / (1 - .55)),
+        p = Math.max(e.density, t.density),
+        f = Math.max(0, (.35 - p) / .35),
+        y = e.isFallback || t.isFallback ? .4 : 0;
+    const total = .05 * a + .38 * r + i * s * .28 + .17 * l + .05 * c + .08 * Math.min(1, Math.abs(e.edgeEnergy - t.edgeEnergy) / .25) + .08 * (Math.abs(e.vertical - t.vertical) / 2) + .05 * Math.max(0, 1 - Math.abs(e.cy - t.cy) / .25) - 1.1 * d - .5 * u - .45 * g - .3 * f - y + capScore + edTerm;
+    /* Two clashes override everything else. A flat picture-plane beside a deep
+       receding one, or an empty frame beside a crowded one, reads as two
+       different kinds of picture however much the subjects agree — so the pair
+       is capped rather than merely penalised. */
+    const depthClash = n_capA && n_capB && ("flat" === n_capA.depth && "deep" === n_capB.depth || "deep" === n_capA.depth && "flat" === n_capB.depth),
+        peopleClash = n_capA && n_capB && ("none" === n_capA.people && "many" === n_capB.people || "many" === n_capA.people && "none" === n_capB.people);
+    return depthClash || peopleClash ? Math.min(total, CLASH_CAP * .8) : total
+}
+
+/* The exact number of distinct diptychs pickPair can reach: the top 500 of
+   the score-sorted list, plus every item's five best partners. Same definition
+   build-pool.mjs uses, but measured here from the live data, so it stays true
+   for a catalogue the build never saw. Cheap — a walk over at most 500 + 5n
+   entries, run once after scoring. */
+function countReachablePairs() {
+    if (!topPairs.length) return 0;
+    const e = new Set;
+    /* TOP_PAIRS_POOL, not a hardcoded 500. The opening pool was widened to 800
+       and this was left behind, so whenever the runtime had to compute the
+       figure itself it counted a pool narrower than the one it actually draws
+       from — and reported a number far below the truth. */
+    for (let t = 0, n = Math.min(TOP_PAIRS_POOL, topPairs.length); t < n; t++) e.add(topPairs[t].a + "|" + topPairs[t].b);
+    for (const [, t] of bestsPerImage)
+        for (const n of t) e.add(n.a + "|" + n.b);
+    return e.size
+}
+
+/* What build-pool.mjs used to write into index.html, computed here from the
+   live catalogue with the same scoring the site runs on.
+
+     pairs    the top 500 photo-only pairs, best first ("7,31 108,148 ...")
+     bests    each photo's five best photo partners, best first
+     aspects  each photo's width / height, to three places
+     fav      FAVORITE_IMAGES
+     count    the reachable total shown on the splash (countReachablePairs)
+     n,items  every photo and clip in the catalogue
+
+   Videos are left out of pairs and bests because the opening pair is always two
+   photographs. Checked against the last build: same pairs in the same order,
+   same five partners for all 216 photos. */
+const POOL_PAIRS = 500;
+
+function buildPoolData() {
     computeTopPairs();
-  });
-}
-
-/* ─────────────────────────────────────────────────────────────────────────
-   SHAREABLE URL HASH
-   ───────────────────────────────────────────────────────────────────────── */
-
-function pairToHash(p) { return '#' + p.map(srcToId).join(','); }
-/* The hash → pair conversion is inlined at the start() IIFE rather
-   than as a helper, because it needs custom error handling for the
-   isReload-vs-fresh-entry case. No separate hashToPair() is exposed. */
-
-/* ─────────────────────────────────────────────────────────────────────────
-   IMAGE LOADING & SWAPPING
-   ───────────────────────────────────────────────────────────────────────── */
-
-/* Staleness — how many clicks since an image last appeared. Never-shown
-   images return a large constant so they dominate any weighted selection
-   until they've appeared at least once. The picker uses this to weight
-   the guarantee branch toward images that haven't surfaced recently. */
-function staleness(src) {
-  const last = lastShown.get(src);
-  return last === undefined ? clickCount + 1000 : clickCount - last;
-}
-
-/* Recent-block check. An image is considered "recent" if its last
-   marking was within RECENT_CLICKS_BLOCK clicks. Map-based lookup
-   replaces the previous array+slice approach so adding siblings to
-   the block doesn't shrink the effective window (each sibling-push
-   used to trim older entries early, making the block window expire
-   faster on clicks that happened to involve grouped images). */
-function isRecent(src) {
-  const last = recent.get(src);
-  return last !== undefined && (clickCount - last) < RECENT_CLICKS_BLOCK;
-}
-
-/* Mark a pair as just-shown — and propagate the block to every
-   sibling declared in SIBLING_GROUPS. Without sibling propagation,
-   near-duplicates like ff97/ff98 (same shoot, near-identical
-   colour signature) could appear in adjacent clicks because the
-   scorer sees them as independent images. */
-function markPairRecent(pair) {
-  for (const src of pair) {
-    recent.set(src, clickCount);
-    const sibs = SIBLINGS.get(src);
-    if (sibs) for (const s of sibs) recent.set(s, clickCount);
-  }
-}
-
-/* Weighted random pick from a list. Each item's chance of selection is
-   proportional to weightFn(item). Falls back to uniform if all weights
-   are zero (defensive). Used by the guarantee branch to favor rarely-
-   shown images, but generic enough to reuse elsewhere if needed. */
-function weightedPick(items, weightFn) {
-  let total = 0;
-  const weights = new Array(items.length);
-  for (let i = 0; i < items.length; i++) {
-    weights[i] = Math.max(0, weightFn(items[i]));
-    total += weights[i];
-  }
-  if (total === 0) return items[Math.floor(Math.random() * items.length)];
-  let r = Math.random() * total;
-  for (let i = 0; i < items.length; i++) {
-    r -= weights[i];
-    if (r <= 0) return items[i];
-  }
-  return items[items.length - 1];
-}
-
-function pickPair(arr, opts) {
-  /* allowVideos defaults to true so existing call-sites keep their
-     behaviour. The first-pair caller in start() passes false because
-     videos aren't preloaded by the splash and a video pick would
-     leave the consent card waiting on a fresh MP4 fetch (2-4s on
-     decent connections). Affects BOTH the guarantee branch and the
-     main top-N draw — previously only the `arr` argument was filtered,
-     and pickPair ignored that for everything except the random
-     fallback below, so the safety claimed by the call-site was never
-     actually realised. */
-  const allowVideos = !opts || opts.allowVideos !== false;
-
-  if (topPairs.length === 0) {
-    const pool = allowVideos ? arr : arr.filter(s => !isVideo(s));
-    const src  = pool.length ? pool : arr;
-    const i = Math.floor(Math.random() * src.length);
-    let   j = Math.floor(Math.random() * src.length);
-    while (j === i && src.length > 1) j = Math.floor(Math.random() * src.length);
-    return [src[i], src[j]];
-  }
-
-  /* Per-image guarantee draw. With GUARANTEE_RATE probability, pick
-     via bestsPerImage — each image's top BESTS_PER_IMAGE highest-
-     scoring pairings, with weighted selection by staleness of the
-     source image. Previously this branch used `imageBests` (one
-     row per image, that image's single highest-scoring pair). The
-     failure mode was: a modest-score image's single best partner
-     was often a globally-popular image, which appeared often in
-     recent[]; the filter then removed the modest image's only row,
-     and since its global rank was below TOP_PAIRS_POOL, it didn't
-     appear in the main pool either — silently starved across
-     sessions. With K=5 best partners per image, we'd need recent[]
-     to be blocking all five before the image vanishes from the
-     guarantee pool. */
-  if (Math.random() < GUARANTEE_RATE && bestsPerImage.size > 0) {
-    /* Build per-image candidates: for each image not currently in
-       recent[], find its highest-scoring pair where neither side
-       is in recent[]. Iteration is over the Map's keys, so each
-       image contributes at most ONE candidate row, weighted by
-       that image's own staleness. When allowVideos is false (first
-       pair), the candidate must be photo-only on both sides AND
-       the source image itself must not be a video. */
-    const candidates = [];
-    for (const [src, pairList] of bestsPerImage) {
-      if (isRecent(src)) continue;
-      if (!allowVideos && isVideo(src)) continue;
-      const avail = pairList.find(p =>
-        !isRecent(p.a) && !isRecent(p.b) &&
-        (allowVideos || (!isVideo(p.a) && !isVideo(p.b)))
-      );
-      if (avail) candidates.push({ src, pair: avail });
+    const e = e2 => srcToId(e2),
+        t = e2 => !isVideo(e2),
+        n = (a2, b2) => +a2 - +b2,
+        a = topPairs.filter(e2 => t(e2.a) && t(e2.b)),
+        o = [],
+        i = {};
+    for (let t2 = 0; t2 < a.length && o.length < POOL_PAIRS; t2++) o.push([e(a[t2].a), e(a[t2].b)].sort(n).join(","));
+    for (const t2 of a) {
+        if (t2.score <= MIN_SHOWN_SCORE) break;
+        for (const [n2, a2] of [[t2.a, t2.b], [t2.b, t2.a]]) {
+            const o2 = i[e(n2)] || (i[e(n2)] = []);
+            o2.length < 5 && o2.push(e(a2))
+        }
     }
-    if (candidates.length > 0) {
-      const gHasVideos = allowVideos && candidates.some(c => isVideo(c.pair.a) || isVideo(c.pair.b));
-      const gEligible  = clicksSinceVideo >= VIDEO_MIN_GAP;
-      const gWantVideo = gHasVideos && gEligible && Math.random() < VIDEO_RATE;
-      const gFiltered  = gWantVideo
-        ? candidates.filter(c =>  isVideo(c.pair.a) ||  isVideo(c.pair.b))
-        : candidates.filter(c => !isVideo(c.pair.a) && !isVideo(c.pair.b));
-      const gPool      = gFiltered.length > 0 ? gFiltered : candidates;
-      /* Weight by the source image's staleness — never-shown images
-         return very large staleness, so they dominate until they
-         surface, then normalize. Note: a pair (A,B) may appear as
-         a candidate twice (once with src=A, once with src=B) if
-         it's in both images' top K. That's intentional — pairs
-         where both sides are stale get effectively doubled weight.
-
-         Favorites get their staleness multiplied by FAVORITE_BOOST,
-         so listed images cycle back more often once their recent-
-         block window has cleared. See FAVORITE_IMAGES near the top
-         of this file. */
-      const chosen = weightedPick(gPool, c => {
-        const base = staleness(c.src);
-        const num  = srcToNum(c.src);
-        return (num && FAVORITE_IMAGES.has(num)) ? base * FAVORITE_BOOST : base;
-      });
-      const pair       = chosen.pair;
-      const drewVideo  = isVideo(pair.a) || isVideo(pair.b);
-      clicksSinceVideo = drewVideo ? 0 : clicksSinceVideo + 1;
-      return Math.random() < 0.5 ? [pair.a, pair.b] : [pair.b, pair.a];
+    const r = {},
+        s = {},
+        /* Excluded frames leave the built page entirely: not in the item
+           list, not preloaded, not counted on the splash. */
+        _live = validImages.filter(e2 => !EXCLUDE_IMAGES.has(srcToId(e2))),
+        l = _live.filter(t).map(e).sort(n),
+        c = _live.filter(isVideo).map(e).sort((a2, b2) => +a2.slice(1) - +b2.slice(1));
+    for (const e2 of l) {
+        i[e2] && (r[e2] = i[e2].join(" "));
+        const t2 = colorSignatures.get(numToSrc(e2));
+        t2 && t2.aspect > 0 && (s[e2] = Math.round(1e3 * t2.aspect) / 1e3)
     }
-    /* Every image's K best partners blocked by recent[] AND every
-       image itself in recent[]. Vanishingly rare. Falls through. */
-  }
-
-  /* Filter out pairs containing any image shown in the last
-     RECENT_CLICKS_BLOCK clicks. If that filter empties the pool
-     (e.g. early in the session when fewer images have loaded), fall
-     back to the full ranked list rather than getting stuck. */
-  let available = topPairs.filter(p => !isRecent(p.a) && !isRecent(p.b));
-  if (!allowVideos) {
-    available = available.filter(p => !isVideo(p.a) && !isVideo(p.b));
-  }
-  /* Fallback pool also respects allowVideos so a tiny early-session
-     pool doesn't smuggle a video into the first pair. Last-resort
-     fallback to unfiltered topPairs covers the pathological case
-     where !allowVideos but every pair in topPairs contains a video
-     (e.g. a catalogue with no photos discovered) — without this,
-     `pool` could end up empty and the final `finalPool[...]` access
-     would return undefined and crash on `chosen.a`. The allowVideos
-     contract is best-effort, not absolute: better to surface a video
-     pair than to crash. */
-  const fallback  = allowVideos ? topPairs : topPairs.filter(p => !isVideo(p.a) && !isVideo(p.b));
-  const pool      = available.length > 0
-    ? available
-    : (fallback.length > 0 ? fallback : topPairs);
-
-  /* Probabilistic video selection with a minimum-gap guard. The
-     gap check ensures videos never appear back-to-back; once past
-     the gap, VIDEO_RATE decides per click. Non-video clicks are
-     filtered to photo-only pairs so the rate is exact — without
-     this, videos could still slip in via the top-N pool. The
-     fallback to `pool` covers the (rare) case where filtering
-     leaves nothing, e.g. very early in the session. */
-  const hasVideos = allowVideos && pool.some(p => isVideo(p.a) || isVideo(p.b));
-  const eligible  = clicksSinceVideo >= VIDEO_MIN_GAP;
-  const wantVideo = hasVideos && eligible && Math.random() < VIDEO_RATE;
-  const drawPool  = wantVideo
-    ? pool.filter(p =>  isVideo(p.a) ||  isVideo(p.b))
-    : pool.filter(p => !isVideo(p.a) && !isVideo(p.b));
-  const finalPool = drawPool.length > 0 ? drawPool : pool;
-
-  /* Update the gap counter based on what we actually drew, not what
-     we wanted. If drawPool collapsed and we fell back to `pool`, the
-     chosen pair may or may not include a video — inspect it directly.
-     The previous version pre-computed this from `finalPool === drawPool
-     && wantVideo`, which read false in the fallback case even when a
-     video was actually selected, allowing VIDEO_MIN_GAP to be violated. */
-  const poolSize  = Math.min(TOP_PAIRS_POOL, finalPool.length);
-  /* Quality-biased pick: see QUALITY_BIAS_POWER constant declaration
-     near the top of this file for the full rationale and the math.
-     Briefly: raising Math.random() to a power > 1 concentrates picks
-     toward the top of the pool. At 1.5 (current), the top 10% gets
-     ~22% of picks and the top 50% gets ~63%; the bias favours the
-     top of the ranking without funnelling so hard that the same
-     handful of "front-runner" pairs dominate. */
-  const chosen    = finalPool[Math.floor(Math.random() ** QUALITY_BIAS_POWER * poolSize)];
-
-  const drewVideo  = isVideo(chosen.a) || isVideo(chosen.b);
-  clicksSinceVideo = drewVideo ? 0 : clicksSinceVideo + 1;
-
-  return Math.random() < 0.5 ? [chosen.a, chosen.b] : [chosen.b, chosen.a];
+    return {
+        v: 2,
+        pairs: o.join(" "),
+        bests: r,
+        aspects: s,
+        fav: [...FAVORITE_IMAGES].filter(e2 => "v" !== e2[0]).map(Number),
+        count: countReachablePairs(),
+        n: l.length + c.length,
+        items: l.concat(c).join(" ")
+    }
 }
 
-/* ─────────── PER-IMAGE LAYOUT ───────────
-   Positioning and sizing is done entirely in CSS — see the
-   `.panel .layer` / `.panel .layer img,video` rules in styles.css.
-   Each layer is a flex container that pins its image to the panel's
-   centerline edge (left panel: flex-end, right panel: flex-start);
-   the image itself is constrained by max-width:50vw and
-   max-height:50dvh, keeping its native aspect ratio via auto on
-   the unbound axis. The browser handles all viewport math on every
-   layout pass, including window resizes — no JS recompute needed,
-   and the centerline pin is guaranteed regardless of viewport state.
+/* Run in the browser console on the live site, once the first pair is up:
 
-   An earlier version of this file computed pixel sizes here and
-   wrote vw/dvh values to CSS custom properties on the layer. That
-   approach captured a snapshot of the viewport at load time and
-   couldn't update if the user resized the window between pair
-   loads — the percentages stayed valid but didn't reflect the
-   intended FIXED_SIZE_VH long-side. Replacing it with pure CSS
-   removed the bug class entirely. */
+     __buildPool()
 
-function preparePanel(panelEl, src, sizeVh) {
-  const layers = panelEl.querySelectorAll('.layer');
-  const active = panelEl.querySelector('.layer.loaded');
-  const back   = (active === layers[0]) ? layers[1] : layers[0];
-
-  /* CSS handles all layout — see styles.css panel/layer rules. The
-     only per-pair work needed here is letting the cross-fade know
-     which layer is incoming (handled by the .loaded class flip below).
-
-     We still stash the src on the layer's dataset for future use
-     (analytics, debugging, possible side-channel features); it's
-     cheap and no current code depends on it being absent. */
-  back.dataset.src = src;
-
-  if (isVideo(src)) {
-    /* Reuse a video element in the back layer if one's already there,
-       otherwise rebuild. The element gets `muted` + `playsinline` so
-       iOS won't go fullscreen and so autoplay isn't blocked. `autoplay`
-       attribute is belt-and-braces alongside the explicit play() call
-       — some iOS Safari versions prefer the attribute over the JS
-       call, others vice versa. Setting muted as both attribute AND
-       property defends against iOS quirks where the property can be
-       silently reset when src changes. */
-    let video = back.querySelector('video');
-    if (!video) {
-      back.innerHTML = '<video muted autoplay loop playsinline preload="auto"></video>';
-      video = back.querySelector('video');
+   Downloads index.html with the pool rebuilt — the live page with only the
+   line between the BUILD:pool markers replaced. Upload it in place of the old
+   one. Do this after adding photos, clips or captions: until then the site
+   sees a catalogue the pool does not describe and scores every pair before the
+   first one appears, on every visit. */
+/* The page with the pool rebuilt: the live index.html with only the line
+   between the BUILD:pool markers replaced, and the splash figures updated
+   alongside. Used by __buildPool() and by __addPhoto(). */
+async function buildIndexHtml() {
+    const t = buildPoolData(),
+        n = "/* BUILD:pool:START */window.__pool=" + JSON.stringify(t) + ";/* BUILD:pool:END */";
+    let a = null;
+    try {
+        a = await (await fetch(location.pathname.replace(/[^/]*$/, "") + "index.html", { cache: "no-store" })).text()
+    } catch {}
+    const o = !!a && /\/\* BUILD:pool:START \*\/[\s\S]*?\/\* BUILD:pool:END \*\//.test(a),
+        /* Captioned items missing from the pool: a file that failed to load in
+           this session is dropped from it, so a network hiccup would quietly
+           shrink the catalogue. Listed so it can be caught before upload. */
+        _in = new Set(t.items.split(" ")),
+        dropped = [...subjects.keys()].map(e2 => e2.replace(/^ff/, "")).filter(e2 => !_in.has(e2));
+    return {
+        ok: o,
+        pool: t,
+        dropped,
+        html: o ? a.replace(/\/\* BUILD:pool:START \*\/[\s\S]*?\/\* BUILD:pool:END \*\//, () => n).replace(/(<span class="subtitle" data-count=")\d+/, "$1" + t.count).replace(/(<span class="loading">0 \/ )\d+/, "$1" + t.count) : n
     }
-    /* Re-assert muted + playsinline state every time, because some
-       iOS versions reset these on src change. Cheap and harmless. */
-    video.muted       = true;
-    video.playsInline = true;
-    return new Promise(resolve => {
-      let settled = false;
-      const done = () => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        /* play() returns a Promise that rejects when autoplay is
-           blocked (iOS Low Power Mode, some Android battery saver
-           modes). Catch it explicitly — a sync try/catch wouldn't
-           catch the rejection. Resolved either way so the diptych
-           still appears, just with the first frame frozen until a
-           user gesture unblocks playback on the next click. */
-        video.play().catch(() => {});
-        resolve({ back, active });
-      };
-      /* Timeout safety net. If the video file is unreachable or
-         corrupt enough that loadeddata + error both never fire,
-         resolve anyway after VIDEO_DISPLAY_TIMEOUT_MS so the
-         gallery stays responsive. */
-      const timer = setTimeout(() => {
-        if (!settled) console.warn('Diptych: video load timeout', src);
-        done();
-      }, VIDEO_DISPLAY_TIMEOUT_MS);
-      video.addEventListener('loadeddata', done, { once: true });
-      video.addEventListener('error',      done, { once: true });
-      video.src = src;
-      video.load();
+}
+
+function downloadBlob(e, t) {
+    const n = document.createElement("a");
+    n.href = URL.createObjectURL(t), n.download = e, document.body.appendChild(n), n.click(), n.remove(), setTimeout(() => URL.revokeObjectURL(n.href), 5e3)
+}
+
+window.__buildPool = async function() {
+    const e = [...colorSignatures].filter(([e2, t2]) => !isVideo(e2) && (!t2 || t2.isFallback)).map(([e2]) => srcToId(e2));
+    e.length && console.warn("Diptych: no colour data yet for " + e.join(", ") + " — they will be missing from the pool. Wait for them, or add them to captions.json.");
+    const { ok: t, pool: n, html: a, dropped: o } = await buildIndexHtml();
+    o.length && console.warn("Diptych: left out of the pool because they didn't load in this session: " + o.join(", ") + ". Reload and run again if they should be there.");
+    downloadBlob(t ? "index.html" : "pool.txt", new Blob([a], { type: t ? "text/html" : "text/plain" }));
+    return (t ? "index.html downloaded" : "Could not read index.html — pool.txt downloaded; paste it over the BUILD:pool line") + ": " + n.n + " items, " + n.count.toLocaleString("en-GB") + " diptychs."
+};
+
+/* Adding a photograph, from the browser console:
+
+     __addPhoto()
+
+   Opens a panel over the site: choose a JPG, write the caption (or have Claude
+   write it), and it downloads one zip with every file that changes — the
+   image in all its sizes and formats, captions.json with the new entry, and
+   index.html with the pool rebuilt to include it. The work is in
+   tools/add-photo.js, loaded only when asked for. */
+window.__addPhoto = function() {
+    return import("./tools/add-photo.js?v=3").then(e => e.default({
+        analyzeImage,
+        buildIndexHtml,
+        downloadBlob,
+        knownKeys: () => [...subjects.keys()],
+        /* Puts the new photo into this session's catalogue, so the rebuilt
+           pool scores it against everything else. Nothing is uploaded. */
+        addToCatalogue(e2, t2, n2) {
+            const a2 = numToSrc(e2.replace(/^ff/, "")),
+                o2 = normalizeSignature(t2),
+                i2 = normalizeCaption(n2);
+            o2 && (n2.colour && (o2.colour = String(n2.colour).trim().toLowerCase()), !1 === n2.loud && (o2.notLoud = !0), !0 === n2.mono && (o2.mono = !0), colorSignatures.set(a2, o2));
+            i2 && subjects.set(e2, i2);
+            validImages.includes(a2) || validImages.push(a2)
+        }
+    })).then(() => "Add-photo panel open.")
+};
+function computeTopPairs() {
+    /* Whoever calls this, a queued run is now redundant: it would score the
+       same data again. */
+    topPairsPending && (cancelAnimationFrame(topPairsPending), topPairsPending = 0), topPairsLastRun = performance.now();
+    if (validImages.length < 2) return topPairs = [], imageBests = [], void(bestsPerImage = new Map);
+    const _st = performance.now();
+    const e = validImages.filter(e => colorSignatures.has(e) && !EXCLUDE_IMAGES.has(srcToId(e))),
+        t = [];
+    for (let n = 0; n < e.length; n++)
+        for (let a = n + 1; a < e.length; a++) t.push({
+            a: e[n],
+            b: e[a],
+            score: pairScore(colorSignatures.get(e[n]), colorSignatures.get(e[a]), subjectFor(e[n]), subjectFor(e[a]), e[n], e[a])
+        });
+    t.sort((e, t) => t.score - e.score), topPairs = t;
+    bestsPerImage = new Map;
+    /* Every photograph is guaranteed partners so that none is unreachable, but
+       the guarantee was filling those slots with whatever scored highest for
+       that frame — including pairs pairScore had rejected outright at -10.
+       Twenty-four such pairs were in the shown set, and they pulled its mean
+       score from .31 down to .08. Rejected means rejected: a frame with fewer
+       than five viable partners simply gets fewer. */
+    for (const e of t) {
+        if (e.score <= MIN_SHOWN_SCORE) break;
+        for (const t of [e.a, e.b]) {
+            const n = colorSignatures.get(t);
+            if (n && n.isFallback) continue;
+            const a = bestsPerImage.get(t);
+            a ? a.length < 5 && a.push(e) : bestsPerImage.set(t, [e])
+        }
+    }
+    const n = new Set,
+        a = [];
+    for (const o of t)
+        if (n.has(o.a) && n.has(o.b) || (a.push(o), n.add(o.a), n.add(o.b)), n.size >= e.length) break;
+    /* Pairs that are each other's first choice out of the whole catalogue —
+       the one thing about a diptych no eye could arrive at, since it depends
+       on every photograph the visitor has not been shown. Keyed both ways
+       round so either order finds it. */
+    mutualBests = new Set;
+    for (const [e2, t2] of bestsPerImage) {
+        const n2 = t2[0] && (t2[0].a === e2 ? t2[0].b : t2[0].a);
+        if (!n2) continue;
+        const a2 = bestsPerImage.get(n2),
+            o2 = a2 && a2[0] && (a2[0].a === n2 ? a2[0].b : a2[0].a);
+        o2 === e2 && mutualBests.add(e2 + "|" + n2)
+    }
+    imageBests = a, window.__topPairs = topPairs, window.__score = (e2, t2) => {
+        const n2 = numToSrc(String(e2).replace(/^ff/, "")),
+            a2 = numToSrc(String(t2).replace(/^ff/, ""));
+        return pairScore(colorSignatures.get(n2), colorSignatures.get(a2), subjectFor(n2), subjectFor(a2), n2, a2)
+    }, window.__imageBests = imageBests, window.__bestsPerImage = bestsPerImage, window.__colorSignatures = colorSignatures, window.__pairScore = pairScore;
+    bootMark("scored"), DEBUG && console.log("Diptych: scored " + t.length + " pairs in " + Math.round(performance.now() - _st) + "ms")
+}
+const TOP_PAIRS_MIN_INTERVAL_MS = 350;
+let topPairsPending = 0,
+    topPairsLastRun = 0,
+    /* True while the opening pair is loading with scoring deferred. Scoring
+       every pair blocks the main thread, and when the opening pair is already
+       known nothing needs it until the pair after — so queued runs wait for
+       the first swap instead of landing in front of it. */
+    bootHold = !1;
+
+function scheduleTopPairs(u) {
+    if (topPairsPending) return;
+    const e = () => {
+        const t = u ? 350 : Math.max(350, colorSignatures.size * colorSignatures.size / 10);
+        bootHold || performance.now() - topPairsLastRun < t ? topPairsPending = requestAnimationFrame(e) : (topPairsPending = 0, topPairsLastRun = performance.now(), computeTopPairs())
+    };
+    topPairsPending = requestAnimationFrame(e)
+}
+
+function pairToHash(e) {
+    return "#" + e.map(srcToId).join(",")
+}
+
+function staleness(e) {
+    const t = lastShown.get(e);
+    return void 0 === t ? clickCount + 1e3 : clickCount - t
+}
+
+function isRecent(e) {
+    const t = recent.get(e);
+    /* The window was written as a literal here, so RECENT_CLICKS_BLOCK above
+       had no effect on it. Both now read the same constant.
+
+       clickCount - t is guarded against going negative: the rotation cache
+       restores `recent` and `clickCount` together, but a cache written by an
+       older build, or one hand-edited, could leave timestamps ahead of the
+       counter — which would mark an image recent forever. */
+    if (void 0 === t) return !1;
+    const n = clickCount - t;
+    return n >= 0 && n < RECENT_CLICKS_BLOCK
+}
+
+function markPairRecent(e) {
+    for (const t of e) {
+        recent.set(t, clickCount);
+        const e = SIBLINGS.get(t);
+        if (e)
+            for (const t of e) recent.set(t, clickCount)
+    }
+}
+
+function weightedPick(e, t) {
+    let n = 0;
+    const a = new Array(e.length);
+    for (let o = 0; o < e.length; o++) a[o] = Math.max(0, t(e[o])), n += a[o];
+    if (0 === n) return e[Math.floor(Math.random() * e.length)];
+    let o = Math.random() * n;
+    for (let t = 0; t < e.length; t++)
+        if (o -= a[t], o <= 0) return e[t];
+    return e[e.length - 1]
+}
+const VIDEO_RATE_EARLY = .6,
+    VIDEO_EARLY_CLICKS = 10;
+
+function videoRateNow() {
+    return clickCount < VIDEO_EARLY_CLICKS ? VIDEO_RATE_EARLY : VIDEO_RATE
+}
+
+function pickPair(e, t) {
+    0 === topPairs.length && computeTopPairs();
+    const n = !t || !1 !== t.allowVideos;
+    if (0 === topPairs.length) {
+        const t = (n ? e : e.filter(e => !isVideo(e))).filter(e => !EXCLUDE_IMAGES.has(srcToId(e))),
+            a = t.length ? t : e,
+            o = Math.floor(Math.random() * a.length);
+        let i = Math.floor(Math.random() * a.length);
+        for (; i === o && a.length > 1;) i = Math.floor(Math.random() * a.length);
+        return [a[o], a[i]]
+    }
+    if (Math.random() < .5 && bestsPerImage.size > 0) {
+        const e = [];
+        for (const [t, a] of bestsPerImage) {
+            if (isRecent(t)) continue;
+            if (!n && isVideo(t)) continue;
+            const o = a.find(e => !isRecent(e.a) && !isRecent(e.b) && (n || !isVideo(e.a) && !isVideo(e.b)));
+            o && e.push({
+                src: t,
+                pair: o
+            })
+        }
+        if (e.length > 0) {
+            const t = n && e.some(e => isVideo(e.pair.a) || isVideo(e.pair.b)) && clicksSinceVideo >= 1 && Math.random() < videoRateNow() ? e.filter(e => isVideo(e.pair.a) || isVideo(e.pair.b)) : e.filter(e => !isVideo(e.pair.a) && !isVideo(e.pair.b)),
+                a = weightedPick(t.length > 0 ? t : e, e => {
+                    const t = staleness(e.src),
+                        n = srcToId(e.src);
+                    return n && FAVORITE_IMAGES.has(n) ? 2.5 * t : t
+                }).pair,
+                o = isVideo(a.a) || isVideo(a.b);
+            return clicksSinceVideo = o ? 0 : clicksSinceVideo + 1, Math.random() < .5 ? [a.a, a.b] : [a.b, a.a]
+        }
+    }
+    let a = topPairs.filter(e => !isRecent(e.a) && !isRecent(e.b));
+    n || (a = a.filter(e => !isVideo(e.a) && !isVideo(e.b)));
+    const o = n ? topPairs : topPairs.filter(e => !isVideo(e.a) && !isVideo(e.b)),
+        i = a.length > 0 ? a : o.length > 0 ? o : topPairs,
+        r = n && i.some(e => isVideo(e.a) || isVideo(e.b)) && clicksSinceVideo >= 1 && Math.random() < videoRateNow() ? i.filter(e => isVideo(e.a) || isVideo(e.b)) : i.filter(e => !isVideo(e.a) && !isVideo(e.b)),
+        s = r.length > 0 ? r : i,
+        l = Math.min(500, s.length),
+        c = s[Math.floor(Math.random() ** 1.2 * l)],
+        d = isVideo(c.a) || isVideo(c.b);
+    return clicksSinceVideo = d ? 0 : clicksSinceVideo + 1, Math.random() < .5 ? [c.a, c.b] : [c.b, c.a]
+}
+
+function preparePanel(e, t, n) {
+    const a = !n || !1 !== n.autoplay,
+        o = e.querySelectorAll(".layer"),
+        i = e.querySelector(".layer.loaded"),
+        r = i === o[0] ? o[1] : o[0];
+    /* Take the back layer to zero opacity INSTANTLY before writing anything
+       into it.
+
+       Every previous attempt at the blip was about ordering — wait for the
+       fade, wait for the prep — and each one narrowed the window without
+       closing it. The window exists because a layer that has just lost .loaded
+       is still animating 1 -> 0 for the length of the fade-out, and anything
+       painted into it during that animation is visible on the way down. That is
+       the pair two clicks away.
+
+       Killing the transition and forcing opacity 0, then flushing layout, means
+       the layer is already invisible at the moment its src changes. There is no
+       window left for a new image to be seen in. The inline styles are cleared
+       again in loadDiptych, just before .loaded goes back on. */
+    r.style.transition = "none", r.classList.remove("loaded"), r.style.opacity = "0", r.offsetHeight;
+    /* If anything below throws, this layer must not be left hidden. */
+    const _restore = () => {
+        r.style.transition = "", r.style.opacity = ""
+    };
+    if (r.dataset.src = t, isVideo(t)) {
+        /* Always build a fresh <video>. Reusing the previous element and only
+           changing src is the same Safari trap as mutating <picture>: the
+           element keeps the old frame (or no frame) and the why panel / hash
+           move on without it.
+
+           Do not play() while this layer is still opacity 0. Safari will
+           accept the call, paint one frame, then stall — which is why a
+           shared #v22,125 pair shows a still photograph of the clip. Playback
+           starts in startVisibleVideos() after .loaded is applied. */
+        r.innerHTML = a
+            ? '<video muted autoplay loop playsinline webkit-playsinline preload="auto"></video>'
+            : '<video muted loop playsinline webkit-playsinline preload="auto"></video>';
+        const e = r.querySelector("video");
+        e.muted = !0;
+        e.playsInline = !0;
+        e.setAttribute("playsinline", "");
+        e.setAttribute("webkit-playsinline", "");
+        e.setAttribute("poster", videoPosterUrl(t));
+        return new Promise(n => {
+            let o = !1;
+            const s = () => {
+                    if (o) return;
+                    o = !0, clearTimeout(l);
+                    const c = e.readyState >= 2;
+                    c || _restore(), n({
+                        back: r,
+                        active: i,
+                        ok: c
+                    })
+                },
+                l = setTimeout(() => {
+                    o || console.warn("Diptych: video load timeout", t), s()
+                }, 8e3);
+            e.addEventListener("loadeddata", s, { once: !0 });
+            e.addEventListener("error", s, { once: !0 });
+            e.src = t;
+            e.load();
+        })
+    }
+    /* Build a fresh <picture> for every frame instead of reusing the one that
+       is already there.
+
+       Safari resolves a <picture> once and does not re-run the selection when
+       srcset is changed on the existing <source> and <img>. So the code set the
+       new srcset, the img kept the picture it had already chosen, and
+       naturalWidth still reported a perfectly good image — the previous one.
+       Everything downstream then agreed the swap had happened: the log said
+       ready, the address bar advanced, the why panel followed. Only the
+       photographs stayed where they were.
+
+       Chromium re-resolves on mutation, which is why Brave was fine and Safari
+       stuck. A new element has nothing cached to keep. */
+    {
+        const e = r.querySelector("video");
+        if (e) try {
+            e.pause(), e.removeAttribute("src"), e.load()
+        } catch {}
+    }
+    /* A plain <img srcset>, not a <picture>.
+
+       <picture> is what Safari would not re-resolve, and the self-check added in
+       v144 was quietly repairing every single swap by hand — which is why it
+       became slow and why a frame lingered into the next pair. An <img> chooses
+       from its own srcset with no <source> elements involved, and a fresh one
+       has nothing to re-resolve. Format is decided here instead of by the
+       browser: AVIF when the probe says it is supported and nothing has failed
+       to decode yet, JPEG otherwise. */
+    r.innerHTML = '<img alt="" sizes="50vw">';
+    const l = srcToNum(t),
+        d = r.querySelector("img"),
+        c = {};
+    {
+        const _s = colorSignatures.get(t),
+            _r = _s && _s.aspect > 0 ? _s.aspect : .8,
+            /* 75, not 100: the stylesheet caps an image at --image-height (75dvh),
+               so that is the tallest it can render and therefore what should drive
+               the srcset choice. Change both together or the browser fetches a
+               larger rung than it can use. */
+            _z = "min(50vw, " + (IMAGE_VH * _r).toFixed(1) + "vh)";
+        d.setAttribute("fetchpriority", a ? "high" : "low"), d.sizes = _z, c.sizes = _z, d.width = 1e3, d.height = Math.round(1e3 / _r), d.onerror = () => {
+            const _i = validImages.indexOf(t);
+            _i >= 0 && (validImages.splice(_i, 1), scheduleTopPairs(!0))
+        }
+    }
+    const _fmt = AVIF_OK && FORMATS.includes("avif") ? "avif" : "jpg";
+    if (IS_SAFARI && SIZES.length) {
+        /* The width index.html already preloaded for this frame, if it did —
+           used as-is so the preload is the download, whatever the viewport has
+           done since. Otherwise the same calculation, fresh. */
+        const _sg = colorSignatures.get(t),
+            _pr = window.__preloadRung && window.__preloadRung[l];
+        _pr && delete window.__preloadRung[l];
+        d.removeAttribute("srcset"), d.src = path(l, "jpg", _pr || safariRung(_sg && _sg.aspect)), d.alt = altFor(l)
+    } else d.srcset = SIZES.length ? srcset(l, _fmt) : "", d.src = path(l, _fmt), d.alt = altFor(l);
+    {
+        const e = colorSignatures.get(t),
+            n = e && e.aspect > 0 ? e.aspect : .8;
+        d.width = 1e3, d.height = Math.round(1e3 / n)
+    }
+    const _ready = () => d.complete && d.naturalWidth > 0;
+    /* Safari often never settles HTMLImageElement.decode() on a newly created
+       <img>, even when load has fired and naturalWidth is already set. Racing
+       only decode() against 5s made every Safari swap wait the full timeout.
+       Wait for load OR decode OR a short cap, then inspect naturalWidth. */
+    const waitDecoded = (img, ms) => {
+        if (img.complete && img.naturalWidth > 0) return Promise.resolve(true);
+        return new Promise(resolve => {
+            let done = false;
+            const finish = ok => { if (!done) { done = true; resolve(!!ok); } };
+            img.addEventListener("load", () => finish(img.naturalWidth > 0), { once: true });
+            img.addEventListener("error", () => finish(false), { once: true });
+            if (typeof img.decode === "function") img.decode().then(() => finish(img.naturalWidth > 0)).catch(() => {});
+            setTimeout(() => finish(img.complete && img.naturalWidth > 0), ms);
+        });
+    };
+    const decodeMs = IS_SAFARI ? 1200 : IMAGE_DECODE_TIMEOUT_MS;
+    return waitDecoded(d, decodeMs).then(ok => {
+        if (ok || _ready()) return {
+            back: r,
+            active: i,
+            ok: !0
+        };
+        /* Drop AVIF for the rest of the session and try this frame again as
+           JPEG. Safari can accept an AVIF source, fail to decode it, and never
+           fall back on its own — the <picture> element only reties on a load
+           error, not on a decode that produces nothing. */
+        if (AVIF_OK) {
+            AVIF_OK = !1, console.warn("Diptych: AVIF failed to decode; falling back to JPEG for this session.");
+        }
+        /* Safari is already on its single JPEG: wait on it again rather than
+           handing it a srcset, which would start a different download. */
+        return IS_SAFARI && SIZES.length || (d.srcset = SIZES.length ? srcset(l, "jpg") : "", d.src = path(l, "jpg")), waitDecoded(d, decodeMs).then(() => {
+            const e = _ready();
+            return {
+                back: r,
+                active: i,
+                ok: e
+            }
+        })
+    })
+}
+/* Only one load may be in flight.
+
+   loadDiptych is called from several places — the opening pair, a shared hash,
+   an interlude's 800ms preload timer, the click handler — and it awaits a
+   decode in the middle. Two calls could therefore overlap: both wrote into the
+   same layers, and whichever finished LAST painted while the other had already
+   written its own pair into the address bar and into currentPairSrcs. On a fast
+   machine the decodes finished in call order and it never showed; in Safari
+   they did not, which is why the URL, the why panel and the pictures were three
+   different answers.
+
+   Each call takes a ticket. After every await it checks whether a later call
+   has started, and if so it abandons quietly — no swap, no address, nothing. */
+let loadTicket = 0,
+    loadPromise = null;
+
+/* Join the load already in flight rather than starting another.
+
+   The interlude's preload timer calls loadDiptych() with no argument, which
+   picks a fresh pair. If the opening load was still decoding, the ticket above
+   made it abandon — correctly, it had been superseded — but that meant the pair
+   on screen was the preload's while currentPairSrcs had never been set at all,
+   so the why panel fell back to reading the address bar and described something
+   else. The first pair you see is exactly when this shows. */
+function teardownVideo(v) {
+    if (!v) return;
+    try {
+        v.pause();
+        v.removeAttribute("autoplay");
+        v.removeAttribute("src");
+        v.removeAttribute("poster");
+        while (v.firstChild) v.removeChild(v.firstChild);
+        v.load();
+    } catch {}
+    try { v.remove(); } catch {}
+}
+
+function teardownLayerVideos(layer) {
+    if (!layer) return;
+    layer.querySelectorAll("video").forEach(teardownVideo);
+}
+
+function startVisibleVideos() {
+    /* Only the loaded layer may play. Any other video in the panel is a
+       leftover Safari compositor overlay — kill it rather than pause it. */
+    document.querySelectorAll(".panel").forEach(panel => {
+        panel.querySelectorAll(".layer:not(.loaded) video").forEach(teardownVideo);
     });
-  }
-
-  /* Image path — reuse the existing picture element if present,
-     otherwise rebuild it (the layer may currently hold a video). */
-  let picture = back.querySelector('picture');
-  if (!picture) {
-    /* If a video occupied this layer, stop its download / playback
-       before the markup is replaced. Without this, the previous video
-       can keep streaming bytes in the background while its DOM element
-       is destroyed, wasting bandwidth on slow connections. */
-    const oldVideo = back.querySelector('video');
-    if (oldVideo) {
-      try {
-        oldVideo.pause();
-        oldVideo.removeAttribute('src');
-        oldVideo.load();
-      } catch {}
-    }
-    back.innerHTML =
-      '<picture>' +
-        '<source type="image/avif" sizes="50vw">' +
-        '<img alt="" sizes="50vw">' +
-      '</picture>';
-    picture = back.querySelector('picture');
-  }
-
-  const num     = srcToNum(src);
-  const avifSrc = picture.querySelector('source[type="image/avif"]');
-  const img     = picture.querySelector('img');
-
-  avifSrc.srcset = FORMATS.includes('avif') ? srcset(num, 'avif') : '';
-  img.srcset     = SIZES.length ? srcset(num, 'jpg') : '';
-  img.src        = path(num, 'jpg');
-  img.alt        = altFor(num);
-
-  /* Race decode against a timeout — see IMAGE_DECODE_TIMEOUT_MS for
-     the reasoning. The image still appears whenever decode actually
-     finishes (img.src is set independently and the browser paints it
-     on the next frame regardless of whether we awaited the promise);
-     the race just ensures the surrounding load flow never wedges. */
-  return Promise.race([
-    img.decode().catch(() => {}),
-    new Promise(r => setTimeout(r, IMAGE_DECODE_TIMEOUT_MS)),
-  ]).then(() => ({ back, active }));
-}
-
-async function loadDiptych(forcedPair) {
-  if (validImages.length < 2) return;
-  const pair = forcedPair || pickPair(validImages);
-  /* Encode the current pair into the URL hash so the visible address
-     is always a shareable deep link to exactly what's on screen. The
-     init code reads this on entry, but ONLY when the navigation type
-     is something other than "reload" — see the navigation-type guard
-     in init. That lets:
-       - someone opening a shared link → see the pair (hash honoured)
-       - the user pressing refresh on their own session → see a fresh
-         random pair (hash ignored despite being in the URL)
-     which is the combination this site wants. */
-  history.replaceState(null, '', pairToHash(pair));
-
-  /* preparePanel doesn't need a size parameter — sizing is done in
-     CSS via max-width: 50vw / max-height: 50dvh on the image
-     element. Passing undefined keeps the function signature stable
-     for any other callers during the transition. */
-  const sides = await Promise.all([
-    preparePanel(document.querySelector('.panel.left'),  pair[0]),
-    preparePanel(document.querySelector('.panel.right'), pair[1])
-  ]);
-
-  requestAnimationFrame(() => {
-    sides.forEach(({ back, active }) => {
-      back.classList.add('loaded');
-      if (active && active !== back) {
-        active.classList.remove('loaded');
-        /* Pause any video in the layer that just became hidden so we
-           don't accumulate background playback as the user clicks
-           through. The video stays in the DOM ready to be reused on
-           its next turn. */
-        const oldVideo = active.querySelector('video');
-        if (oldVideo) { try { oldVideo.pause(); } catch {} }
-      }
+    const wanted = (currentPairSrcs || []).map(srcToId);
+    document.querySelectorAll(".panel .layer.loaded video").forEach(v => {
+        const id = srcToId(v.currentSrc || v.src || "");
+        if (wanted.length && id && wanted.indexOf(id) < 0) {
+            teardownVideo(v);
+            return;
+        }
+        v.muted = !0;
+        v.playsInline = !0;
+        v.setAttribute("playsinline", "");
+        v.setAttribute("webkit-playsinline", "");
+        if (!v.hasAttribute("autoplay")) v.setAttribute("autoplay", "");
+        const p = v.play();
+        if (p && p.catch) p.catch(() => {});
     });
-    /* Record the pair as "recently shown" only AFTER the swap commits.
-       Doing this earlier (before await) marked preloaded-but-hidden
-       interlude pairs as seen, thinning the candidate set unnecessarily.
-       markPairRecent also propagates the block to any declared siblings
-       (SIBLING_GROUPS). lastShown drives the staleness weighting in
-       the guarantee branch: the more clicks since an image last
-       appeared, the more likely the guarantee will pick a pair
-       containing it next time. */
-    markPairRecent(pair);
-    lastShown.set(pair[0], clickCount);
-    lastShown.set(pair[1], clickCount);
-  });
-
-  if (window.gaEnabled && typeof gtag !== 'undefined') {
-    gtag('event', 'diptych_view', { left: pair[0], right: pair[1] });
-  }
-
-  /* Prewarm video files that the picker is most likely to choose
-     next, so when the user clicks again the bytes are already in
-     the browser's HTTP cache and the <video src=...> transition is
-     near-instant instead of waiting on a full network round trip.
-
-     This addresses the laggy "click-then-wait-3-seconds" that
-     happens around pair 3-4 when a video is picked and its file
-     hasn't been touched since page load. Image-only pairs were
-     never slow because the splash preloads all images at boot.
-     This brings videos closer to that experience without paying
-     the full preload-all-videos cost upfront (which would balloon
-     the splash by 10-100×). */
-  prewarmLikelyVideos();
 }
 
-/* Prewarming uses hidden <video preload="auto"> elements rather than
-   fetch() because video files are streamed via HTTP Range requests
-   (the browser asks for byte ranges as it plays, not the whole file
-   upfront). A plain fetch() pulls the entire file as one response and
-   the browser's media cache doesn't always reuse those bytes for a
-   subsequent <video> request — different cache keys, different
-   semantics. A hidden <video> element with preload="auto", however,
-   issues exactly the same Range request pattern the live <video>
-   will, so the cache hit is guaranteed.
-
-   The hidden videos stay in the DOM throughout the session. Each
-   one is 1×1px, fully transparent, offscreen, muted, never plays —
-   so it costs essentially nothing to keep around. Memory cost is
-   bounded by the number of unique videos in the catalogue.
-
-   This also fixes the priority issue: <video preload="auto"> uses
-   the browser's default media-fetch priority (medium), which is
-   high enough to complete in a reasonable timeframe without
-   completely starving visible content. */
-const prewarmedVideos = new Map();  /* src → hidden <video> element */
-
-function warmVideoElement(src) {
-  if (prewarmedVideos.has(src)) return prewarmedVideos.get(src);
-  const v = document.createElement('video');
-  v.muted       = true;
-  v.playsInline = true;
-  v.preload     = 'auto';
-  v.setAttribute('aria-hidden', 'true');
-  /* Offscreen styling — same recipe as loadVideoForAnalysis above. */
-  v.style.cssText = 'position:fixed;left:-9999px;top:-9999px;width:1px;height:1px;opacity:0;pointer-events:none;';
-  v.src = src;
-  document.body.appendChild(v);
-  /* Force the browser to start fetching by calling load() — some
-     mobile browsers wait for a play() or interaction otherwise. */
-  try { v.load(); } catch {}
-  prewarmedVideos.set(src, v);
-  return v;
-}
-
-/* Called from the end of loadDiptych. Warms a small set of video
-   files that are likely to be picked next, biased toward stale
-   videos (which the picker prefers). Capped at PREWARM_BATCH per
-   call so we don't issue dozens of parallel media downloads, but
-   over a session of clicks the warm pool grows to cover most
-   videos in the catalogue. */
-const PREWARM_BATCH = 2;
-function prewarmLikelyVideos() {
-  const candidates = validImages.filter(src =>
-    isVideo(src) && !prewarmedVideos.has(src)
-  );
-  if (candidates.length === 0) return;
-
-  /* Staleness ranking — pick the videos least-recently shown, since
-     the picker's freshness weighting biases toward them. Videos
-     never shown have lastShown = undefined → treated as -Infinity =
-     highest priority. */
-  candidates.sort((a, b) => {
-    const lastA = lastShown.has(a) ? lastShown.get(a) : -Infinity;
-    const lastB = lastShown.has(b) ? lastShown.get(b) : -Infinity;
-    return lastA - lastB;
-  });
-
-  candidates.slice(0, PREWARM_BATCH).forEach(warmVideoElement);
-}
-
-/* Pre-splash priming. Right after the splash starts dismissing,
-   begin warming the FIRST few videos in the catalogue. This means
-   the first time a video pair is picked (typically pair 3-4 given
-   VIDEO_MIN_GAP), the bytes are already on the way down. Without
-   this, the very first video pick — which happens before any
-   prewarmLikelyVideos call can have run — was always slow.
-
-   Called from bootstrap after the splash dismisses. The order
-   doesn't matter (the picker will choose what it chooses), but
-   prioritising lower-numbered videos means analytics and tests
-   benefit from a predictable warming order. */
-function primeInitialVideoWarmup() {
-  const videos = validImages.filter(isVideo);
-  /* Warm up to PREWARM_INITIAL videos right out of the gate.
-     Higher than the per-click batch because we have a window of
-     several seconds before the user is likely to reach a video
-     pair, and parallel media downloads aren't as expensive as
-     they sound — most browsers cap concurrent connections per
-     origin at 6 and queue the rest. */
-  videos.slice(0, PREWARM_INITIAL).forEach(warmVideoElement);
-}
-const PREWARM_INITIAL = 6;
-
-/* Load an image or video for analysis. Images: tries each format in
-   FORMATS until one succeeds, so the browser fetches AVIF first
-   (matching what <picture> will serve to AVIF-capable browsers) and
-   falls back to JPG on error. Videos: routed to a separate path that
-   loads the file, seeks to ~25% in, and extracts a representative
-   frame to feed to analyzeImage. In both cases the src arg is the
-   canonical identifier used in validImages and colorSignatures. */
-function loadOne(src) {
-  if (isVideo(src)) {
-    /* Poster-first path: try `ff{n}-poster.jpg` next to the video.
-       If present, it's analysed exactly like an image — fast, reliable,
-       same colour algorithm. If absent (or fails to load), fall through
-       to runtime video frame extraction, which works on most desktops
-       but is unreliable on iOS Safari. If both fail, the video keeps
-       its neutral fallback signature from the bulk pre-registration in
-       start() and still appears in the rotation. */
-    return loadVideoPosterForAnalysis(src).then(ok =>
-      ok ? true : loadVideoForAnalysis(src)
-    );
-  }
-  return new Promise(resolve => {
-    const num = srcToNum(src);
-    let attemptIdx = 0;
-
-    const attempt = () => {
-      if (attemptIdx >= FORMATS.length) {
-        console.warn('Diptych: failed to load', src);
-        resolve(false);
-        return;
-      }
-      const format = FORMATS[attemptIdx++];
-      const img = new Image();
-      img.onload = () => {
-        if (!validImages.includes(src)) validImages.push(src);
-        const sig = analyzeImage(img);
-        if (sig) {
-          colorSignatures.set(src, sig);
-          scheduleTopPairs();
+/* ?debug only. For each swap: how long from the request to the pair being on
+   screen, whether it had been prepared in the background, and every file
+   fetched for each frame. Two widths listed for one frame means it was
+   downloaded twice. */
+function debugLoadReport(e, t, n) {
+    const a = {};
+    try {
+        for (const e of performance.getEntriesByType("resource")) {
+            const t = e.name.match(/images\/(jpg|avif|webp)\/ff(\d+)-(\d+)\./);
+            t && "256" !== t[3] && (a[t[2]] = a[t[2]] || []).push(t[3] + "." + t[1] + " " + Math.round(e.duration) + "ms")
         }
-        resolve(true);
-      };
-      img.onerror = () => attempt();
-      /* Use the variant this device will actually display, not the
-         smallest one. That makes a single fetch serve two purposes:
-         the analysis pass gets pixels for the colour histogram, and
-         the browser cache is warmed for when <picture> later renders
-         the same URL — so the splash's "loading" wait IS the display
-         preload. Falls back to the base path if SIZES is unset. */
-      img.src = SIZES.length ? path(num, format, pickDisplayVariant()) : path(num, format);
-    };
-
-    attempt();
-  });
+    } catch {}
+    const o = e.filter(e => !isVideo(e)).map(srcToNum);
+    1 === loadTicket && (bootMark("on screen"), console.log("Diptych startup, ms after navigation: " + Object.entries(BOOT_T).map(([e, t]) => e + " " + t).join(" → ") + (BOOT_T.scored ? "" : "  (scoring deferred until after the first pair)")));
+    console.log("Diptych timing: " + Math.round(performance.now() - t) + "ms " + (n ? "(prepared in background)" : "(loaded on demand)") + (1 === loadTicket ? ", first pair at " + Math.round(performance.now()) + "ms after navigation" : "") + " | " + o.map(e => "ff" + e + ": " + (a[e] ? a[e].join(", ") : "from cache")).join(" | ") + (o.some(e => a[e] && a[e].length > 1) ? "  <- DOWNLOADED TWICE" : ""))
 }
 
-/* Neutral fallback colour signature for videos that can't be analysed
-   (mostly iOS Safari, which refuses to load video data without user
-   gesture). Using a flat-uniform histogram and a mid-grey palette
-   means the pair scorer treats the video as neither strongly matching
-   nor strongly clashing with anything — pairing quality drops, but
-   the video appears in the rotation. Without this, videos that fail
-   analysis are silently dropped and never shown. Includes the same
-   cached scalars as analyzeImage's output (oklab, meanL, density,
-   histMag) so pairScore can read them uniformly. */
-function fallbackSignature() {
-  const histogram = new Array(HIST_BINS).fill(1 / HIST_BINS);
-  return {
-    histogram,
-    /* Mid-grey palette entry with both colour-space representations.
-       OKLab for rgb(128,128,128) is approximately (0.6, 0, 0) — a is
-       0 (no green-red tilt), b is 0 (no blue-yellow tilt), L sits in
-       the middle of the lightness range. Neutral against everything. */
-    palette:   [{
-      hsl:    { h: 0, s: 0, l: 0.5 },
-      oklab:  { L: 0.6, a: 0, b: 0 },
-      weight: 1,
-    }],
-    avgSat:    0.3,
-    meanL:     0.5,
-    density:   histogramDensity(histogram),
-    histMag:   histogramMagnitude(histogram),
-    /* Default to square (aspect=1) when we don't yet know the video's
-       real proportions. Once a poster image or runtime frame extraction
-       succeeds, the real signature replaces this one and carries the
-       actual aspect ratio. */
-    aspect:    1,
-    /* Marker read by pairScore. Any pair where one side is a fallback
-       signature gets FALLBACK_TRUST_PENALTY subtracted from its score
-       so it doesn't sneak into the top-N pool on accidental neutral-
-       neutral matching. The flag is cleared automatically when a real
-       signature replaces this one (via poster image or runtime video
-       frame extraction), since the replacement object doesn't carry
-       the flag. */
-    isFallback: true,
-  };
+function loadDiptychOnce() {
+    return loadPromise || loadDiptych()
+}
+async function loadDiptych(e) {
+    if (validImages.length < 2) return;
+    const _ticket = ++loadTicket,
+        _t0 = performance.now();
+    let t, n;
+    /* Let any prep in flight finish before touching the layers. Both write to
+       the same back layer, and whichever finished last used to win — which is
+       how the pair after next ended up on screen for a moment. Waiting costs
+       nothing the visitor can perceive: the prep is a decode that is already
+       most of the way done. */
+    if (prepPromise) try {
+        await prepPromise
+    } catch {}
+    if (_ticket !== loadTicket) return;
+    prepInflightId++;
+    const a = !e && preparedNext;
+    a ? (t = preparedNext.pair, n = preparedNext.sides, preparedNext = null) : (t = e || pickPair(validImages), preparedNext = null), a ? n.forEach(({
+        back: e
+    }) => {
+        const vid = e.querySelector("video");
+        if (vid) vid.setAttribute("autoplay", "");
+    }) : n = await Promise.all([preparePanel(document.querySelector(".panel.left"), t[0]), preparePanel(document.querySelector(".panel.right"), t[1])]).catch(e2 => {
+        /* A panel failed to load. Put every layer back to a state the visitor
+           can see and act on — never leave one hidden with the click dead —
+           then give up on this pair rather than on the session. */
+        document.querySelectorAll(".panel .layer").forEach(e3 => {
+            e3.style.transition = "", e3.style.opacity = ""
+        });
+        const e4 = document.querySelector(".panel.left .layer.loaded"),
+            t2 = document.querySelector(".panel.right .layer.loaded");
+        return e4 && t2 ? null : (document.querySelectorAll(".panel").forEach(e5 => {
+            const t3 = e5.querySelector(".layer");
+            t3 && t3.classList.add("loaded")
+        }), null)
+    }), _ticket === loadTicket && requestAnimationFrame(() => {
+        /* The opening pair is being painted in this frame; deferred scoring
+           can run from the next one. */
+        bootHold = !1;
+        /* A later call may have started while this one was decoding. */
+        if (_ticket !== loadTicket) return;
+        /* n is null when a panel failed to load and the catch above cleaned up.
+           Nothing to swap; the visitor keeps the pair they had and the next
+           click tries a different one. */
+        if (!n) return void scheduleNextPairPrep();
+        /* No readiness gate. A frame that has not finished decoding paints a
+           moment late; a refused swap does not paint at all, and leaves the
+           address bar and the why panel describing a pair that never arrived.
+           The first is a blink, the second is a broken site. */
+        /* The two panels must change together.
+
+           This loop used to do everything per side: restore the transition,
+           force a reflow, then add .loaded — which meant the left panel was
+           already marked loaded when the right panel's reflow forced layout.
+           Safari takes that as licence to paint, so the left frame appeared
+           alone, then the right arrived a beat later. Chromium happened to
+           coalesce the two and hid the fault.
+
+           Three passes now: restore every layer's transition, force ONE reflow
+           for all of them, then flip them all in the same frame. No layout is
+           forced between the two .loaded calls, so there is nothing to paint
+           in between. */
+        n.forEach(({
+            back: e
+        }) => {
+            e.style.transition = ""
+        }), n[0] && n[0].back.offsetHeight, n.forEach(({
+            back: e,
+            active: t
+        }) => {
+            if (e.style.opacity = "", e.classList.add("loaded"), t && t !== e) {
+                t.classList.remove("loaded");
+                /* Safari keeps a playing <video> as its own compositor layer
+                   and ignores the parent opacity, so pause() leaves the clip
+                   stuck on top of the next pair. Remove the element. */
+                teardownLayerVideos(t);
+            }
+        }),
+        /* Verify, then correct.
+
+           Twice now a fix has been shipped on a theory about why Safari shows
+           the wrong frame, and twice the theory was wrong. So instead of a third
+           theory: after the swap, ask each visible <img> what it is actually
+           displaying. If that does not match the pair we just claimed to show,
+           rewrite that layer from scratch with a plain <img> and no <picture>
+           at all — nothing to resolve, nothing to cache, nothing to get wrong.
+
+           The check costs one property read per panel and is silent when it
+           passes. When it fires with ?debug on it says exactly what was on
+           screen versus what should have been. */
+        (() => {
+            const e2 = document.querySelectorAll(".panel");
+            for (let a2 = 0; a2 < e2.length && a2 < t.length; a2++) {
+                const o2 = e2[a2].querySelector(".layer.loaded");
+                if (!o2) continue;
+                const want = t[a2];
+                if (isVideo(want)) {
+                    const vid = o2.querySelector("video");
+                    const got = vid && (vid.currentSrc || vid.src || "");
+                    if (vid && srcToId(got) === srcToId(want)) continue;
+                    DEBUG && console.warn("Diptych: panel", a2, "missing video", want, "— rewriting");
+                    o2.innerHTML = '<video muted autoplay loop playsinline webkit-playsinline preload="auto" poster="' + videoPosterUrl(want) + '"></video>';
+                    const nv = o2.querySelector("video");
+                    nv.muted = !0;
+                    nv.playsInline = !0;
+                    nv.setAttribute("playsinline", "");
+                    nv.setAttribute("webkit-playsinline", "");
+                    nv.src = want;
+                    nv.load();
+                    continue;
+                }
+                const stray = o2.querySelector("video");
+                if (stray) teardownVideo(stray);
+                const i2 = o2.querySelector("img");
+                const r2 = srcToNum(want),
+                    s2 = i2 ? srcToNum(i2.currentSrc || i2.src || "") : null;
+                if (i2 && s2 === r2) continue;
+                DEBUG && console.warn("Diptych: panel", a2, "showed", s2 || "video", "but should show ff" + r2, "— rewriting");
+                const l2 = document.createElement("img");
+                l2.alt = altFor(r2), l2.sizes = "50vw", l2.srcset = SIZES.length ? srcset(r2, "jpg") : "", l2.src = path(r2, "jpg"), o2.innerHTML = "", o2.appendChild(l2)
+            }
+        })(), currentPairSrcs = t, splashFinish(), startVisibleVideos(), DEBUG && console.log("swap", pairToHash(t), "ready:", n.map(e2 => e2 && e2.ok), "avif:", AVIF_OK, "showing:", [...document.querySelectorAll(".panel .layer.loaded img, .panel .layer.loaded video")].map(e2 => srcToId(e2.currentSrc || e2.src || "") || "?")), DEBUG && debugLoadReport(t, _t0, !!a), history.replaceState(null, "", pairToHash(t)), lastSwapAt = performance.now(), markPairRecent(t), lastShown.set(t[0], clickCount), lastShown.set(t[1], clickCount),
+        /* Only now: the layers have flipped, so the back layer really is the
+           one going off screen. See scheduleNextPairPrep. */
+        scheduleNextPairPrep()
+    }), window.gaEnabled && "undefined" != typeof gtag && gtag("event", "diptych_view", {
+        left: t[0],
+        right: t[1]
+    }), prewarmLikelyVideos()
 }
 
-/* Poster-image path for video colour analysis. The user can generate
-   one JPG per video (ff{n}-poster.jpg, same directory as the .mp4) and
-   the site analyses that with analyzeImage exactly like a photo — same
-   colour pipeline, same centre weighting, same OKLab conversion. This
-   is the recommended way to give videos accurate colour signatures.
-   See videoPosterUrl above for the ffmpeg one-liner. Returns true on
-   success (signature stored), false on missing poster or analysis
-   failure — loadOne then falls through to runtime extraction. */
-function loadVideoPosterForAnalysis(src) {
-  return new Promise(resolve => {
-    const img = new Image();
-    img.onload = () => {
-      try {
-        if (!validImages.includes(src)) validImages.push(src);
-        const sig = analyzeImage(img);
-        if (sig) {
-          colorSignatures.set(src, sig);
-          scheduleTopPairs();
-          resolve(true);
-        } else {
-          resolve(false);
-        }
-      } catch {
-        resolve(false);
-      }
-    };
-    img.onerror = () => resolve(false);
-    img.src = videoPosterUrl(src);
-  });
-}
+/* When the pair swaps, the layer that was showing the old pair loses .loaded
+   and fades out over --fade-out-duration. prepareNextPair writes the pair after
+   next into whichever layer is not currently loaded — which is that same layer,
+   still on screen and still fading.
 
-/* Frame extraction for video colour analysis. Creates a hidden
-   <video>, waits for loadeddata, seeks to a representative frame
-   (~25% in, capped at 1s for short clips), and passes the video
-   element to analyzeImage — canvas.drawImage accepts video elements
-   directly, so the same histogram/palette/saturation signature gets
-   computed without converting to an image first. The element is
-   attached to the DOM (offscreen) because iOS Safari refuses to
-   load video data on detached elements. If analysis fails or times
-   out (iOS still being awkward, corrupt file, etc.), the video is
-   registered with a neutral fallback signature so it still appears
-   in the rotation — the alternative would be the video silently
-   vanishing on iOS. */
-function loadVideoForAnalysis(src) {
-  return new Promise(resolve => {
-    const v = document.createElement('video');
-    v.muted       = true;
-    v.playsInline = true;
-    v.preload     = 'auto';
-    /* Attach to DOM offscreen — iOS Safari won't load detached
-       <video> elements, so analysis silently failed on iPhone
-       without this. 1×1px, fully transparent, no pointer events. */
-    v.setAttribute('aria-hidden', 'true');
-    v.style.cssText = 'position:fixed;left:-9999px;top:-9999px;width:1px;height:1px;opacity:0;pointer-events:none;';
-    document.body.appendChild(v);
-
-    let settled = false;
-    const finish = (ok) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(watchdog);
-      try { v.pause(); } catch {}
-      v.removeAttribute('src');
-      v.load();
-      v.remove();
-      /* If analysis didn't produce a signature, register the video
-         with the fallback so it still appears in the rotation. The
-         file existence is already verified by discovery, so this is
-         safe even on failure. */
-      if (!colorSignatures.has(src)) {
-        if (!validImages.includes(src)) validImages.push(src);
-        colorSignatures.set(src, fallbackSignature());
-        scheduleTopPairs();
-      }
-      resolve(true);
-    };
-
-    const analyze = () => {
-      try {
-        if (!validImages.includes(src)) validImages.push(src);
-        const sig = analyzeImage(v);
-        if (sig) {
-          colorSignatures.set(src, sig);
-          scheduleTopPairs();
-        }
-        finish(true);
-      } catch {
-        finish(false);
-      }
-    };
-
-    /* Watchdog: if neither loadeddata nor error fires within the
-       timeout (iOS Safari off-DOM, corrupt file, network drop),
-       fall through to finish() which registers the video with a
-       fallback signature so it still shows up. */
-    const watchdog = setTimeout(() => {
-      console.warn('Diptych: video analysis timeout, using fallback signature', src);
-      finish(false);
-    }, VIDEO_ANALYSIS_TIMEOUT_MS);
-
-    v.addEventListener('loadeddata', () => {
-      if (v.duration && isFinite(v.duration) && v.duration > 0.5) {
-        v.addEventListener('seeked', analyze, { once: true });
-        v.currentTime = Math.min(v.duration * 0.25, 1);
-      } else {
-        analyze();
-      }
-    }, { once: true });
-
-    v.addEventListener('error', () => {
-      console.warn('Diptych: failed to load video, using fallback signature', src);
-      finish(false);
-    }, { once: true });
-
-    v.src = src;
-  });
-}
-
-/* ─────────────────────────────────────────────────────────────────────────
-   INTERLUDE SLIDES
-
-   Three full-screen white cards — contact, share, welcome — appear
-   every CONTACT_MIN..CONTACT_MAX clicks (cadence rolled fresh after
-   each interlude in advance()). Each card is SINGLE-USE per session
-   (seenInterludes) — once shown, removed from the pool. After all
-   three have been seen the rotation stops entirely and the gallery
-   becomes a pure sequence of diptychs.
-
-   All three require a deliberate click to dismiss. Clicking anywhere
-   on the card dismisses it and reveals the next diptych (preloaded
-   while the card was visible).
-   ───────────────────────────────────────────────────────────────────────── */
-
-const INTERLUDES = ['contact', 'share', 'welcome'];
-
-(function buildContact() {
-  const u = 'ciao', d = ['thisisfed', 'xyz'].join('.');
-  const email = u + String.fromCharCode(64) + d;
-  const phoneTel     = '+' + '44' + '7547026300';
-  const phoneDisplay = '+44' + ' (0) ' + '7547 ' + '02 ' + '63 ' + '00';
-
-  const e = document.getElementById('contact-email');
-  e.setAttribute('href', 'mailto:' + email);
-  e.textContent = email;
-
-  const p = document.getElementById('contact-phone');
-  p.setAttribute('href', 'tel:' + phoneTel);
-  p.textContent = phoneDisplay;
+   requestIdleCallback could fire within a frame or two of the swap, so the
+   outgoing image was being replaced mid-fade and the visitor saw, for a moment,
+   the pair two clicks away. Waiting out the fade before repurposing the layer
+   is the whole fix. */
+/* Safari/WebKit decodes AVIF through the OS image stack. It is slower than
+   Chromium, can accept a source then produce an empty frame, and HTMLImageElement
+   decode() on those frames sometimes never settles. Default to JPEG on Apple
+   WebKit so the first pair appears immediately; Chromium keeps AVIF. */
+const IS_SAFARI = (() => {
+    const ua = navigator.userAgent || "";
+    const v = navigator.vendor || "";
+    if (v === "Apple Computer, Inc.") return true;
+    return /Safari/i.test(ua) && !/Chrome|Chromium|CriOS|FxiOS|Edg|OPR|Android/i.test(ua);
 })();
+let AVIF_OK = !IS_SAFARI;
 
-/* Single-use interludes. Each card (contact, share, welcome) appears
-   AT MOST ONCE per session — once shown, it's removed from the pool
-   and never returns within that session. After all three have been
-   seen the rotation stops entirely and the gallery becomes a pure
-   sequence of diptychs.
+/* Safari gets one explicit JPEG width, not a srcset.
 
-   ACROSS sessions, the share and welcome cards are also persisted
-   (see PERSISTENT_INTERLUDES near the cache infrastructure) — once
-   seen, they don't recur on future visits. Contact is deliberately
-   NOT persisted: the email and phone are useful information to
-   re-surface periodically rather than hide forever after the first
-   visit. So a returning visitor sees contact every visit, plus share
-   and welcome only on their first session. */
-const seenInterludes = new Set();
+   index.html preloads the opening pair on Safari as a single file, and Safari
+   used to be handed a 600/1000/1500 srcset here and left to choose. The
+   preload was always the 1000, but on a Retina screen a frame usually needs a
+   little over 1000px, so Safari took the 1500 — and the opening pair was
+   downloaded twice, once as the unused preload and once for real.
+
+   Now both sides make the choice with this same function, the way a browser
+   reads a srcset: the smallest width that covers the frame's rendered size at
+   the screen's pixel density, or the largest there is. The frame renders at
+   min(50vw, 75dvh x aspect) — see --image-height — and innerWidth/innerHeight
+   are that viewport. Keep in step with rungFor() in index.html. */
+function safariRung(e) {
+    const t = Math.min(.5 * window.innerWidth, window.innerHeight * IMAGE_VH / 100 * (e > 0 ? e : .8)) * (window.devicePixelRatio || 1);
+    for (const n of SIZES)
+        if (n >= t) return n;
+    return SIZES[SIZES.length - 1]
+}
+/* random.thisisfed.xyz/?debug — logs each swap: the pair, whether each frame
+   decoded, and which formats are in play. */
+const DEBUG = /[?&]debug\b/.test(location.search);
+const LAYER_FADE_OUT_MS = 200,
+    PREP_GUARD_MS = LAYER_FADE_OUT_MS + 250;
+let lastSwapAt = 0;
+
+/* Called from inside the swap, after the layers have flipped.
+
+   It used to be called straight after the swap was requested — before the
+   frame in which it happens. Chromium defers the work with
+   requestIdleCallback, which by luck always landed after that frame. Safari
+   has no requestIdleCallback, so the prep ran synchronously, still before the
+   swap: the "back" layer it chose was the very layer about to be revealed, and
+   it wrote the pair after next into it. The self-check then caught the wrong
+   frame on screen and rebuilt it from scratch — on every swap, which is the
+   "showed 14 but should show ff125" in the log, a second download of each
+   image, and a video restarted from nothing.
+
+   Without requestIdleCallback the fallback is now a timer, never a direct
+   call, so it can never run inside the swap either. */
+function scheduleNextPairPrep() {
+    const e = Math.max(0, PREP_GUARD_MS - (performance.now() - lastSwapAt)),
+        t = () => "function" == typeof requestIdleCallback ? requestIdleCallback(() => prepareNextPair(), {
+            timeout: 500
+        }) : setTimeout(prepareNextPair, 0);
+    e > 0 ? setTimeout(t, e) : t()
+}
+/* The prep and a click both write images into the same back layer, and until
+   now nothing stopped them doing it at the same time.
+
+   prepInflightId guarded only the assignment of preparedNext, not the DOM
+   writes underneath it. So: prep starts on the pair after next, the visitor
+   clicks before it settles, loadDiptych finds preparedNext still null and calls
+   preparePanel on that same layer for a fresh pair — and the two racing writes
+   finish in whatever order they finish in. When the prep won, the layer was
+   showing the pair after next at the moment .loaded went on it. That is the
+   picture from a few clicks away.
+
+   prepPromise makes the two take turns: loadDiptych waits for any prep in
+   flight before writing to the layer itself. */
+let prepPromise = null;
+
+function prepareNextPair() {
+    if (validImages.length < 2 || preparedNext || prepPromise) return prepPromise;
+    const e = prepInflightId;
+    let t;
+    try {
+        t = pickPair(validImages)
+    } catch {
+        return null
+    }
+    if (!t || !t[0] || !t[1]) return null;
+    return prepPromise = Promise.all([preparePanel(document.querySelector(".panel.left"), t[0], {
+        autoplay: !1
+    }), preparePanel(document.querySelector(".panel.right"), t[1], {
+        autoplay: !1
+    })]).then(n => {
+        e === prepInflightId && (preparedNext = {
+            pair: t,
+            sides: n
+        })
+    }).catch(() => {}).finally(() => {
+        prepPromise = null
+    })
+}
+const prewarmedVideos = new Map;
+
+function warmVideoElement(e) {
+    if (prewarmedVideos.has(e)) return prewarmedVideos.get(e);
+    const t = document.createElement("video");
+    t.muted = !0, t.playsInline = !0, t.preload = "auto", t.setAttribute("aria-hidden", "true"), t.style.cssText = "position:fixed;left:-9999px;top:-9999px;width:1px;height:1px;opacity:0;pointer-events:none;", t.src = e, document.body.appendChild(t);
+    try {
+        t.load()
+    } catch {}
+    return prewarmedVideos.set(e, t), t
+}
+const PREWARM_BATCH = 3;
+
+function prewarmLikelyVideos() {
+    const e = validImages.filter(e => isVideo(e) && !prewarmedVideos.has(e));
+    0 !== e.length && (e.sort((e, t) => (lastShown.has(e) ? lastShown.get(e) : -1 / 0) - (lastShown.has(t) ? lastShown.get(t) : -1 / 0)), e.slice(0, PREWARM_BATCH).forEach(warmVideoElement))
+}
+
+function deferVideoWarmup() {
+    ("function" == typeof requestIdleCallback ? requestIdleCallback : e => setTimeout(e, 300))(() => primeInitialVideoWarmup(), {
+        timeout: 1500
+    })
+}
+
+function primeInitialVideoWarmup() {
+    validImages.filter(isVideo).slice(0, PREWARM_INITIAL).forEach(warmVideoElement)
+}
+const PREWARM_INITIAL = IS_SAFARI ? 1 : 3;
+
+function loadOne(e) {
+    if (isVideo(e)) return loadVideoPosterForAnalysis(e).then(t => !!t || loadVideoForAnalysis(e));
+    const t = srcToNum(e),
+        n = [];
+    n.push(256), SIZES.length && 256 !== SIZES[0] && n.push(SIZES[0]), n.length || n.push(null);
+    const a = [];
+    /* Safari's createImageBitmap(AVIF) is slow and has leaked/hung in WebKit
+       versions. Analyse from JPEG thumbnails there; Chromium can keep AVIF. */
+    const fmts = IS_SAFARI ? ["jpg", "avif"] : FORMATS;
+    for (const e of n)
+        for (const n of fmts) a.push(path(t, n, e));
+    const o = t => {
+        validImages.includes(e) || validImages.push(e);
+        const n = analyzeImage(t);
+        n && (colorSignatures.set(e, n), scheduleTopPairs())
+    };
+
+    function i() {
+        return new Promise(t => {
+            let n = 0;
+            const i = () => {
+                if (n >= a.length) return console.warn("Diptych: failed to load", e), void t(!1);
+                const r = new Image;
+                r.onload = () => {
+                    o(r), t(!0)
+                }, r.onerror = () => i(), r.src = a[n++]
+            };
+            i()
+        })
+    }
+    return !IS_SAFARI && "function" == typeof createImageBitmap ? async function() {
+        for (const e of a) try {
+            const t = await fetch(e);
+            if (!t.ok) continue;
+            const n = await createImageBitmap(await t.blob());
+            try {
+                o(n)
+            } finally {
+                n.close && n.close()
+            }
+            return !0
+        } catch {}
+        return !1
+    }().then(e => !!e || i()): i()
+}
+
+function fallbackSignature() {
+    const e = new Array(7).fill(1 / 7);
+    return {
+        histogram: e,
+        palette: [{
+            hsl: {
+                h: 0,
+                s: 0,
+                l: .5
+            },
+            oklab: {
+                L: .6,
+                a: 0,
+                b: 0
+            },
+            weight: 1
+        }],
+        avgSat: .3,
+        meanL: .5,
+        density: histogramDensity(e),
+        histMag: histogramMagnitude(e),
+        edgeEnergy: .15,
+        vertical: 0,
+        cx: .5,
+        cy: .5,
+        aspect: 1,
+        isFallback: !0
+    }
+}
+
+function loadVideoPosterForAnalysis(e) {
+    return new Promise(t => {
+        const n = new Image;
+        n.onload = () => {
+            try {
+                validImages.includes(e) || validImages.push(e);
+                const a = analyzeImage(n);
+                a ? (colorSignatures.set(e, a), scheduleTopPairs(!0), t(!0)) : t(!1)
+            } catch {
+                t(!1)
+            }
+        }, n.onerror = () => t(!1), n.src = videoPosterUrl(e)
+    })
+}
+
+function loadVideoForAnalysis(e) {
+    return new Promise(t => {
+        const n = document.createElement("video");
+        n.muted = !0, n.playsInline = !0, n.preload = "auto", n.setAttribute("aria-hidden", "true"), n.style.cssText = "position:fixed;left:-9999px;top:-9999px;width:1px;height:1px;opacity:0;pointer-events:none;", document.body.appendChild(n);
+        let a = !1;
+        const o = o => {
+                if (!a) {
+                    a = !0, clearTimeout(r);
+                    try {
+                        n.pause()
+                    } catch {}
+                    n.removeAttribute("src"), n.load(), n.remove(), colorSignatures.has(e) || (validImages.includes(e) || validImages.push(e), colorSignatures.set(e, fallbackSignature()), scheduleTopPairs()), t(!0)
+                }
+            },
+            i = () => {
+                try {
+                    validImages.includes(e) || validImages.push(e);
+                    const t = analyzeImage(n);
+                    t && (colorSignatures.set(e, t), scheduleTopPairs()), o()
+                } catch {
+                    o()
+                }
+            },
+            r = setTimeout(() => {
+                console.warn("Diptych: video analysis timeout, using fallback signature", e), o()
+            }, 1e4);
+        n.addEventListener("loadeddata", () => {
+            n.duration && isFinite(n.duration) && n.duration > .5 ? (n.addEventListener("seeked", i, {
+                once: !0
+            }), n.currentTime = Math.min(.25 * n.duration, 1)) : i()
+        }, {
+            once: !0
+        }), n.addEventListener("error", () => {
+            console.warn("Diptych: failed to load video, using fallback signature", e), o()
+        }, {
+            once: !0
+        }), n.src = e
+    })
+}
+const INTERLUDES = ["contact", "share", "welcome"],
+    /* The opening run, in order, with the number of pairs between each. Fixed
+       rather than rolled, so everyone meets the same screens at the same
+       moments: welcome at pair 2, instructions at pair 5 at the latest.
+       Anything still unseen after that arrives at a random interval, as
+       before. A returning visitor who has already had the welcome starts at
+       the next queued entry, so the instructions arrive sooner, never later
+       than the fifth pair. */
+    INTERLUDE_SCHEDULE = [
+        ["welcome", 2],
+        ["share", 3]
+    ];
+let interludeQueue = [];
+! function() {
+    const e = ["thisisfed", "xyz"].join("."),
+        t = "ciao" + String.fromCharCode(64) + e,
+        n = document.getElementById("contact-email");
+    n.setAttribute("href", "mailto:" + t), n.textContent = t
+}();
+const seenInterludes = new Set;
 
 function pickInterlude() {
-  const unseen = INTERLUDES.filter(s => !seenInterludes.has(s));
-  if (unseen.length === 0) return null;
-
-  /* First interlude of the session is ALWAYS the share card (if still
-     unseen) — teaches the share gesture (Long press / Press S) before
-     the user has any way to discover it. */
-  if (lastInterlude === null && unseen.includes('share')) {
-    lastInterlude = 'share';
-    return 'share';
-  }
-
-  /* Random pick from unseen cards, excluding the previous so the same
-     one never appears twice in a row. If only one unseen remains and
-     it happens to equal lastInterlude, return it anyway — the no-repeat
-     rule yields to the must-be-unseen rule. */
-  const pool   = unseen.filter(s => s !== lastInterlude);
-  const choice = (pool.length ? pool : unseen)[Math.floor(Math.random() * (pool.length || unseen.length))];
-  lastInterlude = choice;
-  return choice;
+    const e = INTERLUDES.filter(e => !seenInterludes.has(e));
+    if (0 === e.length) return null;
+    if (interludeQueue.length) {
+        const t = interludeQueue.shift()[0];
+        if (e.includes(t)) return lastInterlude = t, t
+    }
+    const t = e.filter(e => e !== lastInterlude),
+        n = (t.length ? t : e)[Math.floor(Math.random() * (t.length || e.length))];
+    return lastInterlude = n, n
 }
 
 function showInterlude() {
-  const which = pickInterlude();
-  if (!which) return;  /* All interludes seen — caller falls through to loadDiptych */
-  seenInterludes.add(which);
-  /* Persist immediately rather than waiting for pagehide. If the user
-     sees the welcome card and then closes the tab in a way that skips
-     pagehide (rare — tab crash, OS terminating a backgrounded tab),
-     they'd see it again on their next visit. Writing here means each
-     "seen" event survives even those edge cases. The write is a small
-     localStorage set, cheap to do per interlude. */
-  writeSeenInterludes();
-  currentInterlude = document.getElementById(which);
-
-  currentInterlude.classList.add('visible');
-  currentInterlude.setAttribute('aria-hidden', 'false');
-  /* Tell the CSS that an interlude is covering the diptych so the
-     .layer transitions are suppressed for the duration of this
-     interlude. The next pair will load and swap in instantly behind
-     the cover — no crossfade, no flash through the appearing or
-     disappearing interlude. The visible reveal IS the interlude's
-     own fade-out, which carries the easeOutQuart character that
-     used to live on the layer crossfade. */
-  document.documentElement.classList.add('has-interlude');
-  captureFocus(currentInterlude);
-  /* Defer the next pair's load by the full appearance duration so the
-     snap-swap (suppressed via html.has-interlude) happens AFTER the
-     interlude is fully opaque, not during its fade-in. Without this
-     delay, with cached images loadDiptych can resolve in ~50ms and
-     the .loaded class flip becomes visible through the interlude
-     while it's still 80% transparent. The user reported seeing the
-     next pair briefly before the interlude — this is the fix.
-
-     Wrapped in a Promise so interludePreload still has a Promise
-     to await on dismissal: the dismissal handler races it against
-     a 300ms cap, which means a user dismissing in the first 500ms
-     (very rare — interludes are meant to be read) gets the same
-     graceful fallback the cap was designed for: dismiss anyway,
-     reveal whatever's there. The diptych swap then completes after
-     the dismissal in the normal animated way. Trade: edge-case
-     fast clicks may show a brief crossfade. The common case (read,
-     then dismiss) is now fully clean. */
-  interludePreload = new Promise(resolve => {
-    setTimeout(() => loadDiptych().then(resolve), INTERLUDE_APPEAR_MS);
-  });
-
-  if (window.gaEnabled && typeof gtag !== 'undefined') {
-    gtag('event', 'interlude_shown', { interlude: which });
-  }
+    const e = pickInterlude();
+    if (!e) return;
+    seenInterludes.add(e), writeSeenInterludes(), currentInterlude = document.getElementById(e), currentInterlude.classList.add("visible"), currentInterlude.setAttribute("aria-hidden", "false"), document.documentElement.classList.add("has-interlude"), captureFocus(currentInterlude);
+    let t = !1,
+        n = null;
+    interludePreload = new Promise(e => {
+        const a = () => {
+            t || (t = !0, null !== n && (clearTimeout(n), n = null), loadDiptychOnce().then(() => {
+                requestAnimationFrame(() => requestAnimationFrame(e))
+            }))
+        };
+        n = setTimeout(a, 800), interludeLoadTrigger = a
+    }), window.gaEnabled && "undefined" != typeof gtag && gtag("event", "interlude_shown", {
+        interlude: e
+    })
 }
 
-/* Remove the initial gate that hides the diptych during the welcome
-   and (when needed) analytics cards. Called once, from whichever
-   dismissal is the last of the gate sequence — see hideInterlude
-   and dismissConsent. Idempotent: classList.remove is a no-op if
-   the class isn't present. */
 function liftGate() {
-  document.documentElement.classList.remove('gated');
+    document.documentElement.classList.remove("gated")
 }
-
-/* ── OVERLAY FOCUS MANAGEMENT ──
-   Move keyboard focus into an overlay when it appears, and restore
-   it on dismiss. Without this, screen readers and keyboard users
-   have no idea the overlay opened — focus stays on whatever invisible
-   element the user last interacted with, and Tab navigation reaches
-   the panels behind the card. Cheap a11y improvement.
-
-   Implementation notes:
-   - We focus the `.inner` block with tabindex="-1" (set inline below)
-     rather than the first interactive child, because not every overlay
-     has interactive children (welcome and share are plain text).
-   - previouslyFocused is captured once per show, restored once per
-     hide. Stacking (interlude → privacy → back) is handled by tracking
-     a stack rather than a single slot, but for this site only one
-     overlay is ever active at a time, so a single slot suffices. */
 let previouslyFocused = null;
 
-function captureFocus(targetEl) {
-  previouslyFocused = document.activeElement;
-  const inner = targetEl.querySelector('.inner') || targetEl;
-  if (!inner.hasAttribute('tabindex')) inner.setAttribute('tabindex', '-1');
-  /* Defer focus to the next frame so the visibility transition has
-     started — focusing a still-display:none element is a no-op in
-     some browsers, and we want the screen-reader announcement to
-     coincide with the visible appearance. */
-  requestAnimationFrame(() => { try { inner.focus({ preventScroll: true }); } catch {} });
+function captureFocus(e) {
+    previouslyFocused = document.activeElement;
+    const t = e.querySelector(".inner") || e;
+    t.hasAttribute("tabindex") || t.setAttribute("tabindex", "-1"), requestAnimationFrame(() => {
+        try {
+            t.focus({
+                preventScroll: !0
+            })
+        } catch {}
+    })
 }
 
 function restoreFocus() {
-  const target = previouslyFocused;
-  previouslyFocused = null;
-  if (target && typeof target.focus === 'function' && document.contains(target)) {
-    try { target.focus({ preventScroll: true }); } catch {}
-  } else if (document.body) {
-    try { document.body.focus({ preventScroll: true }); } catch {}
-  }
+    const e = previouslyFocused;
+    if (previouslyFocused = null, e && "function" == typeof e.focus && document.contains(e)) try {
+        e.focus({
+            preventScroll: !0
+        })
+    } catch {} else if (document.body) try {
+        document.body.focus({
+            preventScroll: !0
+        })
+    } catch {}
 }
 
 function hideInterlude() {
-  if (currentInterlude) {
-    currentInterlude.classList.remove('visible');
-    currentInterlude.setAttribute('aria-hidden', 'true');
-    /* Clear the diptych-transition suppressor. Removing this class
-       immediately is safe: there are no pending .loaded changes on
-       the panels at this point (they completed instantly while the
-       interlude was showing), so no transitions will fire as a
-       side-effect of removing the class. Any future click that
-       changes pairs uses the normal asymmetric crossfade again. */
-    document.documentElement.classList.remove('has-interlude');
-    currentInterlude = null;
-    restoreFocus();
-  }
+    currentInterlude && (currentInterlude.classList.remove("visible"), currentInterlude.setAttribute("aria-hidden", "true"), document.documentElement.classList.remove("has-interlude"), currentInterlude = null, restoreFocus())
 }
+async function backgroundLoadRest(e) {
+    if (!e || 0 === e.length) return;
+    let t = 0;
+    await Promise.all(Array.from({
+        length: 4
+    }, () => (async () => {
+        for (; t < e.length;) {
+            const n = e[t++];
+            if (!colorSignatures.has(n)) try {
+                await loadOne(n)
+            } catch {}
+        }
+    })()))
+}
+document.querySelectorAll(".interlude").forEach(e => {
+    e.addEventListener("click", async t => {
+        "consent" !== e.id && "why" !== e.id && (t.target.closest("a") || (interludeLoadTrigger && interludeLoadTrigger(), interludePreload && await Promise.race([interludePreload, new Promise(e => setTimeout(e, 1500))]), hideInterlude()))
+    })
+}), async function() {
+    const e = document.getElementById("splash"),
+        t = e.querySelector(".subtitle"),
+        n = e.querySelector(".loading");
+    let a = 1e3,
+        o = null,
+        i = !1,
+        r = null;
+    const splashShownAt = performance.now();
+    /* Hold the title card for SPLASH_MIN_MS even when everything is already
+       cached and the real work finishes in 80ms — otherwise a warm visit
+       flashes the name and is gone before it can be read.
 
-/* One delegated click handler per interlude. Anchors in the contact
-   slide (mailto:/tel:) navigate normally and don't dismiss. The
-   share card has no in-card trigger — sharing happens via the S key
-   (desktop) or long-press (mobile), so any click on the share card
-   simply dismisses it. Background clicks dismiss for most interludes.
+       `i` is set straight away, not after the wait: it stops the progress
+       loop and marks the splash as spoken for, so nothing schedules a second
+       hide. Only the visual dismissal is delayed. The diptych loads behind
+       the splash in the meantime, which means the images get a two-second
+       head start on decoding rather than the delay costing anything. */
+    /* The splash counter: 0% to 100%, on every visit.
 
-   One exception: #consent never dismisses on background click. It's
-   now a non-blocking bottom banner with its own Accept / Decline /
-   Why? buttons (see the ANALYTICS CONSENT BANNER section); a stray
-   click on the banner should do nothing rather than silently accept
-   or decline by default. */
-document.querySelectorAll('.interlude').forEach(el => {
-  el.addEventListener('click', async (e) => {
-    if (el.id === 'consent') return;
-
-    if (e.target.closest('a')) {
-      return; /* let mailto: / tel: links fire without dismissing */
-    }
-
-    /* Cap the interludePreload await at 300ms. The await exists so
-       the interlude doesn't dismiss faster than the next pair can
-       decode — but if something goes wrong (slow video, network
-       hiccup, unexpected delay), the card shouldn't sit at full
-       opacity for seconds waiting. 300ms is well above any cached-
-       image decode time, so the normal case never trips the cap;
-       the safety net only fires when something is genuinely slow,
-       in which case the diptych may appear mid-decode behind the
-       card fade-out — far better than the card appearing stuck. */
-    if (interludePreload) {
-      await Promise.race([
-        interludePreload,
-        new Promise(r => setTimeout(r, 300))
-      ]);
-    }
-    hideInterlude();
-  });
-});
-
-/* ─────────────────────────────────────────────────────────────────────────
-   SPLASH + IMAGE PRELOAD
-
-   Three static lines (title, gallery count, loading percentage), with
-   the percentage animating 0 → 100 to reflect real image-load progress.
-   A rAF loop drives the percentage display: actual progress increases
-   in chunks each time an image completes, but the rendered number rises
-   at a steady rate (PROGRESS_RATE_PER_SEC) so a warm-cache visit still
-   shows a smooth climb rather than a flicker from 0% to 100%. The
-   splash dismisses the moment the displayed number reaches 100% — so
-   visual completion and gallery-ready always coincide.
-
-   Videos are NOT preloaded; they get a neutral colour signature so the
-   pair scorer keeps them in rotation, and the actual file fetch happens
-   lazily in preparePanel when their pair is selected. There is no
-   click or keyboard skip; the safety cap SPLASH_MAX_WAIT_MS bounds the
-   worst case so the gallery never gets stranded behind a stuck splash.
-   ───────────────────────────────────────────────────────────────────────── */
-
-(async function start() {
-  const splashEl   = document.getElementById('splash');
-  const subtitleEl = splashEl.querySelector('.subtitle');
-  const loadingEl  = splashEl.querySelector('.loading');
-
-  /* NOTE on forward references: this IIFE references `consentEl` later
-     (lines using `if (consentEl && consentEl.isConnected)`), and that
-     `const` is declared further down the file. This is safe because
-     the IIFE hits its first `await` (discovery) before reaching those
-     references — the rest of the script's top-level synchronous code
-     runs during that await window, including the consentEl declaration.
-     If a future refactor removes the awaits before the consentEl
-     references, this will start throwing ReferenceError at runtime. */
-
-  /* Initial target matches the HTML splash placeholder (1000) so the
-     if-check below correctly skips the DOM write when the discovered
-     pair count happens to coincide. Keep this in sync with the
-     subtitle text in index.html. */
-  let target            = 1000;
-  let imageSrcs         = null;
-  let splashFinished    = false;
-  let splashSafetyTimer = null;
-
-  /* Idempotent dismissal. Called from two places: the progress
-     animation (when the displayed % reaches 100), and the safety
-     timer (when MAX_WAIT_MS elapses without loading completing).
-     The splashFinished flag makes subsequent calls no-ops. There
-     is intentionally no click or keyboard path here — once the
-     splash is on screen, only loading completion or the safety
-     cap will dismiss it. */
-  const finishSplash = () => {
-    if (splashFinished) return;
-    splashFinished = true;
-    clearTimeout(splashSafetyTimer);
-    splashEl.classList.add('hidden');
-    setTimeout(() => splashEl.remove(), SPLASH_FADE_MS + 50);
-  };
-
-  splashSafetyTimer = setTimeout(finishSplash, SPLASH_MAX_WAIT_MS);
-
-  const [imageIndices, videoIndices] = await Promise.all([
-    discoverWithCache(DISCO_CACHE_KEY_IMAGES, discoverImages),
-    discoverWithCache(DISCO_CACHE_KEY_VIDEOS, discoverVideos)
-  ]);
-  const totalCount = imageIndices.length + videoIndices.length;
-  if (totalCount < 2) {
-    subtitleEl.textContent = 'No media could be loaded.';
-    loadingEl.textContent  = '';
-    /* Cancel the safety timer — without this it would fire ~30s later,
-       fade the splash, and leave the user staring at a permanently
-       blank page (the diptych is still hidden by html.gated and no
-       loadDiptych ever runs to populate it). Better to keep the
-       message on screen indefinitely than to silently disappear it. */
-    clearTimeout(splashSafetyTimer);
-    return;
-  }
-  images = imageIndices.map(numToSrc).concat(videoIndices.map(videoNumToSrc));
-
-  /* Register every video with a neutral signature up front — without
-     loading the file. That keeps videos eligible for pickPair (they
-     end up in validImages and colorSignatures from the start) while
-     deferring the actual byte fetch to preparePanel's video path,
-     which runs only when a pair containing the video is selected.
-     The neutral signature means pair quality is slightly degraded
-     for video-containing pairs, but the gallery feels lazy-on-demand
-     rather than waiting for tens of megabytes of MP4s up front. */
-  for (const videoSrc of videoIndices.map(videoNumToSrc)) {
-    if (!validImages.includes(videoSrc)) validImages.push(videoSrc);
-    if (!colorSignatures.has(videoSrc)) colorSignatures.set(videoSrc, fallbackSignature());
-  }
-
-  /* Pre-populate image signatures from localStorage. Every src with a
-     cached signature is registered as valid right now — no fetch, no
-     decode, no analyzeImage. The load loop below will see these in
-     colorSignatures and skip them entirely. On a typical reload where
-     all images were analysed in a previous session, this turns the
-     splash from "wait 150 images" into "wait 0 images" — the loop
-     bumps imageLoadsAttempted to total upfront and the counter snaps
-     to 100 immediately. */
-  const cachedSigs = readSignatureCache();
-  for (const imageSrc of imageIndices.map(numToSrc)) {
-    const sig = cachedSigs[imageSrc];
-    if (sig) {
-      colorSignatures.set(imageSrc, sig);
-      if (!validImages.includes(imageSrc)) validImages.push(imageSrc);
-    }
-  }
-  /* Same for videos — upgrade the fallback signature registered just
-     above to the cached real one when a previous session managed to
-     analyse the poster (or extracted a runtime frame). writeSignatureCache
-     filters out isFallback, so anything cached for a video src is a
-     real signature, safe to overwrite the fallback with. */
-  for (const videoSrc of videoIndices.map(videoNumToSrc)) {
-    const sig = cachedSigs[videoSrc];
-    if (sig) colorSignatures.set(videoSrc, sig);
-  }
-
-  /* Background-analyse video posters for any video still on the
-     fallback signature. The poster is a small JPG (not an MP4), so
-     this costs the same as a single image load — well within the
-     "videos stay lazy" budget which was really about not fetching
-     tens-of-megabytes of MP4 data on startup. loadVideoPosterForAnalysis
-     resolves false silently when the poster file doesn't exist, so
-     this is a no-op for videos without posters. Successful analyses
-     overwrite the fallback signature, scheduleTopPairs re-runs, and
-     the new signature is persisted on pagehide for next visit. */
-  for (const videoSrc of videoIndices.map(videoNumToSrc)) {
-    const sig = colorSignatures.get(videoSrc);
-    if (sig && sig.isFallback) loadVideoPosterForAnalysis(videoSrc);
-  }
-
-  /* Update the static subtitle to the real pair count if discovery
-     reveals a different total than the HTML's placeholder "1000". */
-  const unorderedPairs = totalCount * (totalCount - 1) / 2;
-  const realTotal      = Math.min(TOP_PAIRS_POOL, unorderedPairs) * 2;
-  if (realTotal !== target) {
-    target = realTotal;
-    subtitleEl.textContent = `${target} Random Diptychs`;
-  }
-
-  /* Hash-driven entry loads JUST the deep-linked pair (which may
-     include a video) and dismisses the splash immediately — the
-     linked diptych is the whole point of that URL and shouldn't
-     wait on the full image catalogue. The 0→100 progress animation
-     only runs in the no-hash branch below.
-
-     Reload detection: if the user pressed refresh on their own
-     session, the URL still has the hash (loadDiptych wrote it on
-     the last pair) but we deliberately ignore it so reloads feel
-     fresh rather than sticky. Performance Navigation API exposes
-     the navigation type — 'reload' for refresh, 'navigate' for
-     fresh URL entry / clicked links / typed URLs, 'back_forward'
-     for history navigation. Only 'reload' is treated as "ignore
-     the hash"; every other type honours it, which means:
-       - someone opens a shared link in any tab → hash honoured
-       - back-button after navigating away → hash honoured (the
-         user is asking for that specific state)
-       - refresh (Cmd-R / F5 / pull-to-refresh) → hash ignored,
-         fresh random pair selected
-     The optional-chain fallback covers old browsers without the
-     navigation entry (treat as non-reload = honour the hash,
-     which matches the deep-link-friendly default). */
-  const isReload   = performance.getEntriesByType?.('navigation')?.[0]?.type === 'reload';
-  const hashMatch  = isReload ? null : location.hash.match(/^#(v?\d+),(v?\d+)$/);
-
-  if (hashMatch && hashMatch[1] !== hashMatch[2]) {
-    const firstPair = [idToSrc(hashMatch[1]), idToSrc(hashMatch[2])];
-    const results = await Promise.all(firstPair.map(loadOne));
-    if (!results.every(Boolean)) {
-      /* Hash points to a missing/corrupt item — walk until 2 valid. */
-      for (const src of images) {
-        if (validImages.length >= 2) break;
-        if (!validImages.includes(src)) await loadOne(src);
-      }
-    }
-    if (validImages.length < 2) {
-      subtitleEl.textContent = 'No media could be loaded.';
-      loadingEl.textContent  = '';
-      /* Keep the splash on screen with its message; without this the
-         safety timer would fade it to a blank page. */
-      clearTimeout(splashSafetyTimer);
-      return;
-    }
-    /* Background-fill the rest of the IMAGES (videos stay lazy). */
-    Promise.all(
-      imageIndices.map(numToSrc)
-        .filter(src => !validImages.includes(src))
-        .map(loadOne)
-    );
-    const startPair = firstPair.every(s => validImages.includes(s)) ? firstPair : null;
-    finishSplash();
-    /* Lift the gate and start the diptych regardless of consent state
-       — the banner (if needed) is non-blocking and shows alongside the
-       first reveal rather than gating it. The welcome statement now
-       appears later as one of the rotation interludes, not between
-       splash and gallery. */
-    liftGate();
-    /* Start warming the first batch of videos in the background.
-       See the matching call on the no-hash path below for details. */
-    primeInitialVideoWarmup();
-    loadDiptych(startPair);
-    if (consentEl && consentEl.isConnected) showAnalytics();
-    return;
-  }
-
-  /* No hash — preload every image at the device's display variant
-     size before dismissing the splash. The "Loading… X%" counter
-     reflects real progress against the full catalogue, so the
-     splash has a substantive moment and by the time it fades out
-     every diptych the user will ever click through is already
-     cached. Trade-off: splash takes proportionally longer on slow
-     connections (5-30s on 4G with 150 images) — but every
-     transition after is instant, which is what a photography
-     gallery should feel like. Videos remain lazy (loaded on demand
-     in preparePanel) because their files are 10-100x larger than
-     images and waiting for them would push the splash into
-     unreasonable territory. */
-  imageSrcs = imageIndices.map(numToSrc);
-
-  /* Count ATTEMPTS (success or failure), not just successful loads.
-     loadOne resolves either way — success pushes to validImages,
-     failure quietly returns false — and counting both means a 404
-     on one image doesn't permanently strand the percentage at 99
-     waiting for a load that will never happen.
-
-     Pre-cached signatures (populated above from localStorage) are
-     counted as attempted immediately without firing loadOne. On a
-     warm-cache reload where every image was analysed in a previous
-     session, this initialises imageLoadsAttempted at the full
-     catalogue size and the counter snaps to 100 in the first frame
-     of the progress loop — splash dismisses essentially instantly. */
-  let imageLoadsAttempted = 0;
-  imageSrcs.forEach(src => {
-    if (colorSignatures.has(src)) {
-      /* Cached path — no fetch, no analyze. The signature is already
-         in colorSignatures from the readSignatureCache() pre-pop
-         above; just bump the counter so the splash progresses. */
-      imageLoadsAttempted++;
-    } else {
-      /* Cold path — full load + analyze. After analyzeImage completes
-         inside loadOne, the signature lands in colorSignatures and
-         will be persisted to localStorage by the pagehide handler
-         (or by writeSignatureCache() called right after finishSplash). */
-      loadOne(src).finally(() => { imageLoadsAttempted++; });
-    }
-  });
-
-  /* Smooth progress animation, gated on the full image catalogue.
-     displayPct chases an "effective" load fraction that snaps to
-     100 once real progress is within a hair of complete — that
-     absorbs the last 1-2 stragglers without holding the splash on
-     a slow image. The rate cap keeps the climb legible even on a
-     warm cache where every image is already in memory.
-
-     The dt cap (100ms) is a guard against the browser deferring rAF
-     during a tab switch — without it, the first frame after returning
-     focus would advance displayPct by the full elapsed delta and look
-     like a jump. */
-  let displayPct = 0;
-  let lastTickMs = performance.now();
-
-  await new Promise(resolve => {
-    const tick = () => {
-      if (splashFinished) { resolve(); return; }
-
-      const now = performance.now();
-      const dt  = Math.min(0.1, (now - lastTickMs) / 1000);
-      lastTickMs = now;
-
-      const total           = imageSrcs.length;
-      const actualPct       = total > 0 ? (imageLoadsAttempted / total) * 100 : 0;
-      const effectiveActual = actualPct >= 99 ? 100 : actualPct;
-
-      if (effectiveActual > displayPct) {
-        displayPct = Math.min(effectiveActual, displayPct + PROGRESS_RATE_PER_SEC * dt);
-      }
-
-      /* Only show "X%" once the counter has actually started moving.
-         Frozen "Loading… 0%" during the initial discovery phase reads
-         as a stuck splash on warm-cache visits — the hardcoded HTML
-         value sits there for ~100-500ms while discoverImages probes,
-         then jumps from 0 to 1 to 2 …. Showing plain "Loading…" until
-         there's real progress to display avoids that. */
-      const shown = Math.floor(displayPct);
-      loadingEl.textContent = shown > 0 ? `Loading… ${shown}%` : 'Loading…';
-
-      if (displayPct >= 100) {
-        loadingEl.textContent = 'Loading… 100%';
-        resolve();
-      } else {
-        requestAnimationFrame(tick);
-      }
+       Mostly for show. It climbs on a curve — most of the way in the first
+       second, then slower and slower — and only runs the last stretch to 100%
+       once the first pair is actually on screen behind the splash. So it never
+       sits still, never reaches 100% early, and the splash lifts on a pair
+       that is ready rather than on an empty page. */
+    let pDone = !1,
+        pStop = !1,
+        pShown = 0,
+        pLast = performance.now(),
+        pFull;
+    const pFullP = new Promise(e2 => pFull = e2),
+        pFrame = t2 => {
+            if (pStop) return;
+            const a2 = (t2 - splashShownAt) / 1e3,
+                /* 90% by about 1.2s, then creeping toward 99% but never there. */
+                o2 = a2 < 1.2 ? 90 * (1 - Math.pow(1 - a2 / 1.2, 2)) : 90 + 9 * (1 - Math.exp(-(a2 - 1.2) / 3)),
+                i2 = Math.min(.1, (t2 - pLast) / 1e3);
+            pLast = t2;
+            /* Once the pair is ready: along a full curve to 100% by 1.3s on a
+               fast visit, so the figure lands as the splash lifts, or at a
+               steady run from wherever it has got to on a slow one. */
+            pShown = pDone ? a2 < 1.3 ? Math.max(pShown, 100 * (1 - Math.pow(1 - a2 / 1.3, 2))) : Math.min(100, pShown + 150 * i2) : Math.max(pShown, Math.min(o2, 99));
+            n && (n.textContent = pCount(pShown));
+            pDone && pShown >= 100 ? (pStop = !0, pFull()) : requestAnimationFrame(pFrame)
+        };
+    /* Shown as pairs, not percent, in place of the number in "1235 Random
+       Diptychs": "0 / 1235" up to "1235 / 1235". The total is the subtitle's
+       data-count, so a count recomputed during boot is picked up at once. */
+    const pCount = e2 => {
+        const t2 = parseInt(t && t.dataset.count, 10) || (window.__pool && window.__pool.count) || 0;
+        return Math.floor(e2 / 100 * t2) + " / " + t2
     };
-    requestAnimationFrame(tick);
-  });
+    n && (n.textContent = pCount(0)), requestAnimationFrame(pFrame);
+    splashFinish = () => {
+        pDone = !0, pStop && pFull()
+    };
+    /* Stops the counter for good — used when loading has failed and the line
+       is about to say so. */
+    const pHalt = () => {
+        pStop = !0
+    };
+    const s = () => {
+        if (i) return;
+        i = !0, clearTimeout(r);
+        /* If the first pair never arrives, do not hold the splash forever. */
+        setTimeout(splashFinish, 6e3);
+        Promise.all([pFullP, new Promise(e2 => setTimeout(e2, Math.max(0, SPLASH_MIN_MS - (performance.now() - splashShownAt))))]).then(() => {
+            e.classList.add("hidden"), setTimeout(() => {
+                e.remove(), splashHiddenResolve()
+            }, 350)
+        })
+    };
+    r = setTimeout(s, 3e4);
+    let l, c, B = null;
+    /* The catalogue comes from the build, not from probing the server.
 
-  if (validImages.length < 2) {
-    subtitleEl.textContent = 'No media could be loaded.';
-    loadingEl.textContent  = '';
-    /* Keep the splash visible with its message rather than letting
-       the safety timer fade it to a permanently-blank page. See the
-       earlier no-media branch for the same reasoning. */
-    clearTimeout(splashSafetyTimer);
-    return;
-  }
+       build-pool.mjs now writes the full id list into window.__pool.items. When
+       it is there, use it: no HEAD requests, no walking past the last file
+       until the 404s come back, nothing to wait for. Discovery still runs, but
+       behind the first pair rather than in front of it, so a file uploaded
+       since the last build is still picked up.
 
-  /* Loading complete (or safety-capped). Trigger the fade now so the
-     gallery transition begins immediately, before computeTopPairs
-     and pickPair do their work — those run in milliseconds and
-     finish well within the 300ms fade (SPLASH_FADE_MS). */
-  finishSplash();
-
-  /* Persist the signatures computed during this session so the next
-     reload can skip analyzeImage entirely. The pagehide handler does
-     this too, but firing it here means the cache is updated even if
-     the browser somehow skips pagehide (rare crashes, mobile OS
-     terminating a backgrounded tab without notice). */
-  writeSignatureCache();
-
-  /* Restore rotation state from the previous session. clickCount,
-     recent, and lastShown all hydrate from the same JSON blob — see
-     readRotationCache() near the cache infrastructure for the schema
-     and rationale. Done AFTER validImages is fully populated so we
-     can drop any stale entries for sources that aren't in the current
-     catalogue (deleted images would otherwise sit in the maps
-     forever, harmless but cluttering). The whole block is wrapped in
-     a null-check so a cold first visit (or a quota-exceeded localStorage)
-     proceeds with empty maps and clickCount = 0, the pre-persistence
-     behaviour. */
-  const rotation = readRotationCache();
-  if (rotation) {
-    clickCount = rotation.clickCount;
-    for (const [src, ct] of rotation.recent) {
-      if (validImages.includes(src)) recent.set(src, ct);
+       This was two dozen 404s on every load with a warm signature cache — the
+       ones filling the console — and Safari is slow to give up on them. */
+    const _pi = window.__pool && "string" == typeof window.__pool.items ? window.__pool.items.split(" ").filter(Boolean) : null;
+    if (_pi && _pi.length) {
+        l = _pi.filter(e2 => "v" !== e2[0]).map(Number), c = _pi.filter(e2 => "v" === e2[0]).map(e2 => Number(e2.slice(1)));
+        writeDiscoCache("ff_disco_images", l), writeDiscoCache("ff_disco_videos", c);
+        setTimeout(() => {
+            try {
+                discoverWithCache("ff_disco_images", discoverImages, numToSrc, mergeNewImages), discoverWithCache("ff_disco_videos", discoverVideos, videoNumToSrc, mergeNewVideos)
+            } catch {}
+        }, 4e3)
+    } else {
+    B = document.documentElement.classList.contains("has-sig-cache") ? null : await loadBootstrap();
+    if (B && B.images.length) l = B.images, c = Array.isArray(B.videos) ? B.videos : [], writeDiscoCache("ff_disco_images", l), writeDiscoCache("ff_disco_videos", c), discoRefresh("ff_disco_images", discoverImages, numToSrc, l, mergeNewImages), discoRefresh("ff_disco_videos", discoverVideos, videoNumToSrc, c, mergeNewVideos);
+    else {
+        const _d = await Promise.all([discoverWithCache("ff_disco_images", discoverImages, numToSrc, mergeNewImages), discoverWithCache("ff_disco_videos", discoverVideos, videoNumToSrc, mergeNewVideos)]);
+        l = _d[0], c = _d[1]
     }
-    for (const [src, ct] of rotation.lastShown) {
-      if (validImages.includes(src)) lastShown.set(src, ct);
     }
-  }
-
-  /* Restore the across-session set of interlude cards already seen
-     (subset listed in PERSISTENT_INTERLUDES). Contact card is
-     deliberately excluded from persistence and re-appears each
-     visit — see the constant declaration for the reasoning. */
-  for (const s of readSeenInterludes()) seenInterludes.add(s);
-
-  /* scheduleTopPairs is rAF-debounced, so the latest analyses may
-     not yet be reflected. Force a sync compute before picking — and
-     cancel the pending rAF so it doesn't redundantly recompute the
-     same pairs one frame later. */
-  if (topPairsPending) {
-    cancelAnimationFrame(topPairsPending);
-    topPairsPending = 0;
-  }
-  computeTopPairs();
-
-  /* First pair: with probability FIRST_PAIR_FAVORITE_PROB, lead with a
-     favorite image. Walks FAVORITE_IMAGES in random order, picks the
-     first one that's a valid image (not video, has a signature), then
-     pairs it with a random partner from its top-K bestsPerImage list.
-     With the remaining probability, falls through to the normal
-     pickPair selection so the gallery sometimes opens on a fresh
-     top-pool pair instead.
-
-     Previously hard-coded to "always favorite-first" (probability 1.0).
-     That meant the first-impression universe was at most
-     |FAVORITE_IMAGES| × bestsPerImage K — typically 15 × 5 = 75
-     compositions, the same pool every session. At 0.5, half of fresh
-     opens draw from the full top-N pool instead, giving the gallery
-     a meaningfully wider front door.
-
-     If the favorite branch runs but finds nothing usable (rare — only
-     if every favorite failed analysis), falls through to pickPair so
-     the gallery always opens with something.
-
-     IMPORTANT: same allowVideos:false reasoning as the comment block
-     above — first-pair videos would stall the consent card on the
-     MP4 fetch. The favorite-pick is image-only by construction; the
-     partner is explicitly filtered to non-video too; pickPair honours
-     the option for the same reason. */
-  let firstPair = null;
-  if (Math.random() < FIRST_PAIR_FAVORITE_PROB) {
-    const favoriteSrcs = [...FAVORITE_IMAGES]
-      .map(numToSrc)
-      .filter(s => validImages.includes(s) && !isVideo(s) && colorSignatures.has(s));
-    if (favoriteSrcs.length > 0 && bestsPerImage.size > 0) {
-      /* Shuffle favorites so each refresh leads with a different one
-         (FAVORITE_BOOST handles long-term rotation; the first pair is
-         a single moment and benefits from randomness over staleness). */
-      for (let i = favoriteSrcs.length - 1; i > 0; i--) {
-        const j = Math.floor(Math.random() * (i + 1));
-        [favoriteSrcs[i], favoriteSrcs[j]] = [favoriteSrcs[j], favoriteSrcs[i]];
-      }
-      for (const favSrc of favoriteSrcs) {
-        const partners = bestsPerImage.get(favSrc);
-        if (!partners) continue;
-        /* Filter the favorite's top-K partners to non-videos. Then pick
-           randomly from those instead of taking [0] — otherwise every
-           session lands on the favorite's single highest-scoring partner,
-           and across refreshes the same one or two pairs dominate.
-           Random pick across the top-5 keeps the partner high-quality
-           (it's still in this favorite's top-5) while genuinely varying
-           per session. */
-        const eligible = partners.filter(p => !isVideo(p.a) && !isVideo(p.b));
-        if (eligible.length === 0) continue;
-        const partnerPair = eligible[Math.floor(Math.random() * eligible.length)];
-        /* Pair returns [favSrc, partner] — favSrc on the left if it's
-           the .a of the pair, otherwise on the right. Random orientation
-           50/50 to avoid favourites always anchoring the same side. */
-        const other = partnerPair.a === favSrc ? partnerPair.b : partnerPair.a;
-        firstPair = Math.random() < 0.5 ? [favSrc, other] : [other, favSrc];
-        break;
-      }
+    window.__discoImages = l, window.__discoVideos = c, bootMark("catalogue");
+    /* Kicked off here, awaited just before computeTopPairs below, so the first
+       scoring pass already has the captions. Bounded, so a missing or slow
+       manifest delays the splash by at most CAPTIONS_MAX_WAIT_MS. */
+    /* Hold queued scoring runs from here until the opening pair is on screen
+       (see bootHold): captions.json landing asks for a rescore, and on a first
+       visit it lands mid-boot, which put a full scoring pass back in front of
+       the pair. Released below if this boot has to score to choose a pair, at
+       the first swap otherwise, and never held longer than five seconds. */
+    bootHold = !0, setTimeout(() => bootHold = !1, 5e3);
+    const captionsReady = loadCaptionManifest();
+    captionsReady.then(() => bootMark("captions"));
+    const d = l.length + c.length;
+    if (d < 2) return (pHalt(), t && (t.textContent = "No media could be loaded."), n && (n.textContent = "")), void clearTimeout(r);
+    images = l.map(numToSrc).concat(c.map(videoNumToSrc));
+    for (const e of c.map(videoNumToSrc)) validImages.includes(e) || validImages.push(e), colorSignatures.has(e) || colorSignatures.set(e, fallbackSignature());
+    const h = readSignatureCache();
+    if (B && B.sigs)
+        for (const e in B.sigs) h[e] || (h[e] = B.sigs[e]);
+    for (const e of l.map(numToSrc)) {
+        const t = h[e];
+        t && (colorSignatures.set(e, t), validImages.includes(e) || validImages.push(e))
     }
-  }
-  /* Either the favorite branch didn't run (probability roll), or it
-     ran but found nothing usable. Fall through to pickPair. */
-  if (!firstPair) {
-    firstPair = pickPair(validImages, { allowVideos: false });
-  }
-  /* Lift the gate and start the diptych regardless of consent state —
-     the banner (if needed) is non-blocking and shows alongside the
-     first reveal rather than gating it. The welcome statement now
-     appears later as one of the rotation interludes
-     (CONTACT_MIN..CONTACT_MAX clicks in). */
-  liftGate();
-  /* Start warming the first batch of videos in the background as the
-     gallery comes up. By the time the user reaches their first
-     video-containing pair (typically pair 3-4 given VIDEO_MIN_GAP),
-     the bytes are already mostly down. */
-  primeInitialVideoWarmup();
-  loadDiptych(firstPair);
-  if (consentEl && consentEl.isConnected) showAnalytics();
-})();
+    for (const e of c.map(videoNumToSrc)) {
+        const t = h[e];
+        t && colorSignatures.set(e, t)
+    }
+    for (const e of c.map(videoNumToSrc)) {
+        const t = colorSignatures.get(e);
+        t && t.isFallback && loadVideoPosterForAnalysis(e)
+    }
+    /* build-pool.mjs writes the true reachable count into the subtitle at build
+       time. Trust it while the catalogue it was built against still matches
+       what we just discovered; otherwise the real figure is computed below,
+       once scoring has run — no placeholder, no rule of thumb. */
+    const P = window.__pool,
+        countIsStale = !P || P.count <= 0 || P.n !== d;
+    /* Worth knowing which of the two figures you are looking at, and why. */
+    countIsStale && console.warn("Diptych: built count ignored — payload describes " + (P ? P.n : "?") + " items, found " + d + ". Re-run build-pool.mjs, or upload the missing media.");
+    /* Honour the hash on a fresh arrival, ignore it on a reload.
+       
+       This used to ask performance.getEntriesByType("navigation") whether the
+       page was reloaded, and Safari answers "reload" for a URL typed or pasted
+       into a tab that already holds the same page — so a shared link opened in
+       Safari had its pair thrown away and a random one shown instead.
+       
+       A session flag is the reliable test: if this tab has already shown a
+       diptych, we are returning, so give a new pair. If it has not, the hash
+       came from outside and names the pair someone meant to share. */
+    let _returning = !1;
+    try {
+        _returning = "1" === sessionStorage.getItem("ff_session_open"), sessionStorage.setItem("ff_session_open", "1")
+    } catch {}
+    /* Always honour a pair named in the URL. A shared #v22,125 link has to
+       open that pair even if this tab already ran a session — otherwise the
+       hash, the why panel and the photographs disagree. A reload of a shared
+       link should keep the shared pair, not throw it away. */
+    const g = location.hash.match(/^#(v\d+|\d+),(v\d+|\d+)$/i);
+    if (g && g[1] !== g[2]) {
+        const e = [idToSrc(g[1]), idToSrc(g[2])];
+        /* Only analyse a named frame whose signature is not already cached.
+           This used to download and analyse both thumbnails every time — and
+           since the address bar carries the current pair after the first
+           click, that was every reload, in front of the first pair. A video
+           with no usable poster went further and loaded the clip itself. */
+        const _known = e2 => {
+            const t2 = colorSignatures.get(e2);
+            return !!t2 && !t2.isFallback
+        };
+        if (!(await Promise.all(e.map(e2 => _known(e2) || loadOne(e2)))).every(Boolean))
+            for (const e of images) {
+                if (validImages.length >= 2) break;
+                validImages.includes(e) || await loadOne(e)
+            }
+        if (validImages.length < 2) return (pHalt(), t && (t.textContent = "No media could be loaded."), n && (n.textContent = "")), void clearTimeout(r);
+        backgroundLoadRest(l.map(numToSrc).filter(e => !validImages.includes(e)));
+        e.forEach(src => { if (src && !validImages.includes(src)) validImages.push(src); });
+        const a = e[0] && e[1] && e[0] !== e[1] ? e : null;
+        return bootMark("load"), s(), showFirstPairHint(a), liftGate(), deferVideoWarmup(), loadPromise = loadDiptych(a), loadPromise.finally(() => loadPromise = null), void(consentEl && consentEl.isConnected && showAnalytics())
+    }
+    /* A first visit has no signature cache, and used to download and analyse
+       the first eight thumbnails before it could go on — while captions.json,
+       which carries every signature, was arriving alongside. Wait for that one
+       file instead; the thumbnails are only the fallback if it does not come. */
+    Object.keys(h).length || await Promise.race([captionsReady, new Promise(e => setTimeout(e, CAPTIONS_MAX_WAIT_MS))]);
+    o = l.map(numToSrc);
+    const p = o.slice(0, 8),
+        f = o.slice(8);
+    let y = 0;
+    p.forEach(e => {
+        colorSignatures.has(e) ? y++ : loadOne(e).finally(() => {
+            y++
+        })
+    });
+    let w = 0,
+        b = performance.now();
+    if (await new Promise(e => {
+            const t = () => {
+                if (i) return void e();
+                const a = performance.now(),
+                    o = Math.min(.1, (a - b) / 1e3);
+                b = a;
+                const r = p.length || 1,
+                    s = Math.min(r, y) / r * 100;
+                s > w && (w = Math.min(s, w + 2e3 * o));
+                w >= 100 ? e() : requestAnimationFrame(t)
+            };
+            requestAnimationFrame(t)
+        }), validImages.length < 2) return (pHalt(), t && (t.textContent = "No media could be loaded."), n && (n.textContent = "")), void clearTimeout(r);
+    bootMark("signatures"), s(), writeSignatureCache();
+    const S = readRotationCache();
+    if (S) {
+        clickCount = S.clickCount;
+        for (const [e, t] of S.recent) validImages.includes(e) && recent.set(e, t);
+        for (const [e, t] of S.lastShown) validImages.includes(e) && lastShown.set(e, t)
+    }
+    for (const e of readSeenInterludes()) seenInterludes.add(e);
+    interludeQueue = INTERLUDE_SCHEDULE.filter(([e]) => !seenInterludes.has(e));
+    nextInterludeAt = interludeQueue.length ? interludeQueue[0][1] : rollNextInterlude();
+    let E = null;
+    {
+        const e = readNextPair();
+        if (e) {
+            const t = numToSrc(e[0]),
+                n = numToSrc(e[1]);
+            validImages.includes(t) && validImages.includes(n) && colorSignatures.has(t) && colorSignatures.has(n) && (E = [t, n])
+        }
+    }
+    /* Cold-visit opening pair chosen during HTML parse (see the OPENING-PAIR
+       POOL block in index.html) and already preloading. Honouring it here is
+       what turns that preload into a cache hit; picking anything else now
+       would waste both downloads. Validated against the live catalogue first,
+       so a stale pool — an image deleted since build-pool.mjs last ran —
+       falls through to the normal selection instead of showing a gap. */
+    if (!E && Array.isArray(window.__openingPair) && 2 === window.__openingPair.length) {
+        const e = numToSrc(window.__openingPair[0]),
+            t = numToSrc(window.__openingPair[1]);
+        e !== t && validImages.includes(e) && validImages.includes(t) && colorSignatures.has(e) && colorSignatures.has(t) && (E = Math.random() < .5 ? [e, t] : [t, e])
+    }
+    /* Scoring off the critical path.
 
-/* ─────────────────────────────────────────────────────────────────────────
-   CLICK / TAP HANDLING
-   ───────────────────────────────────────────────────────────────────────── */
+       Scoring rates every pair in the catalogue, and it used to run here, on
+       every visit, in front of the opening pair — along with a wait of up to
+       CAPTIONS_MAX_WAIT_MS for captions.json. But when the pair is already
+       known (the one the last session prepared, or the one index.html drew and
+       is already preloading) neither is needed to show it: only the pair after
+       needs scores. So in that case both are skipped here, and scoring runs
+       from the frame after the first swap. It is still done up front when the
+       pair has to be chosen now, or when the built count is stale and the
+       splash needs the real figure. */
+    if (!E || countIsStale) {
+        bootHold = !1;
+        await Promise.race([captionsReady, new Promise(e => setTimeout(e, CAPTIONS_MAX_WAIT_MS))]);
+        computeTopPairs();
+        /* Scoring has run, so the true count is now available. This lands while
+           the splash is still up, so a stale or missing pool costs nothing
+           visible — the number simply arrives a few hundred milliseconds in
+           rather than being in the HTML from the start. */
+        if (countIsStale) {
+            const e = countReachablePairs();
+            e > 0 && (a = e, t && (t.dataset.count = e))
+        }
+    }
+    if (!E && Math.random() < .5) {
+        const e = [...FAVORITE_IMAGES].map(numToSrc).filter(e => validImages.includes(e) && !isVideo(e) && colorSignatures.has(e));
+        if (e.length > 0 && bestsPerImage.size > 0) {
+            for (let t = e.length - 1; t > 0; t--) {
+                const n = Math.floor(Math.random() * (t + 1));
+                [e[t], e[n]] = [e[n], e[t]]
+            }
+            for (const t of e) {
+                const e = bestsPerImage.get(t);
+                if (!e) continue;
+                const n = e.filter(e => !isVideo(e.a) && !isVideo(e.b));
+                if (0 === n.length) continue;
+                const a = n[Math.floor(Math.random() * n.length)],
+                    o = a.a === t ? a.b : a.a;
+                E = Math.random() < .5 ? [t, o] : [o, t];
+                break
+            }
+        }
+    }
+    E || (E = pickPair(validImages, {
+        allowVideos: !1
+    })), bootMark("load"), showFirstPairHint(E), liftGate(), deferVideoWarmup(), loadPromise = loadDiptych(E), loadPromise.finally(() => loadPromise = null), consentEl && consentEl.isConnected && showAnalytics(), backgroundLoadRest(f)
+}();
+let loadingDiptych = !1,
+    clicksSinceInterlude = 0,
+    nextInterludeAt = INTERLUDE_SCHEDULE[0][1];
+/* How long the title card holds before dismissing itself. The why card that
+   follows appears instantly rather than fading in, so WHY_HINT_HOLD_MS below
+   is its whole visible life, plus a 0.2s fade as it leaves. */
+/* When false, the why panel shows both lines: the first names what is in the
+   two frames, the second says why they are together. When true, the caption
+   path collapses to the reason line alone (see showWhy). The uncaptioned
+   fallback always shows both regardless, since its second line is only a
+   closer and says nothing on its own. */
+const WHY_REASON_ONLY = !0,
+    SPLASH_MIN_MS = 1400,
+    /* How long the why card sits before lifting to reveal the pair. It can
+       carry a full sentence, occasionally two, so it needs real reading time —
+       a line runs up to 110 characters. */
+    WHY_HINT_HOLD_MS = 2600;
+let splashHiddenResolve;
+/* Resolves when the splash has finished fading and been removed. The hint
+   waits on it, so the two never overlap: on a warm visit the diptych is ready
+   long before the splash clears, and without this the hint would spend its
+   whole life behind an opaque title card. */
+const splashHidden = new Promise(e => splashHiddenResolve = e);
+let firstHintShown = !1,
+    firstHintDone = !1,
+    firstHintTimer = null;
 
-/* In-flight guard for loadDiptych. Without this, a click landing while
-   a previous load is still awaiting img.decode would overwrite the
-   in-flight image's src and call history.replaceState twice with
-   potentially mismatched pairs — observable as flicker or a hash that
-   disagrees with what's painted. */
-let loadingDiptych = false;
-
-/* Roll the first interlude target up front. clicksSinceInterlude
-   counts user clicks since the last interlude (or since session
-   start); when it crosses nextInterludeAt, an interlude fires and
-   both are reset. */
-let clicksSinceInterlude = 0;
-/* First interlude is pinned to exactly 3 pairs in — the share card
-   (always the first by pickInterlude's ordering rule) teaches the
-   gallery's two basic facts: there's no going back, and S/long-press
-   is how you mark a favourite. Three pairs is enough that the visitor
-   has felt the click-forward rhythm; any sooner and the lesson lands
-   before they've experienced what it applies to. Subsequent
-   interludes use the regular CONTACT_MIN..CONTACT_MAX random cadence
-   (rolled fresh in advance() after each fire) so the second and
-   third feel organic rather than scheduled. */
-let nextInterludeAt      = 3;
-
-/* Shared advance step — used by both the diptych click handler and
-   the keyboard nav listener. Same in-flight guard, same interlude
-   gating logic; defining it once keeps the two input paths in sync.
-   Once all three interludes have been shown for this session,
-   seenInterludes.size === INTERLUDES.length and the gate skips the
-   interlude branch entirely — gallery becomes pure diptychs. */
-async function advance() {
-  if (loadingDiptych) return;
-  clickCount++;
-  clicksSinceInterlude++;
-  const interludesRemaining = seenInterludes.size < INTERLUDES.length;
-  if (interludesRemaining && clicksSinceInterlude >= nextInterludeAt) {
-    clicksSinceInterlude = 0;
-    nextInterludeAt      = rollNextInterlude();
-    showInterlude();
-  } else {
-    loadingDiptych = true;
-    try { await loadDiptych(); } finally { loadingDiptych = false; }
-  }
+/* The why text for a pair, exactly as the panel would show it on a swipe — same
+   composer, same reason-only rule. Returns null if either frame lacks a real
+   signature, in which case there is nothing honest to say about the pairing. */
+function whyLinesFor(e) {
+    if (!e || 2 !== e.length) return null;
+    const t = colorSignatures.get(e[0]),
+        n = colorSignatures.get(e[1]);
+    if (!t || !n || t.isFallback || n.isFallback) return null;
+    whyPairSrcs = e;
+    const [a, o, i] = composeWhyText(t, n, subjectFor(e[0]), subjectFor(e[1]));
+    whyPairSrcs = null;
+    return (WHY_REASON_ONLY && i ? [o] : [a, o]).map(stripPunctuation)
 }
 
-/* Touch-landscape devices get one fullscreen attempt per session.
-   Without the latch, deliberately exiting fullscreen via the
-   browser's own gesture would be immediately reversed by the next
-   tap on the diptych — the site fighting the user. The flag is
-   session-scoped (resets on refresh), which feels right: one
-   refresh re-arms the request. */
-let triedFullscreen = false;
-document.getElementById('diptych').addEventListener('click', () => {
-  if (!triedFullscreen
-      && matchMedia('(hover: none) and (orientation: landscape)').matches
-      && !document.fullscreenElement
-      && document.documentElement.requestFullscreen) {
-    triedFullscreen = true;
-    document.documentElement.requestFullscreen().catch(() => {});
-  }
-  advance();
+/* Replace the card's text with one or more lines, reusing the .line block
+   layout the interludes use. */
+function setHintLines(e, t) {
+    e.textContent = "";
+    for (const n of t) {
+        if (!n) continue;
+        const a = document.createElement("span");
+        a.className = "line", a.textContent = n, e.appendChild(a)
+    }
+}
+/* Nothing stands between the splash and the pair.
+
+   There used to be a card here — first the why for the coming pair, later just
+   the gesture — and either way it was a screen of text the visitor had to get
+   past before seeing a photograph. The splash names the site; after that the
+   diptych should be the next thing, with the gesture waiting quietly at the
+   foot of the screen.
+
+   The name is kept, and firstHintDone set immediately, so that the click
+   handler and the analytics card behave exactly as they did once the old card
+   had been dismissed. */
+async function showFirstPairHint(pair) {
+    if (firstHintShown) return;
+    firstHintShown = firstHintDone = !0;
+    const e = document.getElementById("first-hint");
+    e && e.parentNode && e.remove();
+    await splashHidden;
+    showClickHint()
+}
+
+function dismissFirstHint() {
+    if (firstHintDone) return;
+    firstHintDone = !0, firstHintTimer && (clearTimeout(firstHintTimer), firstHintTimer = null);
+    const e = document.getElementById("first-hint");
+    e && (e.classList.remove("visible"), e.classList.add("leaving"), setTimeout(() => {
+        e.parentNode && e.remove()
+    }, 350)), showClickHint()
+}
+
+/* A quiet line at the foot of the screen, appearing with the first pair and
+   staying until the visitor clicks. It replaces the "Click anywhere" card
+   that used to precede the pair: the instruction is still there, but beside
+   the photographs rather than in front of them.
+
+   It sits above the analytics banner when that is present, measured rather
+   than guessed, since the banner is two lines of a viewport-relative font and
+   isn't there at all once a choice has been made. */
+let clickHintEl = null;
+
+function positionClickHint() {
+    if (!clickHintEl) return;
+    const e = document.getElementById("consent"),
+        t = e && e.isConnected && "true" !== e.getAttribute("aria-hidden") ? e.getBoundingClientRect().height : 0;
+    clickHintEl.style.bottom = t > 0 ? `calc(max(10px, env(safe-area-inset-bottom)) + ${Math.round(t)}px + 1.2em)` : "max(10px, env(safe-area-inset-bottom))"
+}
+
+function showClickHint() {
+    if (clickHintEl) return;
+    clickHintEl = document.getElementById("click-hint");
+    if (!clickHintEl) return;
+    /* Each gesture with what it does in brackets, so neither has to be
+       guessed. One line, three non-breaking spaces between the two halves,
+       matching the gap between Accept / Decline / Why on the analytics card;
+       regular spaces would collapse and could wrap mid-phrase. */
+    clickHintEl.textContent = "Swipe up (why)\u00a0\u00a0\u00a0Click (next)";
+    /* Delayed by the card's own fade-out so the line arrives with the pair
+       rather than over the top of the card leaving. */
+    setTimeout(() => {
+        clickHintEl && (positionClickHint(), clickHintEl.classList.add("visible"))
+    }, 350), window.addEventListener("resize", positionClickHint)
+}
+
+function hideClickHint() {
+    if (!clickHintEl) return;
+    const e = clickHintEl;
+    clickHintEl = null, window.removeEventListener("resize", positionClickHint), e.classList.remove("visible"), setTimeout(() => {
+        e.parentNode && e.remove()
+    }, 350)
+}
+async function advance() {
+    if (loadingDiptych) return;
+    /* While the opening why card is still on screen, the first click
+       spends itself dismissing the hint and nothing else — the opening pair
+       stays put. Advancing only resumes once the hint has gone, so the pair
+       the visitor is being invited to look at isn't taken away by the very
+       click that acknowledges the invitation. Applies to the keyboard path
+       too (space / enter / arrow all route through advance). */
+    if (firstHintShown && !firstHintDone) return void dismissFirstHint();
+    /* Its instruction has been followed; it has nothing left to say. */
+    hideClickHint(), dismissFirstHint(), clickCount++, clicksSinceInterlude++;
+    if (seenInterludes.size < INTERLUDES.length && clicksSinceInterlude >= nextInterludeAt) clicksSinceInterlude = 0, showInterlude(), nextInterludeAt = interludeQueue.length ? interludeQueue[0][1] : rollNextInterlude();
+    else {
+        loadingDiptych = !0;
+        try {
+            await loadDiptych()
+        } finally {
+            loadingDiptych = !1
+        }
+    }
+}
+let triedFullscreen = !1;
+document.getElementById("diptych").addEventListener("click", () => {
+    !triedFullscreen && matchMedia("(hover: none) and (orientation: landscape)").matches && !document.fullscreenElement && document.documentElement.requestFullscreen && (triedFullscreen = !0, document.documentElement.requestFullscreen().catch(() => {})), advance()
+}), document.addEventListener("keydown", async e => {
+    const t = e.target;
+    if (t && ("INPUT" === t.tagName || "TEXTAREA" === t.tagName || t.isContentEditable)) return;
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    const n = " " === e.key || "Enter" === e.key || "ArrowRight" === e.key,
+        a = "Escape" === e.key;
+    if (!n && !a) return;
+    const o = document.getElementById("splash");
+    if (!o || o.classList.contains("hidden")) return whyEl && whyEl.classList.contains("visible") ? (e.preventDefault(), void hideWhy()) : currentInterlude ? (e.preventDefault(), interludeLoadTrigger && interludeLoadTrigger(), interludePreload && await interludePreload, void hideInterlude()) : void(n && (e.preventDefault(), advance()));
+    e.preventDefault()
 });
-
-/* ─────────────────────────────────────────────────────────────────────────
-   KEYBOARD NAVIGATION
-
-   Space / Enter / Right-arrow advance the diptych or dismiss whatever
-   overlay is currently on top; Escape dismisses overlays only. The
-   handler is delegated to document so it works regardless of focus,
-   but it bails when the user is typing in an input or holding a
-   modifier (so Ctrl+R, Cmd+L and friends still work as expected).
-
-   Priority order matches z-index: splash → privacy → interlude →
-   diptych. Whichever is currently visible consumes the key.
-   ───────────────────────────────────────────────────────────────────────── */
-
-document.addEventListener('keydown', async (e) => {
-  const t = e.target;
-  if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
-  if (e.ctrlKey || e.metaKey || e.altKey) return;
-
-  const isAdvance = (e.key === ' ' || e.key === 'Enter' || e.key === 'ArrowRight');
-  const isEscape  = (e.key === 'Escape');
-  if (!isAdvance && !isEscape) return;
-
-  /* Splash still on screen — absorb the keypress so it doesn't leak
-     through to the diptych underneath, but DO NOT dismiss. The splash
-     has no skip path anymore; it dismisses on loading completion or
-     the SPLASH_MAX_WAIT_MS safety cap. Re-querying the element rather
-     than capturing once at script parse: finishSplash removes it from
-     the DOM after the fade, so a stale reference would never read as
-     "not hidden" again. */
-  const splashEl = document.getElementById('splash');
-  if (splashEl && !splashEl.classList.contains('hidden')) {
-    e.preventDefault();
-    return;
-  }
-
-  /* Privacy modal — Escape only; the Accept/Decline buttons handle
-     their own keyboard activation since they're focusable. */
-  if (privacyEl && privacyEl.classList.contains('visible')) {
-    if (isEscape) { e.preventDefault(); hidePrivacy(); }
-    return;
-  }
-
-  /* Interlude visible — any handled key dismisses, mirroring the
-     click-anywhere-to-dismiss behavior. Await the preloaded next
-     pair so the photo behind is ready when the card fades out.
-
-     The consent banner is NOT a currentInterlude (non-blocking — see
-     ANALYTICS CONSENT BANNER section), so it never reaches this
-     branch; keys press through to the diptych underneath. */
-  if (currentInterlude) {
-    e.preventDefault();
-    if (interludePreload) await interludePreload;
-    hideInterlude();
-    return;
-  }
-
-  /* Diptych on screen — advance on advance keys; Escape is a no-op
-     (there's nothing to dismiss). */
-  if (isAdvance) {
-    e.preventDefault();
-    advance();
-  }
-});
-
-/* ─────────────────────────────────────────────────────────────────────────
-   ANALYTICS CONSENT BANNER
-
-   Non-blocking bottom strip — appears alongside the first diptych
-   reveal rather than as a wall between splash and gallery. The user
-   can click through the diptych, share, etc. while the banner sits
-   there waiting for an Accept / Decline decision. Flow:
-
-     splash → diptych  (with consent banner at the bottom if needed)
-
-   Previously a centered interlude-style card. The change was made so
-   the gallery reveal isn't gated on a deliberate choice — consent is
-   a one-time decision the user can take whenever they notice the
-   banner. The "Why?" link still opens the full-screen privacy slide
-   for users who want the long explanation; the banner stays visible
-   behind that modal and resumes its role once the modal closes.
-   ───────────────────────────────────────────────────────────────────────── */
-
-const GA_ID       = 'G-F8Z6W7JPHQ';
-const CONSENT_KEY = 'ff-analytics-consent';
-const consentEl   = document.getElementById('consent');
-const privacyEl   = document.getElementById('privacy');
+const GA_ID = "G-F8Z6W7JPHQ",
+    CONSENT_KEY = "ff-analytics-consent",
+    consentEl = document.getElementById("consent");
 
 function loadAnalytics() {
-  if (window.gaEnabled) return;
-  window.gaEnabled = true;
-  const s = document.createElement('script');
-  s.async = true;
-  s.src   = `https://www.googletagmanager.com/gtag/js?id=${GA_ID}`;
-  document.head.appendChild(s);
-  window.dataLayer = window.dataLayer || [];
-  window.gtag = function () { dataLayer.push(arguments); };
-  gtag('js', new Date());
-  gtag('config', GA_ID, { anonymize_ip: true });
+    if (window.gaEnabled) return;
+    window.gaEnabled = !0;
+    const e = document.createElement("script");
+    e.async = !0, e.src = `https://www.googletagmanager.com/gtag/js?id=${GA_ID}`, document.head.appendChild(e), window.dataLayer = window.dataLayer || [], window.gtag = function() {
+        dataLayer.push(arguments)
+    }, gtag("js", new Date), gtag("config", GA_ID, {
+        anonymize_ip: !0
+    })
 }
+const CONSENT_REVEAL_DELAY_MS = 900;
 
-/* Reveal the consent banner. Non-blocking: doesn't set currentInterlude
-   (so keyboard/click input still reaches the diptych underneath) and
-   doesn't capture focus (so the gallery stays the active surface). The
-   styling lives in styles.css under #consent overrides; this only
-   flips the visibility state. */
 function showAnalytics() {
-  if (!consentEl) return;
-  consentEl.classList.add('visible');
-  consentEl.setAttribute('aria-hidden', 'false');
+    consentEl && setTimeout(() => {
+        consentEl && consentEl.isConnected && (consentEl.classList.add("visible"), consentEl.setAttribute("aria-hidden", "false"))
+    }, CONSENT_REVEAL_DELAY_MS)
 }
 
-/* Dismiss the banner. No interludePreload await — the diptych was
-   never gated on consent, so there's nothing to coordinate with.
-   setTimeout cleans the element from the DOM after the fade-out
-   completes (250ms covers the 0.2s transition with margin to spare). */
 function dismissConsent() {
-  if (!consentEl) return;
-  consentEl.classList.remove('visible');
-  consentEl.setAttribute('aria-hidden', 'true');
-  setTimeout(() => consentEl.remove(), 250);
+    consentEl && (consentEl.classList.remove("visible"), consentEl.setAttribute("aria-hidden", "true"), setTimeout(() => consentEl.remove(), 250))
 }
-
-function showPrivacy() {
-  privacyEl.classList.add('visible');
-  privacyEl.setAttribute('aria-hidden', 'false');
-  captureFocus(privacyEl);
-}
-function hidePrivacy() {
-  privacyEl.classList.remove('visible');
-  privacyEl.setAttribute('aria-hidden', 'true');
-  restoreFocus();
-}
-
-const stored = (() => { try { return localStorage.getItem(CONSENT_KEY); } catch { return null; } })();
-if (stored === 'granted') {
-  loadAnalytics();
-  consentEl.remove();
-  privacyEl.remove();
-} else if (stored === 'denied') {
-  consentEl.remove();
-  privacyEl.remove();
-} else {
-  /* No stored decision — banner stays in the DOM, hidden (opacity:0
-     via the .interlude default), and gets revealed by showAnalytics()
-     as part of the initial gallery reveal. No first-pair preload to
-     wait on anymore — the banner is non-blocking, so dismissal is
-     immediate. */
-  document.getElementById('consent-accept').addEventListener('click', (e) => {
+const stored = (() => {
+    try {
+        return localStorage.getItem(CONSENT_KEY)
+    } catch {
+        return null
+    }
+})();
+"granted" === stored ? (loadAnalytics(), consentEl.remove()) : "denied" === stored ? consentEl.remove() : (document.getElementById("consent-accept").addEventListener("click", e => {
     e.stopPropagation();
-    try { localStorage.setItem(CONSENT_KEY, 'granted'); } catch {}
-    loadAnalytics();
-    dismissConsent();
-  });
-  document.getElementById('consent-decline').addEventListener('click', (e) => {
+    try {
+        localStorage.setItem(CONSENT_KEY, "granted")
+    } catch {}
+    loadAnalytics(), dismissConsent()
+}), document.getElementById("consent-decline").addEventListener("click", e => {
     e.stopPropagation();
-    try { localStorage.setItem(CONSENT_KEY, 'denied'); } catch {}
-    dismissConsent();
-  });
-  document.getElementById('consent-why').addEventListener('click', (e) => {
-    e.stopPropagation();
-    showPrivacy();
-  });
+    try {
+        localStorage.setItem(CONSENT_KEY, "denied")
+    } catch {}
+    dismissConsent()
+}), document.getElementById("consent-why").addEventListener("click", e => {
+    e.stopPropagation(), window.open("/privacy.html", "privacy-policy", "width=" + screen.width / 3 + ",height=" + screen.availHeight + ",top=0,scrollbars=yes,resizable=yes")
+}));
+const shareToastEl = document.getElementById("share-toast"),
+    shareToastTextEl = document.getElementById("share-toast-text"),
+    /* How long "Link copied" stays up. It was 150ms, which is below the point
+       at which most people register that text appeared at all — long enough to
+       leave someone unsure whether the share worked. */
+    SHARE_TOAST_MS = 1400,
+    LONG_PRESS_MS = 550,
+    LONG_PRESS_MOVE_TOLERANCE = 12,
+    SWIPE_UP_MIN = 60;
+let shareToastTimer = null,
+    longPressFired = !1,
+    whyGestureFired = !1,
+    touchActive = !1,
+    touchStartTime = 0,
+    touchStartX = 0,
+    touchStartY = 0,
+    touchMoved = !1;
 
-  /* Privacy slide — clicking outside the action anchors dismisses
-     back to the consent banner. The action anchors themselves complete
-     the consent flow (both the privacy slide and the consent banner
-     go away). Action anchors live inside .privacy-actions so that
-     selector is the differentiator — a click on the long privacy
-     paragraph above shouldn't be mistaken for a button press. */
-  privacyEl.addEventListener('click', (e) => {
-    if (e.target.closest('.privacy-actions a')) return;
-    hidePrivacy();
-  });
-  document.getElementById('privacy-accept').addEventListener('click', (e) => {
-    e.stopPropagation();
-    try { localStorage.setItem(CONSENT_KEY, 'granted'); } catch {}
-    loadAnalytics();
-    hidePrivacy();
-    dismissConsent();
-  });
-  document.getElementById('privacy-decline').addEventListener('click', (e) => {
-    e.stopPropagation();
-    try { localStorage.setItem(CONSENT_KEY, 'denied'); } catch {}
-    hidePrivacy();
-    dismissConsent();
-  });
-}
-
-/* ─────────────────────────────────────────────────────────────────────────
-   SHAREABLE PAIRS
-
-   Every pair has a URL — history.replaceState fires inside loadDiptych
-   on every advance, so location.href always reflects what's on screen.
-   This block makes that shareable without adding visible chrome:
-
-     Desktop:  S key             →  copy URL  →  brief "Link copied" toast
-     Mobile:   long-press diptych →  copy URL  →  brief "Link copied" toast
-
-   The toast is a screen-wide semi-transparent dim with large centred
-   text; auto-dismisses in ~1s. The existing share interlude (every
-   CONTACT_MIN..CONTACT_MAX clicks) keeps using its own Web-Share-API path —
-   untouched here.
-   ───────────────────────────────────────────────────────────────────────── */
-
-const shareToastEl     = document.getElementById('share-toast');
-const shareToastTextEl = document.getElementById('share-toast-text');
-const LONG_PRESS_MS    = 550;
-const LONG_PRESS_MOVE_TOLERANCE = 12; // px — beyond this, treat as scroll/drag, not press
-
-let shareToastTimer = null;
-let longPressFired  = false;
-let touchActive     = false;
-let touchStartTime  = 0;
-let touchStartX     = 0;
-let touchStartY     = 0;
-let touchMoved      = false;
-
-function showShareToast(text) {
-  shareToastTextEl.textContent = text;
-  shareToastEl.classList.add('visible');
-  shareToastEl.setAttribute('aria-hidden', 'false');
-  clearTimeout(shareToastTimer);
-  /* Hold 150ms then trigger the CSS fade-out (100ms). Tuned to feel
-     like a lightning flash — snap on, brief peak, quick decay. The
-     CSS routes .visible's transition to 0s (instant appearance) and
-     the base rule's transition to 100ms (the fade-out), so the
-     in/out asymmetry IS the thunderstorm feel: the toast doesn't
-     gracefully arrive, it strikes. Total visible cycle ~250ms.
-     Previously 500ms hold + 120ms symmetric fades = ~740ms, which
-     felt deliberate where the user wanted decisive. Going under
-     ~120ms hold loses readability on "Link copied" even though it's
-     just two words; the eye still needs that long to register and
-     parse the message. */
-  shareToastTimer = setTimeout(() => {
-    shareToastEl.classList.remove('visible');
-    shareToastEl.setAttribute('aria-hidden', 'true');
-  }, 150);
+function showShareToast(e) {
+    shareToastTextEl.textContent = e, shareToastEl.classList.add("visible"), shareToastEl.setAttribute("aria-hidden", "false"), clearTimeout(shareToastTimer), shareToastTimer = setTimeout(() => {
+        shareToastEl.classList.remove("visible"), shareToastEl.setAttribute("aria-hidden", "true")
+    }, SHARE_TOAST_MS)
 }
 
 function shareCurrentPair() {
-  /* loadDiptych updates the URL hash via history.replaceState, so
-     location.href is the live "what's currently shown" URL. */
-  const url   = location.href;
-  const title = 'Federico Ferrari — Random Diptychs';
+    const e = location.href;
+    if (matchMedia("(hover: none) and (pointer: coarse)").matches && navigator.share) return void navigator.share({
+        url: e,
+        title: "Federico Ferrari — Random Diptychs"
+    }).then(() => {
+        window.gaEnabled && "undefined" != typeof gtag && gtag("event", "pair_shared", {
+            url: e,
+            source: "shortcut-mobile"
+        })
+    }, () => {});
+    const t = () => {
+        window.gaEnabled && "undefined" != typeof gtag && gtag("event", "pair_shared", {
+            url: e,
+            source: "shortcut"
+        })
+    };
+    navigator.clipboard && navigator.clipboard.writeText ? navigator.clipboard.writeText(e).then(() => {
+        showShareToast("Link copied"), t()
+    }, () => {
+        legacyCopy(e) ? (showShareToast("Link copied"), t()) : showShareToast("Couldn’t copy")
+    }) : legacyCopy(e) ? (showShareToast("Link copied"), t()) : showShareToast("Couldn’t copy")
+}
 
-  /* MOBILE PATH — native share sheet.
-     iOS Safari has become unreliable about clipboard access; both
-     navigator.clipboard.writeText and document.execCommand('copy')
-     silently fail on plenty of real-world devices (in-app webviews,
-     Lockdown Mode, recent permission tightening). navigator.share
-     uses the same user-gesture machinery but works reliably across
-     iOS Safari, Android Chrome, and most webviews. The native sheet
-     IS the feedback — the user picks Copy / Messages / AirDrop /
-     email and the OS handles the rest. No toast needed; the sheet
-     opening is the success signal. */
-  const isMobile = matchMedia('(hover: none) and (pointer: coarse)').matches;
-  if (isMobile && navigator.share) {
-    navigator.share({ url, title }).then(
-      () => {
-        /* Only log a share event on actual success. Without the
-           promise branching, the previous version fired gtag
-           unconditionally — counting every long-press that opened
-           the sheet, including ones the user cancelled. */
-        if (window.gaEnabled && typeof gtag !== 'undefined') {
-          gtag('event', 'pair_shared', { url, source: 'shortcut-mobile' });
+function legacyCopy(e) {
+    const t = document.createElement("textarea");
+    t.value = e, t.setAttribute("readonly", ""), t.style.cssText = "position:fixed;top:0;left:0;width:2em;height:2em;padding:0;border:none;outline:none;box-shadow:none;background:transparent;font-size:16px;opacity:0;", document.body.appendChild(t);
+    let n = !1;
+    try {
+        if (/iPad|iPhone|iPod/.test(navigator.userAgent) || "MacIntel" === navigator.platform && navigator.maxTouchPoints > 1) {
+            t.contentEditable = "true", t.readOnly = !1;
+            const n = document.createRange();
+            n.selectNodeContents(t);
+            const a = window.getSelection();
+            a.removeAllRanges(), a.addRange(n), t.setSelectionRange(0, e.length)
+        } else t.focus(), t.select();
+        n = document.execCommand("copy")
+    } catch {
+        n = !1
+    }
+    return document.body.removeChild(t), n
+}
+const diptychEl = document.getElementById("diptych");
+/* Trackpad swipe, the desktop equivalent of the touch swipe below — and like
+   it, this opens the why panel. It does NOT advance: clicking does that.
+
+   Not over the splash, not during an interlude, not when the panel is
+   already open. The threshold and the cooldown
+   keep a flick of trackpad momentum from firing several times over. */
+let _wheelAt = 0;
+window.addEventListener("wheel", e => {
+    if (Math.abs(e.deltaY) < 28 || e.deltaY < 0) return;
+    const t = Date.now();
+    if (t - _wheelAt < 700) return;
+    const n = document.getElementById("splash");
+    if (n && !n.classList.contains("hidden") || currentInterlude || whyEl && whyEl.classList.contains("visible")) return;
+    _wheelAt = t, showWhy()
+}, { passive: !0 });
+diptychEl.addEventListener("touchstart", e => {
+        longPressFired = !1, whyGestureFired = !1, e.touches && 1 === e.touches.length ? (touchActive = !0, touchStartTime = performance.now(), touchStartX = e.touches[0].clientX, touchStartY = e.touches[0].clientY, touchMoved = !1) : touchActive = !1
+    }, {
+        passive: !0
+    }), diptychEl.addEventListener("touchmove", e => {
+        if (!touchActive) return;
+        if (!e.touches || 0 === e.touches.length) return;
+        const t = e.touches[0].clientX - touchStartX,
+            n = e.touches[0].clientY - touchStartY;
+        t * t + n * n > 144 && (touchMoved = !0), n < 0 && Math.abs(n) > Math.abs(t) && Math.abs(n) > 3 && e.preventDefault()
+    }, {
+        passive: !1
+    }), diptychEl.addEventListener("touchend", e => {
+        if (!touchActive) return;
+        if (touchActive = !1, e.changedTouches && e.changedTouches.length) {
+            const t = e.changedTouches[0].clientX - touchStartX,
+                n = e.changedTouches[0].clientY - touchStartY;
+            if (-n >= 60 && Math.abs(n) > Math.abs(t)) return whyGestureFired = !0, void showWhy()
         }
-      },
-      () => { /* user cancelled or share failed — silent, no event */ }
-    );
-    return;
-  }
+        if (touchMoved) return;
+        performance.now() - touchStartTime >= 550 && (longPressFired = !0, shareCurrentPair())
+    }, {
+        passive: !0
+    }), diptychEl.addEventListener("touchcancel", () => {
+        touchActive = !1
+    }, {
+        passive: !0
+    }), diptychEl.addEventListener("click", e => {
+        (longPressFired || whyGestureFired) && (longPressFired = !1, whyGestureFired = !1, e.stopImmediatePropagation(), e.preventDefault())
+    }, !0), document.addEventListener("keydown", e => {
+        if ("s" !== e.key && "S" !== e.key) return;
+        if (e.ctrlKey || e.metaKey || e.altKey) return;
+        const t = e.target;
+        if (t && ("INPUT" === t.tagName || "TEXTAREA" === t.tagName || t.isContentEditable)) return;
+        const n = document.getElementById("splash");
+        n && !n.classList.contains("hidden") || currentInterlude || whyEl && whyEl.classList.contains("visible") || (e.preventDefault(), shareCurrentPair())
+    }),
+    function() {
+        /* The two hint lines are set independently: either can be absent from
+           the markup without silencing the other. They were coupled, so
+           removing the share line also left the why hint blank and hidden —
+           it stays display:none until `show` is added here. */
+        const e = document.getElementById("share-trigger"),
+            t = document.getElementById("why-hint");
+        if (!e && !t) return;
+        const n = matchMedia("(hover: none) and (pointer: coarse)"),
+            a = () => {
+                const a = n.matches;
+                e && (e.textContent = a ? "Long press to share your favourite" : "Press S to share your favourite"), t && (t.textContent = a ? "Swipe up to see why a pair was chosen" : "Swipe up to see why a pair was chosen", t.classList.add("show"))
+            };
+        a(), n.addEventListener ? n.addEventListener("change", a) : n.addListener && n.addListener(a)
+    }();
+const whyEl = document.getElementById("why"),
+    whyLine1El = null,
+    whyLine2El = document.getElementById("why-line-2");
 
-  /* DESKTOP PATH — clipboard + toast.
-     Modern Clipboard API works reliably on desktop browsers and
-     reports success/failure honestly. The legacy execCommand path
-     (document.execCommand('copy') via off-screen textarea) is
-     deprecated, notoriously dishonest about success on some engines,
-     and pollutes the DOM each call — so it's only the fallback for
-     ancient browsers without navigator.clipboard. We only show
-     "Link copied" — and only fire analytics — on a real success
-     signal. */
-  const logShare = () => {
-    if (window.gaEnabled && typeof gtag !== 'undefined') {
-      gtag('event', 'pair_shared', { url, source: 'shortcut' });
-    }
-  };
-  if (navigator.clipboard && navigator.clipboard.writeText) {
-    navigator.clipboard.writeText(url).then(
-      () => { showShareToast('Link copied'); logShare(); },
-      () => {
-        /* Modern API rejected (permission, focus, lockdown). Try
-           the legacy path as a last resort before giving up. */
-        if (legacyCopy(url)) { showShareToast('Link copied'); logShare(); }
-        else                   showShareToast('Couldn’t copy');
-      }
-    );
-  } else if (legacyCopy(url)) {
-    showShareToast('Link copied');
-    logShare();
-  } else {
-    showShareToast('Couldn’t copy');
-  }
+/* The current pair, held in memory rather than in the URL. */
+let currentPairSrcs = null;
+
+function currentPairSrcsFromHash() {
+    if (currentPairSrcs && currentPairSrcs[0] && currentPairSrcs[1]) return currentPairSrcs;
+    const e = location.hash.slice(1);
+    if (!e) return null;
+    const t = e.split(",");
+    if (2 !== t.length) return null;
+    const n = idToSrc(t[0]),
+        a = idToSrc(t[1]);
+    return n && a ? [n, a] : null
 }
 
-function legacyCopy(text) {
-  /* Off-screen textarea — must be in the DOM and have non-zero
-     size for iOS Safari to honour the selection. font-size:16px
-     prevents iOS from zooming the viewport if the textarea ever
-     briefly takes focus. opacity:0 hides it visually without
-     making it inert (pointer-events:none would, so we don't set
-     it — iOS sometimes refuses to operate on truly-inert elements). */
-  const ta = document.createElement('textarea');
-  ta.value = text;
-  ta.setAttribute('readonly', '');
-  ta.style.cssText =
-    'position:fixed;top:0;left:0;width:2em;height:2em;' +
-    'padding:0;border:none;outline:none;box-shadow:none;' +
-    'background:transparent;font-size:16px;opacity:0;';
-  document.body.appendChild(ta);
-
-  let ok = false;
-  try {
-    /* iOS-family detection. Modern iPads (iPadOS 13+) report
-       themselves as Mac in the user-agent string by default, so
-       a UA-only check misses them. The combination of MacIntel
-       platform and maxTouchPoints > 1 is the standard Apple-
-       recommended way to spot iPadOS. */
-    const isAppleMobile =
-      /iPad|iPhone|iPod/.test(navigator.userAgent) ||
-      (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
-    if (isAppleMobile) {
-      /* iOS-specific selection ritual. Plain .select() is silently
-         ignored — Safari only honours a Range that's been added
-         to the live Selection, followed by an explicit
-         setSelectionRange on the textarea itself. The textarea
-         also has to be editable (not readOnly, contentEditable
-         true) at the moment of selection. */
-      ta.contentEditable = 'true';
-      ta.readOnly        = false;
-      const range = document.createRange();
-      range.selectNodeContents(ta);
-      const sel = window.getSelection();
-      sel.removeAllRanges();
-      sel.addRange(range);
-      ta.setSelectionRange(0, text.length);
-    } else {
-      ta.focus();
-      ta.select();
-    }
-    ok = document.execCommand('copy');
-  } catch {
-    ok = false;
-  }
-  document.body.removeChild(ta);
-  return ok;
+function paletteContrastOf(e, t) {
+    const n = (e, t) => {
+        let n = 0;
+        for (const a of e) {
+            let e = 0;
+            for (const n of t) {
+                const t = colorSimilarity(a, n);
+                t > e && (e = t)
+            }
+            n += e * a.weight
+        }
+        return n
+    };
+    return 1 - (n(e.palette, t.palette) + n(t.palette, e.palette)) / 2
 }
 
-/* ── LONG-PRESS DETECTION (mobile) ──
-   iOS Safari refuses to honour navigator.clipboard.writeText
-   from inside a setTimeout callback — the user-gesture
-   activation has lapsed by the time the timer fires. The fix
-   is to do the duration check on touchend instead, where we're
-   still inside the synchronous user-gesture handler.
+/* The gold/green boundary sits at 56, not 67. Grass, leaves and foliage
+   photograph between 60 and 75 degrees, so a boundary at 67 put half of them in
+   "gold" — a green field read as gold, and the whole catalogue showed only 8
+   frames in the entire green band despite being full of plants. */
+function hueFamily(e) {
+    return (e = (e % 360 + 360) % 360) < 15 || e >= 345 ? "red" : e < 40 ? "orange" : e < 64 ? "gold" : e < 159 ? "green" : e < 200 ? "teal" : e < 252 ? "blue" : e < 292 ? "violet" : "pink"
+}
 
-   Flow:
-     touchstart → record time + position, mark touchActive
-     touchmove  → if displacement exceeds tolerance, mark
-                  touchMoved (it's a drag or scroll, not a press)
-     touchend   → if duration ≥ LONG_PRESS_MS and not moved,
-                  fire share synchronously. The capture-phase
-                  click handler below swallows the synthetic
-                  click that touchend produces, so the diptych
-                  doesn't advance after a share. */
-const diptychEl = document.getElementById('diptych');
+/* A colour name needs the frame to have colour in it, not just the swatch.
 
-diptychEl.addEventListener('touchstart', (e) => {
-  /* Multi-touch (pinch, two-finger) is never a long-press —
-     bail and let the browser handle it. */
-  if (!e.touches || e.touches.length !== 1) {
-    touchActive = false;
-    return;
-  }
-  touchActive    = true;
-  touchStartTime = performance.now();
-  touchStartX    = e.touches[0].clientX;
-  touchStartY    = e.touches[0].clientY;
-  touchMoved     = false;
-}, { passive: true });
+   The palette drops anything below .06 or above .94 lightness, so in a very
+   dark or very light photograph most of the frame is excluded and whatever
+   small saturated thing survives becomes the "dominant" swatch — a black van
+   with a yellow numberplate came out as gold at 72% weight while the frame's
+   own saturation was .066. Naming that as the picture's colour is wrong, so
+   frames this close to monochrome get no hue at all. */
+const MIN_FRAME_SAT = .18;
 
-diptychEl.addEventListener('touchmove', (e) => {
-  if (!touchActive || touchMoved) return;
-  if (!e.touches || e.touches.length === 0) return;
-  const dx = e.touches[0].clientX - touchStartX;
-  const dy = e.touches[0].clientY - touchStartY;
-  /* Squared-distance compare — no Math.sqrt per touchmove.
-     12px tolerance matches iOS's own tap-vs-drag threshold
-     closely enough to feel native. */
-  if (dx * dx + dy * dy > LONG_PRESS_MOVE_TOLERANCE * LONG_PRESS_MOVE_TOLERANCE) {
-    touchMoved = true;
-  }
-}, { passive: true });
+/* The name a person would actually use. hueFamily gives eight bands from the
+   hue angle alone, so a dark desaturated yellow and a bright one are both
+   "gold" — and one of them is mustard. Lightness and saturation decide which.
 
-diptychEl.addEventListener('touchend', () => {
-  if (!touchActive) return;
-  touchActive = false;
-  if (touchMoved) return;
-  const duration = performance.now() - touchStartTime;
-  if (duration >= LONG_PRESS_MS) {
-    /* Mark BEFORE calling shareCurrentPair: the synthetic click
-       that follows touchend needs to see the flag set so the
-       capture-phase handler below can swallow it. */
-    longPressFired = true;
-    shareCurrentPair();
-  }
-}, { passive: true });
+   This is for prose only. The family names still drive the warm/cool logic and
+   the adjacency test, which need stable buckets rather than good words. */
+function colourName(e, t, n) {
+    const a = hueFamily(e),
+        o = n < .32,
+        i = n > .75,
+        r = t < .42;
+    switch (a) {
+        case "red":
+            return o ? "dark red" : r ? i ? "blush" : "brick red" : i ? "coral" : "red";
+        case "orange":
+            /* Wood, brick and tan cloth all land here. At anything short of
+               vivid they read as brown, not orange — "orange and blue" for a
+               dark wood cabinet was simply the wrong word. */
+            return o ? "brown" : i ? r ? "tan" : "apricot" : t < .75 ? "brown" : "orange";
+        case "gold":
+            return o ? "olive" : r ? i ? "cream" : "mustard" : i ? "butter yellow" : "gold";
+        case "green":
+            return o ? "deep green" : r ? i ? "sage" : "olive green" : i ? "mint" : "green";
+        case "teal":
+            return o ? "deep teal" : i ? "aqua" : "teal";
+        case "blue":
+            return o ? "navy" : r ? i ? "pale blue" : "slate blue" : i ? "sky blue" : "blue";
+        case "violet":
+            return o ? "indigo" : i ? "lilac" : "violet";
+        default:
+            return o ? "plum" : i ? "pale pink" : "pink"
+    }
+}
 
-diptychEl.addEventListener('touchcancel', () => {
-  touchActive = false;
-}, { passive: true });
+/* The name a frame goes by in prose.
 
-/* Capture-phase click handler — fires BEFORE the existing
-   bubble-phase advance handler on the same element. When a long
-   press just fired, swallow the synthetic click that touchend
-   produces via stopImmediatePropagation, so the diptych doesn't
-   advance. The longPressFired flag resets after each use. */
-diptychEl.addEventListener('click', (e) => {
-  if (longPressFired) {
-    longPressFired = false;
-    e.stopImmediatePropagation();
-    e.preventDefault();
-  }
-}, true);
+   Currently the plain family — red, blue, green — not the richer name that
+   colourName above can produce. The specific names are correct English for the
+   swatch they describe, but the swatch is still sometimes the wrong one: a
+   brick building whose white render carries 73% of the palette comes out
+   "aqua", and a wrong "aqua" is far more jarring to read than a wrong "blue".
 
-/* ── KEYBOARD 'S' SHORTCUT (desktop) ──
-   Separate keydown listener from the main one — keeps share
-   logic local to this block and avoids editing the existing
-   keys/overlays flow. Mirrors the same overlay-gating: bail
-   if splash / privacy / consent / any interlude is up so 'S'
-   isn't reachable until the diptych is actually on screen. */
-document.addEventListener('keydown', (e) => {
-  if (e.key !== 's' && e.key !== 'S') return;
-  if (e.ctrlKey || e.metaKey || e.altKey) return;
-  const t = e.target;
-  if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
-  const splashEl = document.getElementById('splash');
-  if (splashEl && !splashEl.classList.contains('hidden')) return;
-  if (privacyEl && privacyEl.classList.contains('visible')) return;
-  if (currentInterlude) return;
-  e.preventDefault();
-  shareCurrentPair();
-});
+   Switch the call to colourName(t.hsl.h, t.hsl.s, t.hsl.l) once a large pale
+   background can no longer outvote a small vivid subject — the fix is to weight
+   swatches by chroma as well as area when choosing which family carries the
+   frame. */
+function dominantColourName(e) {
+    if (e && e.colour) return "none" === e.colour ? null : e.colour;
+    const t = representativeSwatch(e);
+    /* The swatch doing the naming has to be a colour itself. Black denim
+       registers as h40 s0.60 at lightness .08 — HSL saturation is noise down
+       there — so a near-black frame was being called orange, and the frame's
+       own avgSat of .16 squeaked past the floor. Chroma settles it: .030 is
+       grey, whatever the hue says. */
+    return !t || !t.hsl || !t.oklab || t.hsl.s < .22 || Math.hypot(t.oklab.a, t.oklab.b) < .045 || (e.avgSat || 0) < MIN_FRAME_SAT ? null : colourName(t.hsl.h, t.hsl.s, t.hsl.l)
+}
 
-/* ── SHARE INTERLUDE LABEL ──
-   The share interlude card (shown every CONTACT_MIN..CONTACT_MAX clicks)
-   uses different wording per input mode. Touch-primary devices
-   get "long press to share"; pointer-primary get "press S to share"
-   (teaches the keyboard shortcut).
+/* A small, strongly coloured thing in an otherwise colourless frame — the brass
+   teeth on black denim, at 1% of the palette but the only real colour in it.
+   Returned only when the frame has no dominant colour to name, so this never
+   competes with one. */
+/* The colour of a small vivid detail, for lines like "and just a thread of
+   orange on the other".
 
-   Detection: hover:none AND pointer:coarse — the standard CSS
-   media-query pair for "this device's primary input is touch".
-   Avoids 'ontouchstart' in window false-positives on hybrid
-   laptops that have both a touchscreen and a precise pointer.
-   Re-runs on input-mode change so a 2-in-1 flipping between
-   laptop and tablet posture gets the right wording without a
-   reload. */
-(function setShareTriggerLabel() {
-  const trigger = document.getElementById('share-trigger');
-  if (!trigger) return;
-  const mq = matchMedia('(hover: none) and (pointer: coarse)');
-  const apply = () => {
-    trigger.textContent = mq.matches ? 'Long press to share your favourite' : 'Press S to share your favourite';
-  };
-  apply();
-  /* addEventListener is the modern API; older Safari only supports
-     the deprecated addListener. Try the modern one first. */
-  if (mq.addEventListener) mq.addEventListener('change', apply);
-  else if (mq.addListener) mq.addListener(apply);
-})();
+   It has to be a detail. A white bulk bag whose shadow reads h208 at chroma
+   .095 across 77% of the frame was being given "blue" as its detail colour —
+   but a swatch that is most of the picture is the ground, not a thread in it. */
+function detailColour(e) {
+    if (e && e.colour || dominantColourName(e)) return null;
+    let t = null;
+    for (const n of e.palette || []) {
+        if (!n.oklab || !n.hsl) continue;
+        const a = Math.hypot(n.oklab.a, n.oklab.b);
+        a >= .09 && (n.weight || 0) <= .45 && n.hsl.l >= .25 && n.hsl.l <= .85 && (!t || a > t.c) && (t = {
+            c: a,
+            name: hueFamily(n.hsl.h)
+        })
+    }
+    return t ? t.name : null
+}
+
+/* The family name, used for "same family" and for the shared-colour rule.
+
+   It needs the chroma floor that dominantColourName already has. Without it a
+   white van, whose shadows read h225 at .29 saturation, was labelled blue and
+   then said to share a colour family with the sky behind the Dreamland tower.
+   The van has no colour; nothing should be able to say it does. */
+function dominantHueLabel(e) {
+    /* A caption colour ending in a family name — "coral pink", "dark red" —
+       belongs to that family for warm, cool and neighbouring-hue checks; the
+       full name is what gets written. Anything else ("warm grey") is used as
+       it stands. */
+    if (e && e.colour) {
+        if ("none" === e.colour) return null;
+        const t = e.colour.split(/\s+/).pop();
+        return ["red", "orange", "gold", "green", "teal", "blue", "violet", "pink"].includes(t) ? t : e.colour
+    }
+    const t = representativeSwatch(e);
+    return !t || !t.hsl || !t.oklab || t.hsl.s < .22 || Math.hypot(t.oklab.a, t.oklab.b) < .045 || (e.avgSat || 0) < MIN_FRAME_SAT ? null : hueFamily(t.hsl.h)
+}
+
+function capitalizeFirst(e) {
+    return e ? e.charAt(0).toUpperCase() + e.slice(1) : e
+}
+
+/* Which swatch stands for the frame.
+
+   Taking the single heaviest one was wrong whenever a colour arrives split
+   across several swatches: a garden of red roses holds its reds at .29, .12 and
+   .10 — 51% between them — while one bright yellow-green highlight sits at .38
+   and won outright. The frame was then called mint.
+
+   So group the swatches by hue family first, pick the family carrying the most
+   weight, and return the heaviest swatch inside it. A colour broken into pieces
+   is still that colour. */
+function representativeSwatchIndex(e) {
+    const t = e && e.palette;
+    if (!t || !t.length || !t[0].hsl) return 0;
+    const n = {};
+    for (let e = 0; e < t.length; e++) {
+        const a = t[e];
+        /* Judged on oklab chroma, not HSL saturation. HSL calls a near-white
+           render 80% cyan and a near-black navy 100% blue, because its
+           saturation term is meaningless at both ends of the lightness range.
+           Chroma is the distance from grey in a perceptual space, so it says
+           what a viewer would: those two are almost colourless. */
+        if (!a.hsl || !a.oklab || Math.hypot(a.oklab.a, a.oklab.b) < .045) continue;
+        const o = hueFamily(a.hsl.h);
+        /* Area, not area x chroma. Weighting by chroma was tried, to stop a
+           large pale ground outvoting a small vivid subject — and it made
+           things worse: a garden of red roses came back olive green, because
+           the few high-chroma leaves beat the mass of red. The pavement-beats-
+           bicycle problem is real but this is not its fix. */
+        n[o] = n[o] || {
+            w: 0,
+            idx: e,
+            best: 0
+        }, n[o].w += a.weight || 0, (a.weight || 0) > n[o].best && (n[o].best = a.weight || 0, n[o].idx = e)
+    }
+    const a = Object.values(n).sort((e, t2) => t2.w - e.w)[0];
+    /* Nothing carries a nameable hue: fall back to the old behaviour, which
+       looks past a flat or very dark leading swatch for something with colour
+       in it. */
+    if (!a) {
+        const n2 = t[0].hsl,
+            a2 = n2.s < .16,
+            o = n2.s >= .16 && n2.s < .45 && n2.l < .34;
+        if (!a2 && !o) return 0;
+        const i = t[0].weight || 0;
+        for (let e = 1; e < t.length; e++) {
+            const a3 = t[e];
+            if (!(!a3.hsl || a3.hsl.s < .16 || (a3.weight || 0) < .3 * i) && (!o || a3.hsl.s >= n2.s && a3.hsl.l >= .22)) return e
+        }
+        return 0
+    }
+    /* A coloured family only displaces the leading swatch if it is genuinely
+       present — otherwise a small vivid detail in a grey frame would speak for
+       the whole picture. */
+    return a.w >= .25 ? a.idx : 0
+}
+
+function representativeSwatch(e) {
+    return e && e.palette ? e.palette[representativeSwatchIndex(e)] : null
+}
+
+function describeSwatch(e, t) {
+    const n = void 0 === t ? representativeSwatchIndex(e) : t,
+        a = e && e.palette && e.palette[n];
+    if (!a || !a.hsl) return "a quiet tone";
+    const o = a.hsl.s,
+        i = a.hsl.l;
+    if (o < .16) return i < .12 ? "near-black" : i < .28 ? "charcoal" : i < .46 ? "slate grey" : i < .64 ? "mid grey" : i < .82 ? "soft grey" : "near-white";
+    const r = hueFamily(a.hsl.h);
+    if ("orange" === r && i < .4) return i < .25 ? "dark brown" : "brown";
+    let s = "";
+    return i < .22 ? s = "deep" : i < .38 ? s = "dark" : i > .8 ? s = "pale" : i > .64 ? s = "soft" : o > .62 ? s = "vivid" : o < .3 && (s = "muted"), s ? s + " " + r : r
+}
+
+function whySeed(e, t) {
+    const n = e => Math.round(1e3 * (e || 0)),
+        a = 31 * n(e.meanL) + 37 * n(t.meanL) + 41 * n(e.avgSat) + 43 * n(t.avgSat) + 47 * n(e.density) + 53 * n(t.density) + 59 * n(e.cx) + 61 * n(t.cx) + 67 * n(e.cy) + 71 * n(t.cy);
+    return Math.abs(a)
+}
+
+function pick(e, t) {
+    return e[(t % e.length + e.length) % e.length]
+}
+
+function selectWhyPattern(e, t) {
+    const n = paletteContrastOf(e, t),
+        a = Math.abs(e.density - t.density),
+        o = Math.abs(e.meanL - t.meanL),
+        i = Math.abs(e.edgeEnergy - t.edgeEnergy),
+        r = (e.meanL + t.meanL) / 2,
+        s = Math.abs(e.avgSat - t.avgSat),
+        l = representativeSwatch(e),
+        c = representativeSwatch(t),
+        d = l ? l.oklab.b : 0,
+        h = c ? c.oklab.b : 0,
+        u = e => {
+            const t = representativeSwatch(e);
+            return !!(t && t.hsl && t.hsl.s >= .16 && t.hsl.h >= 75 && t.hsl.h <= 165)
+        },
+        m = u(e),
+        g = u(t),
+        p = d > .03 && !m && (h > .03 && !g),
+        f = d < -.03 && !m && (h < -.03 && !g),
+        y = d > .04 && !m && h < -.04 && !g || d < -.04 && !m && h > .04 && !g,
+        w = dominantHueLabel(e),
+        b = dominantHueLabel(t),
+        S = e.vertical > .3 && t.vertical < -.3 || e.vertical < -.3 && t.vertical > .3,
+        E = Math.abs(e.cy - t.cy) < .07 && (e.cy < .4 || e.cy > .6),
+        v = e.aspect < .9,
+        T = e.aspect > 1.15,
+        I = t.aspect < .9,
+        P = t.aspect > 1.15,
+        A = v && P || T && I,
+        _ = r > .65 && o < .25,
+        /* Both dark — judged on the lighter of the two, not the average of
+           them, or one bright frame is called dark because the other is very.
+           The lightness test alone is not enough either: a saturated blue
+           or a deep red measures low on L while reading as colour, not
+           darkness — a bright sky full of contrails was being called "the same
+           dark twice". Requiring low saturation as well keeps the word honest,
+           and such pairs fall through to the temperature patterns, which is
+           what a viewer would say about them anyway. */
+        k = e.avgSat < .3 && t.avgSat < .3,
+        M = e.avgSat > .45 && t.avgSat > .45,
+        C = e => {
+            const t = e.palette,
+                n = t && t[representativeSwatchIndex(e)];
+            return n && n.hsl ? n.hsl.s : 0
+        },
+        N = C(e),
+        O = C(t),
+        /* Both dark — and neither with a main colour that is itself bright:
+           reeded glass at dusk sits at .35 lightness overall, but its swatch
+           is a vivid mid-blue, and "the same dark twice" beside black water
+           was not what anyone saw. */
+        L = Math.max(e.meanL, t.meanL) < .38 && o < .25 && e.avgSat < .45 && t.avgSat < .45 && N < .5 && O < .5,
+        x = Math.min(N, O) < .3,
+        R = N >= .45 && O >= .45,
+        F = N >= .45 && O < .3 || O >= .45 && N < .3,
+        D = e => {
+            const t = representativeSwatch(e);
+            return t ? Math.hypot(t.oklab.a, t.oklab.b) : 0
+        },
+        V = e.avgSat < .12 && N < .18 && D(e) < .03 && e.meanL >= .3 && e.meanL <= .62,
+        B = t.avgSat < .12 && O < .18 && D(t) < .03 && t.meanL >= .3 && t.meanL <= .62;
+    return n > .5 && o > .3 && a > .22 ? {
+        id: "P1"
+    } : _ && n > .45 ? {
+        id: "P2"
+    } : _ ? {
+        id: "P2b"
+    } : L && n > .45 ? {
+        id: "P3"
+    } : L ? {
+        id: "P3b"
+    } : y && o > .3 ? {
+        id: "P4"
+    } : y && a > .22 ? {
+        id: "P5"
+    } : y ? {
+        id: "P6"
+    } : V && O >= .45 || B && N >= .45 ? {
+        id: "PMONO"
+    } : o > .3 && n > .55 ? {
+        id: "P7"
+    } : o > .3 && a > .22 ? {
+        id: "P8"
+    } : o > .3 ? {
+        id: "P9"
+    } : a > .22 && i > .1 && n > .55 ? {
+        id: "P10"
+    } : a > .22 && i > .1 ? {
+        id: "P11"
+    } : s > .3 && x || F && !k ? {
+        id: "P12"
+    } : w && b && w !== b && (n > .4 || R) ? {
+        id: "P12b"
+    } : w && b && w === b ? {
+        id: "P12c"
+    } : n > .6 ? {
+        id: "P13"
+    } : p ? {
+        id: "P14"
+    } : f ? {
+        id: "P15"
+    } : k ? {
+        id: "P16"
+    } : M ? {
+        id: "P17"
+    } : S ? {
+        id: "P17b"
+    } : E ? {
+        id: "P17c"
+    } : A ? {
+        id: "P17d"
+    } : {
+        id: "P18"
+    }
+}
+
+function renderWhy(e, t, n, a) {
+    const o = describeSwatch(t),
+        i = describeSwatch(n),
+        r = capitalizeFirst(o),
+        s = capitalizeFirst(i),
+        l = representativeSwatch(t),
+        c = representativeSwatch(n),
+        d = l ? l.oklab.b : 0,
+        h = c ? c.oklab.b : 0,
+        /* Left frame first, always — u/m used to be warm-first, naming
+           whichever side happened to be warmer. Uncaptioned prose has no
+           nouns to anchor it, so a reader maps the first phrase to the left
+           panel; getting that order wrong describes the pair backwards. */
+        u = o,
+        m = i,
+        g = r,
+        p = dominantHueLabel(t) || dominantHueLabel(n),
+        f = r,
+        y = !!(t.palette && t.palette[1] && t.palette[1].hsl),
+        w = !!(n.palette && n.palette[1] && n.palette[1].hsl),
+        b = describeSwatch(t, 1),
+        S = describeSwatch(n, 1),
+        E = y && w ? b === S ? b : b + " and " + S : y ? b : w ? S : null,
+        v = paletteContrastOf(t, n),
+        T = Math.abs(t.meanL - n.meanL),
+        I = Math.abs(t.density - n.density),
+        P = Math.max(v, T, I),
+        A = capitalizeFirst(P > .55 ? "a wide gulf" : P > .35 ? "a clear gap" : P > .18 ? "a short step" : "barely a step"),
+        _ = a,
+        L = Math.imul(2654435769 ^ a, 2654435761) >>> 0,
+        k = {
+            P1: {
+                l1: ["Three axes apart: colour, density, and light.", "Colour, light, and density, all pulling different ways.", "Apart on every axis the algorithm watches.", "Every signal disagrees at once.", "Colour, tone, rhythm; none of them line up.", "A clean break on all three measures."],
+                l2: ["The pair scores high on every signal measured.", "Maximum contrast: the rarest thing in the catalogue.", A + " on every front.", "Nothing here agrees, and that’s the point."]
+            },
+            P2: {
+                l1: ["Two high-key frames, drawn from different palettes.", r + " and " + i + ", both lit bright.", "Two bright frames that disagree on colour.", "Light in both, agreement in neither.", r + " beside " + i + ", and the room is bright in both.", "Both overexposed-bright; the palettes part ways."],
+                l2: ["Light fills both, but the colours hold separate notes.", "Shared luminance, separate palettes.", "The light agrees; the palette argues.", E ? "Bright up top, " + E + " below." : null]
+            },
+            P2b: {
+                l1: ["Two bright frames, close in palette.", r + " beside " + i + ", both high and pale.", "Two high-key frames in the same narrow band.", "Both bright, both pale, barely a colour between them.", "Light, and not much colour to separate them."],
+                l2: ["Light is what both photos share.", "A pair held together by brightness alone.", "Chosen for the light, not the colour.", "The brightness does all the binding."]
+            },
+            P3: {
+                l1: ["Both low-key, with palettes that don’t share a note.", r + " and " + i + ", both kept dark.", "Two frames deep in shadow, apart on colour.", "Dark in both, but the colour pulls two ways.", r + " against " + i + ", and the light is low in both."],
+                l2: ["After-hours frames meeting across the colour gap.", "The dark is shared; the palette is not.", "Two dim frames pulling colour from different worlds.", E ? "Shadow up top, " + E + " beneath." : null]
+            },
+            P3b: {
+                l1: ["Two dim frames, within the same tonal range.", r + " beside " + i + ", both low and close.", "Two low-key frames in one narrow band.", "Both dark, both quiet, the same kind of dark."],
+                l2: ["A pair built on the shared weight of low light.", "Held together by the weight of the shadows.", "The shared dark is the whole of the pairing.", "One register, dim and steady."]
+            },
+            P4: {
+                l1: ["Warm meets cool, light meets dark.", g + " against " + m + ", and bright against dark.", "Warm against cool, with the light split too.", "Temperature and tone, both breaking the same way.", g + " and bright on one side, " + m + " and dark on the other."],
+                l2: ["Two oppositions running in parallel.", "Two contrasts stacked into a single pair.", A + " between them, twice over.", "The eye gets warmth and brightness in one read."]
+            },
+            P5: {
+                l1: ["Warm against cool; busy against still.", g + " against " + m + ", one busy, one calm.", "Warm meets cool, dense meets sparse.", "Temperature and rhythm, both turning over.", g + " and crowded, " + m + " and clear."],
+                l2: ["Palette and rhythm both turning over.", "Two axes of contrast at the same time.", "Heat and density, pulling together.", A + " on colour, and the rhythm splits too."]
+            },
+            P6: {
+                l1: ["Warm against cool.", g + " against " + m + ".", g + " on one side, " + m + " on the other.", "Warmth on one side, cool on the other.", g + ", then " + m + ".", "A warm frame and a cool one, nothing else needed.", "The whole pairing is temperature.", g + " meeting " + m + " down the middle."],
+                l2: ["The opposition is the whole of the pair.", "Temperature is the entire argument.", A + " in warmth, and little else.", "Nothing else needs to happen.", E ? "Warm against cool up top, " + E + " below." : null]
+            },
+            PMONO: {
+                l1: ["Colour beside monochrome.", "One in colour, one in black and white.", f + " beside black and white.", "Colour on one side, greyscale on the other.", "One side in colour, the other in grey.", f + " against a near-colourless frame."],
+                l2: ["The colour lives on one side only.", "One frame keeps its colour, the other lets it go.", "Colour against greyscale, the plainest split there is.", "Almost all the colour on one side."]
+            },
+            P7: {
+                l1: ["Light meets dark; the colours disagree, too.", r + " against " + i + ", bright against dark.", "A bright frame against a dark one, colours apart.", "Tone first, then the colour gap.", "Luminance splits, and so does the palette."],
+                l2: ["The eye registers luminance first, then everything else.", "Tone leads, colour follows a beat behind.", "Luminance reads first; the palette gap lands second.", E ? "Light against dark up top, " + E + " underneath." : null]
+            },
+            P8: {
+                l1: ["Bright against dark, dense against sparse.", "Light against dark, busy against still.", "One bright and busy, one dark and quiet.", "Tone and rhythm, breaking together.", "Brightness and density, both split."],
+                l2: ["A pair built on two parallel oppositions.", "Tone and rhythm breaking the same way.", "Two contrasts moving in step.", A + " between them, on two counts."]
+            },
+            P9: {
+                l1: ["Light against dark, within a shared family of colours.", r + " against " + i + ", a step apart in light.", "A bright frame and a dark one, colours in agreement.", "The colours hold; the light does the splitting.", "Same palette, opposite ends of the light."],
+                l2: ["Tone, not hue, doing the work.", "The colours stay close; the tone carries it.", "The whole contrast lives in the light.", A + " in light, none to speak of in colour."]
+            },
+            P10: {
+                l1: ["A composition full of detail, beside one that breathes.", "Dense beside sparse, and the colours diverge too.", "One frame packed, one frame open; colours apart.", "Detail against rest, palette against palette.", "One crowds the frame, one clears it."],
+                l2: ["The palettes don’t share a centre, either.", "One frame crowds; the other clears space.", "Detail against rest, with the palette splitting as well.", A + " in colour, on top of the density."]
+            },
+            P11: {
+                l1: ["Where one is busy, the other rests.", "One frame crowded, the other clear.", "Dense beside sparse.", "One asks for time, the other lands at once.", "Detail on one side, space on the other."],
+                l2: ["Two scenes read at different speeds.", "Detail against space: that’s the pairing.", "One takes a moment to read; the other doesn’t.", "Rhythm is the whole of it."]
+            },
+            P12: {
+                l1: ["One carries the colour; the other holds back.", f + " against a more restrained counterpart.", "One frame saturated, the other restrained.", "Colour on one side, restraint on the other.", "One leans into colour, the other hangs back."],
+                l2: ["A colour-forward frame paired with a quieter one.", "One side colour-forward, the other holding back.", "The colour gap is the whole of it.", E ? "Colour up front, " + E + " behind it." : null]
+            },
+            P12b: {
+                l1: [r + " meets " + i + ".", r + " on one side, " + i + " on the other.", "A clash of families: " + o + " and " + i + ".", r + " against " + i + ", no overlap.", o + " and " + i + ", two different worlds.", "On one side " + o + ", on the other " + i + "."],
+                l2: ["Two colour families, set against each other.", "Named colours, pulling apart.", "The two hues don’t belong to the same world.", A + " between the families.", E ? "The clash up top, " + E + " beneath." : null]
+            },
+            P12c: {
+                l1: ["Both in the " + p + " family.", (o === i ? "Two takes on " + o : r + " beside " + i) + ".", "A " + p + " pair, varied from within.", "One family, " + p + ", read two ways.", "Both " + p + ", a shade apart."],
+                l2: ["The whole pair lives inside one colour family.", "One family, read at two different settings.", "Same family, different corners of it.", "A single hue, taken two directions."]
+            },
+            P13: {
+                l1: ["Different palettes, equivalent weight.", r + " against " + i + ", evenly matched otherwise.", "Two palettes apart, everything else level.", "Same brightness, same density; the colour does the work.", "Only the colour separates them."],
+                l2: ["Same brightness, same density; the colour does all the work.", "Only the palette separates them.", "Colour is the single variable here.", A + " in colour, and nothing else moves.", E ? "Two palettes up top, " + E + " below." : null]
+            },
+            P14: {
+                l1: ["Both warm in palette, varying by small steps.", r + " and " + i + ", both on the warm side.", "Two warm frames, a small step apart.", "Warm and warmer, the same half of the wheel.", "Both lean warm, by different amounts."],
+                l2: ["The pair holds together through shared temperature.", "Warmth is the common thread.", "Shared temperature binds them.", "One warm register, two readings."]
+            },
+            P15: {
+                l1: ["Two cool palettes, paired across small variations.", r + " and " + i + ", both kept cool.", "Two cool frames, close but not identical.", "Cool and cooler, the same end of the wheel.", "Both lean cool, by a little."],
+                l2: ["The contrast surfaces on the second reading, not the first.", "A cool pair, separated by degrees.", "The difference is quiet, and deliberate.", "One cool register, two readings."]
+            },
+            P16: {
+                l1: ["Two restrained palettes; the contrast keeps quiet.", r + " and " + i + ", both held back.", "Two low-saturation frames in conversation.", "Muted against muted; the contrast whispers.", "Both subdued, neither loud."],
+                l2: ["Neither frame raises its voice.", "A muted pair; the contrast is in the detail.", "Nothing shouts; the difference whispers.", "Both muted in colour."]
+            },
+            P17: {
+                l1: ["Both saturated, with the colour pointing elsewhere in each.", r + " and " + i + ", both vivid, both apart.", "Two saturated frames pulling toward different hues.", "Loud colour on both sides, aimed different ways.", "Vivid and vivid, but not the same vivid."],
+                l2: ["Colour-forward frames, drawn to different families.", "Two colour-forward frames headed different ways.", "Colour-rich, and colour-divided.", A + " between two loud palettes.", E ? "Vivid up top, " + E + " behind." : null]
+            },
+            P17b: {
+                l1: ["One frame stands, the other lies flat.", "One built upright, the other laid wide.", "Verticals in one, horizontals in the other.", "A standing frame against a reclining one.", "Up on one side, across on the other."],
+                l2: ["Vertical against horizontal, structure carrying the pair.", "The geometry is the contrast here.", "Structure, not colour, doing the work.", "Two directions meeting at the seam."]
+            },
+            P17c: {
+                l1: ["Two centres of interest at the same height.", "Both subjects sitting on a shared line.", "Matched heights across the two frames.", "One eyeline, running through both.", "The same horizon, left and right."],
+                l2: ["An eyeline that carries across the seam.", "A horizon that runs straight through the pair.", "The eye crosses the seam without a step.", "One line holding both frames."]
+            },
+            P17d: {
+                l1: ["A tall frame beside a wide one.", "One portrait, one landscape.", "Upright format against wide format.", "Tall meets wide.", "Two shapes, one narrow, one broad."],
+                l2: ["Two formats meeting at the centre.", "The shapes themselves are the dialogue.", "Two proportions set side by side.", "Format against format."]
+            },
+            P18: {
+                l1: ["Paired across quiet contrasts on three axes.", "Small differences across colour, light, and density.", "Close on every axis, slightly apart on all of them.", "A pairing of small margins.", "No single axis leads, a little of each."],
+                l2: ["The kind of agreement that takes a second to read.", "A quiet pairing that rewards a second look.", "Subtle by design; nothing here announces itself.", A + " on any one axis, and that’s the point."]
+            }
+        },
+        M = k[e] || k.P18;
+    return [capitalizeFirst(pick(M.l1, _)), pick([...M.l2, "The match holds.", "Nothing else competes.", "The rest stays quiet.", "It takes a second to settle, then it does.", "A quiet kind of agreement.", "Nothing forced about it.", "The eye accepts it before it can explain it.", "That’s the whole of the pairing.", "Simple, once you see it.", "Everything else falls away."].filter(Boolean), L)]
+}
+/* ═══════════════════════════════════════════════════════════════
+   CAPTIONS — richer "why this pair" prose
+   captions-manifest.json (see build-captions.mjs) holds one entry per
+   frame. Images are keyed ffN, videos vN (from their posters). Each entry
+   is an object { subject, short, detail, placement, height, distance,
+   lines, light, surface }; a plain string (v1 manifest) is accepted as a
+   subject-only entry.
+   When BOTH frames of the current pair have a subject, line 1 names what is
+   in the two frames and line 2 states the measured relationship (the same
+   pattern selectWhyPattern picks for the colour-only prose) through those
+   nouns. Anything missing falls back to the colour-only text.
+   ═══════════════════════════════════════════════════════════════ */
+const subjects = new Map;
+
+function subjectKey(e) {
+    const t = srcToId(e);
+    return t ? (isVideo(e) ? t : "ff" + t) : null
+}
+
+/* Every field the scoring and the why text read has to be copied through here.
+
+   This is where the whole caption system was silently dead in the browser.
+   The list of copied fields stopped at "surface", so text, people, scale,
+   category, structure, accent and hands were all stripped before any pair was
+   scored or described. Every rule built on them — both carry words, framed as
+   though the same size, hands in both, two lattices, the same red twice — could
+   fire in the build script, which reads the manifest raw, and never once on
+   the live site. The test harness read the manifest raw too, which is why it
+   kept agreeing with the build and disagreeing with the phone.
+
+   The rule now: copy everything that is a non-empty string or a boolean. A
+   field added to the manifest must never again need adding here. */
+function captionKeyToSrc(key) {
+    const t = String(key || "");
+    if (/^v\d+$/i.test(t)) return videoNumToSrc(t.slice(1));
+    if (/^ff\d+$/i.test(t)) return numToSrc(t.slice(2));
+    if (/^\d+$/.test(t)) return numToSrc(t);
+    return null;
+}
+
+function pickNum() {
+    for (let i = 0; i < arguments.length; i++) {
+        const n = arguments[i];
+        if (typeof n === "number" && isFinite(n)) return n;
+    }
+    return arguments[arguments.length - 1];
+}
+
+/* Accept the word-keyed signature written in captions.json, or the short
+   keys from the old signatures.json. Runtime still uses avgSat / meanL / cx
+   so scoring and the why panel do not need two code paths. */
+function normalizeSignature(e) {
+    if (!e || "object" != typeof e) return null;
+    if (!Array.isArray(e.histogram) || e.histogram.length < 3) return null;
+    return {
+        histogram: e.histogram,
+        palette: Array.isArray(e.palette) ? e.palette : [],
+        avgSat: pickNum(e.averageSaturation, e.avgSat, .3),
+        meanL: pickNum(e.meanLight, e.meanL, .5),
+        density: pickNum(e.density, .5),
+        histMag: pickNum(e.histogramMagnitude, e.histMag, .5),
+        aspect: pickNum(e.aspect, .75),
+        edgeEnergy: pickNum(e.edgeEnergy, .3),
+        vertical: pickNum(e.vertical, 0),
+        cx: pickNum(e.centerX, e.cx, .5),
+        cy: pickNum(e.centerY, e.cy, .5)
+    };
+}
+
+function normalizeCaption(e) {
+    if ("string" == typeof e) {
+        const t = e.trim();
+        return t ? { subject: t } : null
+    }
+    if (!e || "object" != typeof e || "string" != typeof e.subject || !e.subject.trim()) return null;
+    const t = { subject: e.subject.trim() };
+    const skip = { subject: 1, signature: 1, kind: 1, id: 1 };
+    for (const n in e) {
+        if (skip[n]) continue;
+        "string" == typeof e[n] && e[n].trim() ? t[n] = e[n].trim() : "boolean" == typeof e[n] && (t[n] = e[n]);
+    }
+    return t
+}
+
+function subjectFor(e) {
+    const t = subjectKey(e);
+    return t && subjects.get(t) || null
+}
+async function loadCaptionManifest() {
+    try {
+        let t = null;
+        for (const url of ["captions.json", "captions-manifest.json"]) {
+            try {
+                const e = await fetch(url);
+                if (e.ok) { t = await e.json(); break; }
+            } catch {}
+        }
+        if (!t || "object" != typeof t) return;
+        if (t.frames && "object" == typeof t.frames) t = Object.assign({}, t, t.frames);
+        let n = 0, sigs = 0;
+        for (const e in t) {
+            /* Keys beginning with two underscores are separators / meta. */
+            if (e.startsWith("__")) continue;
+            const raw = t[e];
+            const a = normalizeCaption(raw);
+            a && (subjects.set(e, a), n++);
+            const src = captionKeyToSrc(e);
+            const sig = normalizeSignature(raw && raw.signature ? raw.signature : null);
+            /* "colour" in a caption names the frame's colour outright, for the
+               frames the measurement gets wrong — pale pink roses sit in the red
+               band of the hue wheel. Usually one of the family names — red,
+               orange, gold, green, teal, blue, violet, pink — but any colour a
+               person would say works ("warm grey"); it is used as written. */
+            sig && raw && "string" == typeof raw.colour && raw.colour.trim() && (sig.colour = raw.colour.trim().toLowerCase());
+            /* "loud": false — never call this frame loud, whatever the
+               measurement says (a deep blue fence measures as vivid). */
+            sig && raw && !1 === raw.loud && (sig.notLoud = !0);
+            /* "mono": true — treat as black and white (a nearly colourless
+               frame the measurement lets through). */
+            sig && raw && !0 === raw.mono && (sig.mono = !0);
+            if (src && sig) {
+                colorSignatures.set(src, sig);
+                if (!validImages.includes(src)) validImages.push(src);
+                sigs++;
+            }
+        }
+        /* Captions feed pairScore. Rescore once the file lands. */
+        (n || sigs) && "undefined" != typeof scheduleTopPairs && scheduleTopPairs(!0)
+    } catch (e) {}
+}
+
+/* "the pint" — from `short`, else the last word of the subject. */
+/* The name a subject goes by inside a sentence.
+
+   Prefers the subject itself — "the pint of beer", "stacked champagne boxes" —
+   over the bare head noun, so a single line can carry both what the thing is
+   and how it relates to the other frame. Falls back to the head noun when the
+   subject runs long, because two four-word names plus a predicate overruns
+   LINE_MAX and the composer would end up picking its shortest, dullest
+   candidate instead. */
+/* Two words, not four. At four, a subject like "graffiti sprayed upside down"
+   was used whole and the sentence carried more description than reason: the
+   name only has to identify which frame is meant. Anything longer falls back to
+   the caption's short noun. */
+const NOUN_MAX_WORDS = 2;
+
+/* Only the three directions that genuinely oppose one another. Curved is left
+   out: it sits against everything and against nothing. */
+/* The word a phrase actually agrees with. Judging on the last word breaks on
+   "the corner of two walls" (walls, but the corner is), and judging on the
+   caption's short field breaks when nounOf rendered the subject instead — which
+   gave "the glittered princess sticker sheet catch the light". Cut at the first
+   preposition or participle and take the last word before it. */
+const PHRASE_TAIL = /\b(of|over|at|in|on|with|under|behind|across|against|through|between|beside|from|going|seen|holding|reading|painted|cast)\b/;
+
+function headOfPhrase(e) {
+    const t = String(e || "").replace(/^the\s+/i, "").split(PHRASE_TAIL)[0].trim().split(/\s+/);
+    return t[t.length - 1] || e
+}
+
+/* One plain adjective each. "Flat across" and "on the diagonal" are adverbial
+   phrases, so joining them gave "Flat across against on the diagonal" — three
+   prepositions in six words. Single adjectives read as a pair. */
+/* What two frames of the same kind get called. Build, room, object and
+   machine are left out — too broad to be a reason. */
+const SAME_KIND = {
+    food: "Two meals.",
+    animal: "Two creatures.",
+    person: "Someone in both.",
+    plant: "Both still growing.",
+    vehicle: "Two vehicles.",
+    sign: "Both telling you something.",
+    light: "Both are about light.",
+    water: "Two kinds of water.",
+    sky: "Look up twice.",
+    /* A spill, a drink — anything that pours but is not water. Paired with
+       water too: see sameKind() below. */
+    liquid: "Both wet."
+};
+
+/* Water and liquid count as one kind for the pairing line; a pair with
+   liquid on either side gets the liquid line. */
+function sameKind(e, t) {
+    const n = { water: 1, liquid: 1 };
+    return e === t ? e : n[e] && n[t] ? "liquid" : null
+}
+
+/* The bare head noun, always short: "the sign", "the boxes". */
+function headNounOf(e) {
+    let t = (e.short || "").trim();
+    if (!t) {
+        const n = String(e.subject || "").replace(/^(a|an|the)\s+/i, "").split(/\s+/);
+        t = n[n.length - 1] || e.subject
+    }
+    return /^(the|a|an)\s/i.test(t) ? t.replace(/^(a|an)\s/i, "the ") : "the " + t
+}
+
+function nounOf(e) {
+    const t = String(e.subject || "").trim().replace(/^(a|an)\s+/i, "");
+    if (t && t.split(/\s+/).length <= NOUN_MAX_WORDS) return /^the\s/i.test(t) ? t : "the " + t;
+    let n = (e.short || "").trim();
+    if (!n) {
+        const a = String(e.subject || "").replace(/^(a|an|the)\s+/i, "").split(/\s+/);
+        n = a[a.length - 1] || e.subject
+    }
+    return /^(the|a|an)\s/i.test(n) ? n.replace(/^(a|an)\s/i, "the ") : "the " + n
+}
+
+/* "low, right of frame" — from the caption, else from the signature's centre
+   of mass.
+
+   Returns "" for the plain centre/middle combination rather than the old
+   "dead centre". Across this catalogue the captioner answered "centre" for
+   61% of images and "middle" for 89%, which is a default rather than an
+   observation — 56% of all images came out as "dead centre". Saying nothing
+   is honest; the caller drops the templates that need a position and uses one
+   that doesn't. Off-centre answers are rarer and therefore likelier to be
+   real, so those still speak. */
+function placePhrase(e, t) {
+    const n = e.placement || (t && t.cx < .4 ? "left" : t && t.cx > .6 ? "right" : "centre"),
+        a = e.height || (t && t.cy < .4 ? "high" : t && t.cy > .6 ? "low" : "middle"),
+        o = "left" === n ? "left of frame" : "right" === n ? "right of frame" : "",
+        i = "high" === a ? "high" : "low" === a ? "low" : "";
+    return i && o ? i + ", " + o : i || o
+}
+
+const LINE_MAX = 110;
+
+function fitLines(e, t) {
+    const n = e.filter(e => "string" == typeof e && e.trim());
+    if (!n.length) return null;
+    const a = n.filter(e => e.length <= LINE_MAX);
+    return a.length ? pick(a, t) : n.slice().sort((e, t) => e.length - t.length)[0]
+}
+
+/* Rough plural test on the head noun, so verbs agree ("the daisies carry"). */
+function isPluralNoun(e) {
+    const t = (e || "").trim().split(/\s+/).pop() || "";
+    return /s$/i.test(t) && !/(ss|us|is|ous|ics|news|glass|grass|bus|lens|series|species)$/i.test(t)
+}
+
+/* Plural form of a 3rd-person-singular verb: runs→run, carries→carry, is→are. */
+function pluralVerb(e) {
+    const t = { is: "are", has: "have", does: "do", was: "were" };
+    return t[e] || (/ies$/.test(e) ? e.slice(0, -3) + "y" : /(ss|sh|ch|x|z)es$/.test(e) ? e.slice(0, -2) : /s$/.test(e) ? e.slice(0, -1) : e)
+}
+
+/* Plural of a noun, for "two skies" rather than "two skys". Only the last word
+   changes. */
+const IRREGULAR_PLURAL = { man: "men", woman: "women", child: "children", person: "people", knife: "knives", leaf: "leaves", shelf: "shelves" };
+
+function pluralOf(e) {
+    const t = String(e || "").trim().split(/\s+/),
+        n = t.pop() || "",
+        a = n.toLowerCase();
+    let o;
+    if (IRREGULAR_PLURAL[a]) o = IRREGULAR_PLURAL[a];
+    else if (/[^aeiou]y$/i.test(n)) o = n.slice(0, -1) + "ies";
+    else if (/(s|sh|ch|x|z)$/i.test(n)) o = n + "es";
+    else o = n + "s";
+    return t.concat(o).join(" ")
+}
+
+/* Fill "{A} {A:runs} {tempA}; {b} {b:runs} {tempB}." — "{name:verb}" conjugates the
+   verb to match the plurality of the noun in slot `name`. Returns null if any
+   plain field is missing, so the caller can skip the template. */
+function fillTemplate(e, t) {
+    let n = !1;
+    const a = e.replace(/\{(\w+)(?::(\w+))?\}/g, (e, a, o) => {
+        if (o) return t.__plural && t.__plural[a] ? pluralVerb(o) : o;
+        const i = t[a];
+        return "string" == typeof i && i ? i : (n = !0, "")
+    });
+    return n ? null : a
+}
+
+function composeRichLine1(e, t, n, a, o) {
+    const i = capitalizeFirst,
+        r = e.subject,
+        s = t.subject,
+        l = placePhrase(e, n),
+        c = placePhrase(t, a),
+        d = e.detail,
+        h = t.detail;
+    return fitLines([
+        /* Needs a real position on both sides; skipped when either frame only
+           offered the default centre. */
+        l && c ? i(r) + ", " + l + "; " + s + ", " + c + "." : null,
+        l && !c ? i(r) + ", " + l + "; " + s + " on the right." : null,
+        !l && c ? i(r) + " on the left; " + s + ", " + c + "." : null,
+        "On the left, " + r + "; on the right, " + s + ".",
+        i(r) + " " + pick(["beside", "next to", "against", "and"], o) + " " + s + ".",
+        d && h ? i(r) + ", " + d + "; " + s + ", " + h + "." : null,
+        d ? i(r) + " on the left, " + d + "; " + s + " on the right." : null,
+        h ? i(r) + " on the left; " + s + " on the right, " + h + "." : null,
+        e.distance && t.distance && e.distance !== t.distance ? i(r) + " up " + e.distance + ", " + s + " " + ("far" === t.distance ? "at a distance" : "mid" === t.distance ? "at mid range" : "up close") + "." : null
+    ], o)
+}
+
+/* The relationship line, always naming the left frame first and the right
+   second — never "the warmer one first", whichever side that happens to be.
+
+   That ordering is why the descriptors are what swap rather than the subjects.
+   Where the old version wrote "{warmer} runs warm; {cooler} runs cool" and let
+   the subjects fall wherever the measurement put them, this fixes the subjects
+   to left and right and assigns each side the word its own measurement earns.
+   Same information, read in the order the eye actually travels. */
+/* Conjugate a verb phrase for its own subject: "keeps its colour" becomes
+   "keep their colour" when the noun in front of it is plural. Only the leading
+   verb and a possessive "its" need touching. */
+function conjPhrase(e, t) {
+    if (!t) return e;
+    const n = e.split(" ");
+    return n[0] = pluralVerb(n[0]), n.join(" ").replace(/\bits\b/g, "their")
+}
+
+/* The reason the pair was chosen, and nothing else.
+
+   No description of what is in the frames: a viewer can already see that. The
+   subjects are named only where the reason needs them — quoted words, a shared
+   noun, a size gap — or where the pattern hinges on one side and saying which
+   makes it concrete ("The pasta crowded, the sky clear").
+
+   Caption-driven reasons come first because they are the ones the colour
+   metrics cannot reach, and they are what the scoring weights most heavily.
+   The commonest colour reasons carry two or three phrasings, picked off the
+   pair's own seed so a given pair always reads the same way. */
+const REASON = {
+    P1: ["Nothing in common."],
+    P2: ["Both bright."],
+    P2b: ["Both pale, in the same light."],
+    P3: ["Both dark, different colour."],
+    P3b: ["The same dark twice."],
+    P9: ["One palette, two exposures."],
+    P13: ["Colour is the only difference."],
+
+    P17: ["Both loud, aimed apart."],
+    P17c: ["The same horizon."]
+};
+
+function composeRichLine2(e, t, o, n, a, i, skipCaptionRules) {
+    const r0 = capitalizeFirst;
+    const r = capitalizeFirst;
+    if (n && a && !skipCaptionRules) {
+        /* The words are not said.
+
+           A sign in one frame and a sign in the other is something any eye can
+           already read off the pictures, so stating it tells the viewer nothing
+           they did not have. The why line is for the relationship they cannot
+           see — the palette, the form, the kind of thing.
+
+           The text terms in pairScore are untouched: words still bring pairs
+           together, they are just no longer given as the reason. */
+        /* Same subject twice — naming it is the whole point of the pairing. */
+        const h = (n.short || "").toLowerCase(),
+            u = (a.short || "").toLowerCase();
+        /* "Two roses" for two photographs of roses counts the flowers, not the
+           frames — and there are dozens in each. A noun that is already plural
+           gets no number in front of it. */
+        /* Each other's first choice out of the whole catalogue. Rarest thing
+           the site knows and the only one that is about the pairing rather
+           than the pictures, so it is said before anything else. */
+        if (whyPairSrcs && mutualBests.has(whyPairSrcs[0] + "|" + whyPairSrcs[1])) return "Nothing pairs better.";
+        /* Both subjects pressed up against the seam, leaning into the gap
+           between the frames. Read from where each frame's weight actually
+           falls, not from the caption. Four pairs in the catalogue. */
+        if (t.cx >= .56 && o.cx <= .44) return "They lean together.";
+        if (h && h === u) return "Same thing somewhere else.";
+        /* Same kind of thing, different thing. A pot of soup and a table of
+           finished plates share no noun, so the same-subject rule misses them,
+           and the form-rhyme rule needs the categories to DIFFER — so two meals
+           had no way to be called two meals. Only the categories specific
+           enough to mean something: "both buildings" says nothing. */
+        /* Two skies at different hours: a crane under a midday sky beside
+           street lights at dusk. "sky": true marks a frame with sky in it;
+           "time" is day, golden hour, dusk or night. */
+        if (n.sky && a.sky && n.time && a.time && n.time !== a.time) return "Skies hours apart.";
+        /* What the words DO between them is a reason; the mere fact of
+           lettering is not. The scoring already reads these relationships
+           (captionScore), so the pairs exist — these lines name what it found:
+           opposed words, the same word twice, a word in common. */
+        if (n.text && a.text) {
+            const wL = textWords(n.text),
+                wR = textWords(a.text);
+            if (textOpposed(wL, wR)) return "One says the opposite.";
+            if (textKey(n.text) === textKey(a.text)) return "The same words twice.";
+            if ([...wL].some(e2 => wR.has(e2))) return "A word in common.";
+        }
+        const kind = sameKind(n.category, a.category);
+        /* Plants: growing, or picked — cut flowers in a vase, greens on a
+           market crate. "picked": true or false in the caption; a frame
+           without it could be either, so the pair gets the line that holds
+           for both. */
+        if ("plant" === kind && h !== u) {
+            const pL = n.picked,
+                pR = a.picked;
+            return "boolean" != typeof pL || "boolean" != typeof pR ? "Seed first." : pL && pR ? "Both picked." : pL || pR ? pL ? "Picked and still growing." : "Still growing and picked." : "Both still growing."
+        }
+        if (kind && SAME_KIND[kind] && h !== u) return SAME_KIND[kind];
+        const m = SCALE_RANK[n.scale],
+            g = SCALE_RANK[a.scale];
+        /* The full range only — something you could hold against a whole
+           landscape. At three steps this fired on a third of every pair in the
+           catalogue, and a framing joke told that often stops being one. */
+        if (void 0 !== m && void 0 !== g && Math.abs(m - g) >= 4) return "Size lies.";
+        if (n.hands && a.hands) return "Hand and hand.";
+        /* Anatomy, the wider rule under hands. A hand, an arm, a face, a
+           painted figure, a carved torso — a body in both frames is a real
+           relationship even when the hands rule is too narrow to catch it.
+           Read from the people field, which was set while looking at each
+           frame, rather than inferred from the caption's wording. */
+        /* A whole figure and a piece of one are not the same claim. Two hands
+           are "a part of someone in each"; two standing people are "someone in
+           both frames". Saying the second about a wrist and a forearm was the
+           complaint. */
+        const bodyL = n.people && "none" !== n.people && "unclear" !== n.people,
+            bodyR = a.people && "none" !== a.people && "unclear" !== a.people;
+        if (bodyL && bodyR) {
+            const wholeL = "figure" === n.people || "many" === n.people,
+                wholeR = "figure" === a.people || "many" === a.people;
+            return wholeL && wholeR ? "A figure in each." : wholeL || wholeR ? "One whole, one in part." : "Anatomy in both."
+        }
+        /* The same accent twice. Placed above structure because a colour
+           repeating across two unrelated frames is the more startling of the
+           two — it is the thing you notice without looking for it. */
+        if (n.accent && n.accent === a.accent && (n.short || "").toLowerCase() !== (a.short || "").toLowerCase()) return "The same " + n.accent + " twice.";
+        /* Structure reads before subject: two lattices look like each other
+           long before you notice one is scaffolding and one is shelving. */
+        if (n.structure && n.structure === a.structure && (n.short || "").toLowerCase() !== (a.short || "").toLowerCase()) {
+            /* Both lattice and grid are called grids in the prose. The two are
+               worth keeping apart in the data — a scaffold is not a tiled wall —
+               but "lattice" is a builder's word, and a viewer sees a grid. */
+            /* Lines are their own case. Wires, cables, contrails, a shadow
+               thrown across a wall — thin dark marks over a plain ground, which
+               a viewer reads before anything else in the frame. The other
+               phrasings count ("two grids"), and lines are never countable. */
+            if ("lines" === n.structure) return "Lines.";
+            const st = { lattice: "grid", grid: "grid", stack: "stack" } [n.structure];
+            return capitalizeFirst(pluralOf(st)) + " on both sides."
+        }
+        /* Direction. The captions carry it and nothing was saying it: a
+           contrail cutting across the frame against a lamp post standing
+           straight up is a plain visual fact, and the sort a viewer notices
+           first. Only the three genuine oppositions count — curved against
+           anything is too soft to be worth a sentence, and 39% of pairs have
+           one of these, so it sits below the caption-specific reasons and
+           above the colour patterns. */
+
+        /* Words on one side are not said. A sign in one frame and none in the
+           other describes a frame, not a relationship, and a why line should
+           only ever give the reason two photographs are together. */
+        /* Colour against black and white, and complementary colour. Both are
+           pairing principles rather than descriptions, so they sit above the
+           looser colour patterns.
+
+           Computed here rather than read from the const block below: that block
+           runs after this chain, so referencing it from here throws. */
+        const cnL = dominantColourName(t),
+            cnR = dominantColourName(o),
+            /* Family names for the shared-colour test: "blue" has to match
+               "blue" even when one is slate and the other is sky. */
+            cnL0 = dominantHueLabel(t),
+            cnR0 = dominantHueLabel(o),
+            /* Black and white needs two things: a low average AND no swatch
+               with real colour in it. A red sweet wrapper on a white table
+               averages .022, because the white fills the frame — but the
+               wrapper is chroma .144, and no one would call that photograph
+               black and white. */
+            hasChroma = e2 => (e2.palette || []).some(e3 => e3.oklab && Math.hypot(e3.oklab.a, e3.oklab.b) >= .09 && (e3.weight || 0) >= .1),
+            /* .02. At .045 a scaffold in grey daylight qualified — a colour
+               photograph of a colourless thing, which is not the same as a
+               black-and-white one. Only frames with essentially no colour at
+               all get the words. */
+            mL = t.mono || (t.avgSat || 0) < .02 && !hasChroma(t),
+            mR = o.mono || (o.avgSat || 0) < .02 && !hasChroma(o);
+        /* One side must be monochrome AND the other must have a colour worth
+           naming. Black denim with a brass zip sits at .16 saturation — over
+           the monochrome line, but its dominant swatch has a chroma of .030,
+           which is grey. Saying "colour against black and white" about two dark
+           frames claims something neither of them has. */
+        /* The same colour in both, even when it is the whole of one frame and a
+           detail of the other: a blue wall behind model planes and a blue bag
+           dropped on grass. The accent rule above only compares accent with
+           accent, so this pairing had no way to be seen. */
+        const setL = [cnL0, n.accent, detailColour(t)].filter(Boolean),
+            setR = [cnR0, a.accent, detailColour(o)].filter(Boolean),
+            sharedCol = setL.find(e2 => setR.includes(e2));
+        if (sharedCol && (cnL0 !== cnR0 || n.accent || a.accent) && (n.short || "").toLowerCase() !== (a.short || "").toLowerCase()) return capitalizeFirst(pluralOf(sharedCol)) + ".";
+        /* Left frame first, like every other ordered line: the skeleton is the
+           black-and-white one, so it is the one named first. These were fixed
+           strings and always put colour ahead of monochrome regardless of which
+           side each was on. */
+        if (mL !== mR && (mL ? cnR : cnL)) return "One forgot its colour.";
+        if (cnL && cnR && cnL !== cnR) {
+            const sL = representativeSwatch(t),
+                sR = representativeSwatch(o);
+            let gap = sL && sR ? Math.abs(sL.hsl.h - sR.hsl.h) : 0;
+            gap > 180 && (gap = 360 - gap);
+            /* The frame's own main colour has to be solid — not any swatch in
+               the palette. Testing "some swatch" let a small vivid accent
+               qualify a frame whose actual colour is dull, so two pictures were
+               called complementary on the strength of details. */
+            const solid = e2 => {
+                const e3 = representativeSwatch(e2);
+                return !!e3 && e3.hsl.s >= .5 && e3.hsl.l >= .22 && e3.hsl.l <= .88
+            };
+            if (gap >= 140 && solid(t) && solid(o)) return "Complementarity."
+        }
+        /* A shared geometry. Named before the curve rule, which is a coarser
+           version of the same idea; and rectangles are excluded here too. */
+        /* The shape line never names the subjects. shape records a geometry
+           present in the frame, not the form of the thing photographed: the
+           circle in a pot of soup is the ladle, and in a plate of oysters it
+           is the plate. "Two circles: the soup and the oysters" claims a
+           roundness neither subject has. Naming the shape alone is true of
+           every frame that carries one. */
+        if (n.shape && n.shape === a.shape && "rectangle" !== n.shape && (n.short || "").toLowerCase() !== (a.short || "").toLowerCase()) return "A rhyme in shape.";
+        /* A shared material. Two frames of concrete, or brick, or marble, are
+           made of the same stuff however different their subjects — and the
+           surface field has carried this all along without anything reading it.
+           Only materials worth naming: "painted" and "plastic" describe half
+           the catalogue. */
+        const MATERIALS = ["concrete", "brick", "marble", "timber", "denim", "steel", "glass", "tile", "render", "card", "paper"],
+            /* Whole words: "painted fibreglass" was being read as glass. */
+            hasMat = (e2, t2) => new RegExp("\\b" + t2 + "\\b", "i").test(e2 || ""),
+            matL = MATERIALS.find(e2 => hasMat(n.surface, e2)),
+            matR = MATERIALS.find(e2 => hasMat(a.surface, e2));
+        if (matL && matL === matR && (n.short || "").toLowerCase() !== (a.short || "").toLowerCase()) return capitalizeFirst(matL) + " in each.";
+        /* Numbers, and words. The text field records what a frame says; two
+           frames that both carry digits, or both carry lettering, have that
+           between them whatever else differs. The words themselves are not
+           quoted — naming them was too much detail for a reason. */
+        const digL = /\d/.test(n.text || ""),
+            digR = /\d/.test(a.text || "");
+        /* A logo in each reads before the words do: RENAULT on a lorry and
+           ATLAS on a crane are marks, not text, and "Words in both" undersold
+           them. Set "logo": true in a caption to join. */
+        if (n.logo && a.logo) return "A logo in each.";
+        if (digL && digR) return "Numbers in both.";
+        /* Lettering in both is NOT a reason on its own. It was the site's most
+           common line by far — a fifth of every pair — and "both have writing
+           on them" is the weakest thing two photographs can have in common.
+           The scoring still brings text frames together (captionScore rewards
+           opposed words, echoed words and repeated words), so those pairs
+           still happen; they now have to earn a reason from what else they
+           share, which is the stronger claim anyway. */
+        /* A shared curve. The direction rule below only speaks when the lines
+           oppose, so a parabolic arch against an oval bowl — the same shape in
+           two unrelated worlds — got nothing but a colour line. Curves are rare
+           enough in the catalogue (one frame in six) for two of them to be a
+           real rhyme. */
+        if ("curved" === n.lines && "curved" === a.lines) return "Curves.";
+        /* Two geometries against each other. The shape field records a form
+           present in the frame, not the outline of the subject, so the line
+           names the forms and nothing else. */
+        if (n.shape && a.shape && n.shape !== a.shape) {
+            const SH = { circle: "Round", rectangle: "Square", triangle: "Pointed" },
+                e2 = SH[n.shape],
+                t2 = SH[a.shape];
+            if (e2 && t2) return e2 + " and " + t2.toLowerCase() + ".";
+        }
+        /* One frame looked up at, one looked down at — named in screen order,
+           like every other ordered line, so the first word belongs to the
+           frame on the left. */
+        if ("high" === n.height && "low" === a.height) return "Look up look down.";
+        if ("low" === n.height && "high" === a.height) return "Look down look up.";
+        /* A shadow in the picture, in both. Hard sun alone was not enough — a
+           tower against a clear sky is lit hard and casts nothing the viewer
+           can see. The captions have to say a shadow, or deep shade, is there. */
+        const SHADOW = e2 => /shadow|\bshade\b/i.test([e2.light, e2.subject, e2.detail].join(" ")) && !/no shadow/i.test(e2.light || "");
+        if (SHADOW(n) && SHADOW(a)) return "Two shadows.";
+        /* The same light, described in the same words while looking at two
+           unrelated things — a coincidence of conditions, not of subject. */
+        if (n.light && n.light === a.light && h !== u) return "The same light twice.";
+        /* Direction used to be named here — "upright against diagonal" and the
+           like. Removed: judging a frame's inclination from a caption proved
+           unreliable, and two frames running at visibly the same angle were
+           being set against each other as opposites. A claim that cannot be
+           trusted is worse than no claim, so nothing in the prose now says
+           anything about which way a picture leans. */
+    }
+    const { id: s } = { id: e },
+        /* Which frame leads on the axis the pattern turns on, so a variant can
+           name it rather than stating the contrast in the abstract. */
+        l = representativeSwatch(t),
+        p = representativeSwatch(o),
+        f = (l && l.hsl ? l.hsl.s : 0) >= (p && p.hsl ? p.hsl.s : 0),
+        y = t.density >= o.density,
+        L2 = t.meanL >= o.meanL,
+        WM = (l ? l.oklab.b : 0) >= (p ? p.oklab.b : 0),
+        /* One frame has to actually be dark before the word is used. */
+        /* Night is darkness, not a dark colour: a deep blue fence in flat
+           daylight sits at .21 lightness but is fully saturated, and calling
+           it night was wrong. The dark side has to be dim AND close to
+           colourless. */
+        reallyDark = Math.min(t.meanL, o.meanL) < .35 && Math.abs(t.meanL - o.meanL) >= .25 && (t.meanL < o.meanL ? t : o).avgSat < .55,
+        /* Day and night are hours, not lightness. A paint tube under studio
+           light is not day, and a car interior in hard sun is not night — so
+           the words are only used when the captions allow them: the dark frame
+           with no sun or daylight in it, the light frame outdoors. */
+        SUNLIT = e2 => !!e2 && (!!e2.sky || /\bsun\b|sunlit|daylight|clear sky|overcast|sunset/i.test(e2.light || "")),
+        /* And a dark interior is not night either: an escalator under strip
+           lights is dim, not late. */
+        UNLIT = e2 => !!e2 && !SUNLIT(e2) && !/interior|indoor|gallery|shop light|strip|fluoresc|kitchen|bathroom|workshop|studio|pendant|lamp/i.test(e2.light || ""),
+        dayNightOK = reallyDark && (t.meanL < o.meanL ? UNLIT(n) && SUNLIT(a) : UNLIT(a) && SUNLIT(n)),
+        /* Does the frame hold a colour a viewer would call strong? avgSat is an
+           area-weighted mean, so a few vivid roses in a lot of dark foliage
+           average out to a low number and the pair gets called low-colour. The
+           palette knows better. Very dark and very pale swatches are excluded:
+           a near-black navy reads as fully saturated in HSL and is not what
+           anyone means by colour. */
+        strong = e2 => (e2.palette || []).some(e3 => e3.hsl.s >= .5 && e3.hsl.l >= .22 && e3.hsl.l <= .88 && e3.weight >= .12),
+        strongL = strong(t),
+        strongR = strong(o),
+        /* "All the colour on one side" needs a real gap, not a small vivid
+           patch in an otherwise muted frame beside another muted frame: an
+           agave in a planter and scaffolding on brick both sit near .11
+           saturation, and the line was being said about them. */
+        /* "All the colour on one side" is a claim about the OTHER side having
+           none, so it is measured on the strongest colour each frame actually
+           shows — any swatch big enough to notice, not the area-weighted mean.
+           A white van with a red light, or a footpath with a green verge, has
+           colour in it and does not qualify. */
+        chromaShown = e2 => Math.max(0, ...(e2.palette || []).filter(e3 => e3.oklab && e3.weight >= .08).map(e3 => Math.hypot(e3.oklab.a, e3.oklab.b))),
+        cShownL = chromaShown(t),
+        cShownR = chromaShown(o),
+        colourGap = Math.max(cShownL, cShownR) >= .13 && Math.min(cShownL, cShownR) < .1 && Math.abs(cShownL - cShownR) >= .1 && !detailColour(cShownL > cShownR ? o : t),
+        /* Warm and cool are only worth saying when the two hues genuinely sit
+           on opposite sides of it. Oklab's b axis runs blue to yellow, so green
+           lands on the positive side and gets called warm — a green field under
+           a blue sky was reading as "warm and crowded". Green, teal and violet
+           are the ambiguous middle: when either frame is one of them, the pair
+           is described by hue instead, which is both true and more specific. */
+        /* The caption has the last word on warmth. A flaking apricot board
+           against a blue wheel measures warm and was captioned "mixed", which
+           is what it is; the measurement should not overrule what was written
+           while looking at the picture. */
+        tempWritten = e2 => !e2 || !e2.temp || "mixed" !== e2.temp,
+        hFamL = dominantHueLabel(t),
+        hFamR = dominantHueLabel(o),
+        hL = dominantColourName(t),
+        hR = dominantColourName(o),
+        dL = detailColour(t),
+        dR = detailColour(o),
+        WARM_HUES = ["red", "orange", "gold", "pink"],
+        COOL_HUES = ["blue", "teal"],
+        tempOK = hFamL && hFamR && hL && hR && (WARM_HUES.includes(hFamL) && COOL_HUES.includes(hFamR) || COOL_HUES.includes(hFamL) && WARM_HUES.includes(hFamR)) && tempWritten(n) && tempWritten(a),
+        /* The side about to be called hot must not be a cool or in-between
+           family, and the cold side not a warm or in-between one. */
+        tempFree = (WM ? !hFamL || WARM_HUES.includes(hFamL) : !hFamL || COOL_HUES.includes(hFamL)) && (WM ? !hFamR || COOL_HUES.includes(hFamR) : !hFamR || WARM_HUES.includes(hFamR)),
+        /* Must require the display names too: dominantColourName applies a
+           chroma gate that dominantHueLabel does not, so the family can be
+           known while the name is null — which printed "null and red." */
+        hueOK = hFamL && hFamR && hL && hR && hL !== hR,
+        /* "No colour in common" was firing on a red palette against an orange
+           one — two plates of the same warm food, palette contrast .062, about
+           as close as two photographs get. A difference in hue LABEL is not a
+           difference in colour: red and orange are neighbours on the wheel and
+           the boundary between them is arbitrary. The claim now needs the
+           families to be genuinely far apart AND the palettes to agree that
+           they are. */
+        HUE_ADJACENT = {
+            red: ["orange", "pink"],
+            orange: ["red", "gold"],
+            gold: ["orange", "green"],
+            green: ["gold", "teal"],
+            teal: ["green", "blue"],
+            blue: ["teal", "violet"],
+            violet: ["blue", "pink"],
+            pink: ["violet", "red"]
+        },
+        hueFar = hueOK && !(HUE_ADJACENT[hFamL] || []).includes(hFamR) && paletteContrastOf(t, o) >= .3,
+        /* "Both warm" is a claim about whole frames, so both frames have to
+           have enough colour for it to mean anything. A grey wall with a prism
+           on it measures warm because the prism's highlight is the strongest
+           swatch — the same reason a frame this close to monochrome gets no hue
+           name. The same floor applies. */
+        tempSayable = (t.avgSat || 0) >= MIN_FRAME_SAT && (o.avgSat || 0) >= MIN_FRAME_SAT && tempWritten(n) && tempWritten(a),
+
+        VT = t.vertical >= o.vertical,
+        TL = t.aspect <= o.aspect,
+        /* Descriptor pairs, always in screen order: index 0 describes the left
+           frame. The bare reasons below read straight off these, so a line like
+           "Cool and clear against warm and crowded" follows the pictures rather
+           than naming whichever side happens to be warm. */
+        d2 = (e, t2, n2) => n2 ? [e, t2] : [t2, e],
+        [tw1, tw2] = d2("warm", "cold", WM),
+
+        [li1, li2] = d2("day", "night", L2),
+        [br1, br2] = d2("bright", "dark", L2),
+        /* These describe density, which is the entropy of a seven-bin colour
+           histogram — how widely spread the colours are, not how much is in
+           the frame. "Crowded" and "empty" were the wrong English for it: a
+           building site behind a flat white hoarding scores lower than an empty
+           white corner, because the hoarding concentrates colour and the
+           corner's shading spreads it. Colour-variety words are what the
+           measurement actually supports. */
+        [em1, em2] = d2("several colours", "one", y),
+        /* The one/many phrasing sounds absolute while the measurement is only
+           comparative, so two photographs of blue sky could come out as "many
+           colours" against "one" on a gap that is real but small. It is only
+           used when the varied frame is genuinely varied and the plain one
+           genuinely plain — above the median and inside the bottom tenth of
+           this catalogue respectively. Everything else takes another line. */
+        countOK = Math.max(t.density, o.density) >= .8 && Math.min(t.density, o.density) <= .6,
+        [co1, co2] = d2("colour", "none", f),
+        [vt1, vt2] = d2("upright", "across", VT),
+        [vn1, vn2] = d2("verticals", "horizontals", VT),
+        [as1, as2] = d2("tall", "wide", TL),
+        w = n && a ? (f ? nounOf(n) : nounOf(a)) : "",
+        b = n && a ? (f ? nounOf(a) : nounOf(n)) : "",
+        S = n && a ? (y ? nounOf(n) : nounOf(a)) : "",
+        E = n && a ? (y ? nounOf(a) : nounOf(n)) : "",
+        LT = n && a ? (L2 ? nounOf(n) : nounOf(a)) : "",
+        DK = n && a ? (L2 ? nounOf(a) : nounOf(n)) : "",
+        /* Fixed to position, not to any measurement: L is whatever is on the
+           left of the screen. The variants below swap the predicate around
+           these, which is what keeps the sentence matching the picture. */
+        L = n ? nounOf(n) : "",
+        R = a ? nounOf(a) : "",
+        /* Verb agreement, judged on the caption's own head noun: "the tram
+           wires take", not "takes". */
+        pL = n ? isPluralNoun(headOfPhrase(L)) : !1,
+        pR = a ? isPluralNoun(headOfPhrase(R)) : !1,
+        vL = (e, t) => pL ? t : e,
+        vR = (e, t) => pR ? t : e,
+        v = {
+            /* Every named variant reads left frame first and swaps the
+               predicate, never the subjects. Ordering by attribute put the lit
+               frame first wherever it sat, so a reader mapping the first name
+               to the left-hand picture was told the opposite of what they were
+               looking at. */
+            P4: [tempOK ? r(tw1) + " and " + tw2 + "." : null,
+                hueOK ? r(hL) + " and " + hR + "." : null,
+                /* Same gate as P8 and P9 — this one was missed, so "Lit against
+                   dark" still fired on a frame at .42 lightness. */
+                dayNightOK ? r(li1) + " and " + li2 + "." : null,
+                /* A lightness gap short of real darkness: the plain pair of words. */
+                reallyDark || Math.min(t.meanL, o.meanL) >= .4 ? null : L2 ? "Light and dark." : "Dark and light."],
+            /* P5's two lines both need a nameable colour on each side. Where
+               one frame is too muted to name — scaffold poles in grey render
+               beside a fully saturated blue fence — the pattern had nothing
+               left and the pair fell all the way to "Small differences", which
+               is not what a viewer would say about it. The difference in how
+               much colour each frame carries IS the pair. */
+            P5: [tempOK ? r(tw1) + " and " + tw2 + "." : null,
+                hueOK ? r(hL) + " and " + hR + "." : null,
+                colourGap ? "All the colour on one side." : null],
+            P6: [tempOK ? r(tw1) + " and " + tw2 + "." : null,
+                hueOK ? r(hL) + " and " + hR + "." : null,
+                /* One frame has a colour, the other only a detail of one. */
+                /* "In the dark" was describing frames at .5 lightness. The
+                   detail is small and the frame around it is plain; neither of
+                   those is darkness. */
+                /* Left frame first, like every other ordered line. This one
+                   always led with whichever frame had the dominant colour,
+                   so a red detail on the left was announced after the blue on
+                   the right. */
+                /* Was "Blue on the left, just a thread of red on the right" —
+                   nine words to say what two do. The side each colour is on is
+                   plain to see; only the pairing needs saying. */
+                hL && !hR && dR ? capitalizeFirst(hL) + " and " + dR + "." : null,
+                hR && !hL && dL ? capitalizeFirst(dL) + " and " + hR + "." : null,
+                tempOK && L && R ? r(L) + " " + vL("runs", "run") + " " + tw1 + ", " + R + " " + vR("runs", "run") + " " + tw2 + "." : null,
+                hueOK && L && R ? r(L) + " " + vL("is", "are") + " " + hL + ", " + R + " " + vR("is", "are") + " " + hR + "." : null,
+                /* Last resort, and stated plainly. P6 is selected on a real
+                   temperature gap, so the absolute words are earned even where
+                   neither hue can be named — one frame is cool and the other
+                   warm, and the comparative form only made that sound less
+                   certain than it is. */
+                /* Only where neither frame's colour family argues with the word:
+                   oklab's warm axis runs through green, so a green field was
+                   being called hot. */
+                /* And never about a frame with too little colour to be warm or cold at
+                   all: a grey render was being called warm. */
+                tempOK || hueOK || !tempFree || !tempSayable ? null : r(tw1) + " and " + tw2 + "."],
+            P7: [dayNightOK ? r(li1) + " and " + li2 + "." : null],
+            /* Same floor as P11: the one/many wording is only honest on a wide
+               density gap. */
+            P10: [
+                hueFar ? "No colour shared." : null],
+            P17d: [r(as1) + " against " + as2 + "."],
+            /* Both-warm and both-cool need both frames to hold enough colour
+               for the claim to mean anything; see tempSayable above. */
+            P14: [tempSayable && [hFamL, hFamR].every(e2 => !e2 || WARM_HUES.includes(e2)) ? "Both warm." : null,
+                tempSayable && hueOK ? r(hL) + " and " + hR + "." : null],
+            P15: [tempSayable && [hFamL, hFamR].every(e2 => !e2 || COOL_HUES.includes(e2)) ? "Both cool." : null,
+                tempSayable && hueOK ? r(hL) + " and " + hR + "." : null],
+            P11: [
+                /* Say what the measurement means in the plainest words there
+                   are: it counts colours, so the line should say colours. */
+
+
+                y ? "A gaze and a glance." : "A glance and a gaze."],
+            P8: [dayNightOK ? r(li1) + " and " + li2 + "." : null,
+                /* A lightness gap short of real darkness: the plain pair of words. */
+                reallyDark || Math.min(t.meanL, o.meanL) >= .4 ? null : L2 ? "Light and dark." : "Dark and light."],
+            /* P9 is a lightness split, nothing more: the selector allows palette
+               contrast up to .55, so calling it "the same palette" was a claim
+               the pattern never made — a pink neon against a grey sky qualifies. */
+            /* "In shadow" says why a frame is dark; a wall painted black is
+               dark without a shadow anywhere. And the absolute words need a
+               genuinely dark frame — .46 lightness against .77 is not "dark
+               against bright", it is one frame lighter than the other. */
+            P9: [dayNightOK ? r(li1) + " and " + li2 + "." : null,
+                L && R && reallyDark ? r(L) + (L2 ? " " + vL("catches", "catch") + " the light, " : " " + vL("holds", "hold") + " the dark, ") + R + (L2 ? " " + vR("holds", "hold") + " the dark." : " " + vR("catches", "catch") + " the light.") : null,
+                /* A lightness gap short of real darkness: the plain pair of words. */
+                reallyDark || Math.min(t.meanL, o.meanL) >= .4 ? null : L2 ? "Light and dark." : "Dark and light."],
+            P3b: ["The same dark twice."],
+            P12: [
+                /* Exactly one side, not either side: the claim is that the
+                   colour is on ONE of them. Two warm brick frames both have
+                   colour, and saying it sits on one was simply false. And the
+                   plain side must be plain: a framed print of a red apple has
+                   its colour in one small place, but it has it. */
+                strongL !== strongR && !(strongL ? detailColour(o) : detailColour(t)) ? "All the colour on one side." : null,
+                /* Only say a frame carries the colour when it holds one a
+                   viewer would call strong. */
+                w && (f ? strongL : strongR) && !(f ? detailColour(o) : detailColour(t)) ? "The colour sits with " + w + "." : null],
+            P12b: [hueFar ? "No colour in common." : null,
+                hueOK ? r(hL) + " and " + hR + "." : null],
+            P12c: ["A shade apart."],
+            /* Only claim low colour when the palettes agree with the average:
+               vivid roses in dark foliage average low but are not quiet. */
+            P16: [],
+            /* The signature's verticality and the caption's lines field can
+               disagree; when they do, say nothing about direction. */
+            /* This pattern used to name the direction too — "upright against
+               across", and "one leans one way, one the other". All of it is a
+               claim about inclination, which is the thing being withdrawn, so
+               the pattern falls back to what it can still say honestly. */
+            P17b: ["Neither one insists."],
+            /* P18 is the terminal else in selectWhyPattern — the bucket a pair
+               falls into when no axis crossed its threshold. That is "nothing
+               stood out", not "these are nearly identical", and the old wording
+               claimed the strongest similarity in the set for pairs that had
+               merely failed to be interesting in any particular way. */
+            P18: ["Small differences."],
+            PMONO: [strongL !== strongR && !(strongL ? detailColour(o) : detailColour(t)) ? "One forgot its colour." : null,
+                strongL !== strongR && !(strongL ? detailColour(o) : detailColour(t)) ? "All the colour on one side." : null,
+                L && R ? r(L) + (f ? " in colour, " : " in grey, ") + R + (f ? " in grey." : " in colour.") : null]
+        },
+        T0 = (v[s] || REASON[s] || REASON.P18).filter(Boolean);
+    let T = T0;
+    /* Before giving up: claims that hold for any pair but were only being
+       made inside particular patterns, so a pair routed elsewhere missed
+       them. An escalator under strip lights beside a gable in full sun is
+       "Indoors and out" whatever its palette said. */
+    if (!T.length || 1 === T.length && "Small differences." === T[0]) {
+        /* A canteen lit by daylight and pendant globes is indoors: the room
+           it is decides that, not the word "daylight" in its light. */
+        const INSIDE = e2 => "room" === e2.category || /interior|indoor|gallery|shop light|strip|fluoresc|kitchen|bathroom|workshop|pendant|lamp/i.test(e2.light || ""),
+            OUTSIDE = e2 => !INSIDE(e2) && (e2.sky || /\bsun\b|sunset|daylight|overcast|dusk|fog|open sky/i.test(e2.light || "")),
+            inL = n && INSIDE(n), inR = a && INSIDE(a),
+            outL = n && OUTSIDE(n), outR = a && OUTSIDE(a),
+            F = [colourGap ? "All the colour on one side." : null,
+                inL && outR && !outL ? "Indoors and out." : inR && outL && !outR ? "Outdoors and in." : null,
+                /* The darker side has to be dark, not merely darker: a woman
+                   running in a field at .47 lightness is not the dark half of
+                   anything. */
+                !reallyDark && Math.abs(t.meanL - o.meanL) >= .25 && Math.min(t.meanL, o.meanL) < .4 ? L2 ? "Light and dark." : "Dark and light." : null,
+                /* Screen order, like every other ordered line. */
+                n && a && "close" === n.distance && "far" === a.distance ? "Near and far." : n && a && "far" === n.distance && "close" === a.distance ? "Far and near." : null
+            ].filter(Boolean);
+        F.length && (T = [F[0]])
+    }
+    /* One reason per pair, not a seeded choice between phrasings: where more
+       than one line is valid, the shortest is the one said. A rule whose
+       every line is gated off falls through to P18 rather than to nothing. */
+    return shortestLine(T.length ? T : v.P18)
+}
+
+function shortestLine(e) {
+    const t = e.filter(e => "string" == typeof e && e.trim());
+    return t.length ? t.reduce((e, t) => t.length < e.length ? t : e) : null
+}
+
+
+
+/* No punctuation in a reason. The line is a caption, not a sentence, and the
+   full stops and commas were doing nothing but sitting there. Applied once at
+   the point of display so none of the phrasings has to change. A hyphen
+   between two words becomes a space; an apostrophe inside a word stays. */
+function stripPunctuation(e) {
+    return e ? e.replace(/(\p{L})-(?=\p{L})/gu, "$1 ").replace(/(^|[^\p{L}])['’]|['’](?=[^\p{L}]|$)/gu, "$1").replace(/[^\p{L}\p{N}\s'’]/gu, "").replace(/\s+/g, " ").trim() : e
+}
+
+/* Every "in both" line has a second form, "left and right", and each pair
+   keeps one of the two — decided by the pair's own seed, so a given pair
+   always reads the same way. */
+function bothOrSides(e, t) {
+    return e && / in both\.$/.test(e) && 1 & t >>> 7 ? "Someone in both." === e ? "Someone." : e.replace(/ in both\.$/, " left and right.") : e
+}
+
+/* The srcs of the pair being explained, set by the two callers below. The why
+   line is otherwise composed from signatures and captions alone, and a couple
+   of rules need to know WHICH photographs these are — whether they are each
+   other's best match, for one. */
+let whyPairSrcs = null;
+
+function composeWhyText(e, t, n, a) {
+    const o = whySeed(e, t),
+        i = Math.imul(2654435769 ^ o, 2654435761) >>> 0,
+        { id: r } = selectWhyPattern(e, t);
+    if (n && a) {
+        const s = composeRichLine1(n, a, e, t, o),
+            l = bothOrSides(composeRichLine2(r, e, t, n, a, i), i);
+        /* Third element flags the caption path: there, line 1 is description
+           and line 2 is the reason, so line 2 can stand alone. The colour-only
+           fallback below splits the other way round and needs both lines. */
+        if (s && l) return [s, l, !0]
+    }
+    return renderWhy(r, e, t, o)
+}
+
+function showWhy() {
+    /* The gesture has been used, so the line naming it has done its job —
+       clicking already removed it, swiping up did not. */
+    hideClickHint();
+    if (!whyEl) return;
+    if (whyEl.classList.contains("visible")) return;
+    const e = currentPairSrcsFromHash();
+    if (!e) return;
+    const [t, n] = e, a = colorSignatures.get(t), o = colorSignatures.get(n);
+    if (!a || !o) return;
+    if (a.isFallback || o.isFallback) return;
+    whyPairSrcs = e;
+    const i = subjectFor(t),
+        r = subjectFor(n),
+        [s, l, richMode] = composeWhyText(a, o, i, r);
+    whyPairSrcs = null;
+    /* With captions, line 1 names what is in the frames and line 2 says why
+       they are together — and line 2 names the subjects itself ("the pint and
+       the sign, both pale"), so it reads perfectly well on its own. Showing
+       only the reason is the stronger panel.
+
+       The colour-only fallback is built the other way round: its first line
+       carries the substance ("Vivid red against a more restrained
+       counterpart") and its second is a closer ("Everything else falls
+       away") that says nothing by itself. So both lines stay in that case.
+       Set WHY_REASON_ONLY to false to always show both. */
+    /* why-line-1 was removed from the page; only the reason line remains. */
+    whyLine1El && (whyLine1El.textContent = WHY_REASON_ONLY && richMode ? "" : stripPunctuation(s)), whyLine2El.textContent = stripPunctuation(l);
+    let c = !!window.__diag;
+    if (!c) try {
+        c = "1" === localStorage.getItem("diptychDiag")
+    } catch (e) {}
+    if (!c) try {
+        c = /[?&]dbg=1\b/.test(location.search)
+    } catch (e) {}
+    if (c) {
+        const e = e => (String(e).match(/ff(\d+)/) || [])[1] || e,
+            i = e => {
+                const t = representativeSwatch(e),
+                    n = t && t.oklab ? Math.hypot(t.oklab.a, t.oklab.b) : 0,
+                    a = t && t.hsl ? Math.round(t.hsl.h) + "/" + t.hsl.s.toFixed(2) + "/" + t.hsl.l.toFixed(2) : "-",
+                    o = t && t.hsl ? t.hsl.s : 0;
+                return describeSwatch(e) + " [hsl " + a + " chroma " + n.toFixed(3) + " peakSat " + o.toFixed(2) + " | avgSat " + (e.avgSat || 0).toFixed(2) + " meanL " + (e.meanL || 0).toFixed(2) + "]"
+            },
+            /* Caption keys and subjects alongside the colour data, so a
+               mismatch between the manifest and the images on screen is
+               visible rather than inferred: if the subject printed for ff102
+               isn't what ff102 actually shows, the manifest is stale. */
+            c2 = e => {
+                const t = subjectKey(e),
+                    n = t && subjects.get(t);
+                return t + " = " + (n ? n.subject + (n.short ? " (" + n.short + ")" : "") : "NO CAPTION")
+            },
+            r = "[" + selectWhyPattern(a, o).id + "] ff" + e(t) + " = " + i(a) + "   ||   ff" + e(n) + " = " + i(o) + "\n   captions: " + c2(t) + "   ||   " + c2(n);
+        console.log(r);
+        let s = document.getElementById("diptych-dbg");
+        s || (s = document.createElement("div"), s.id = "diptych-dbg", s.style.cssText = "position:fixed;left:8px;bottom:8px;z-index:99999;font:11px/1.4 ui-monospace,Menlo,monospace;color:rgba(255,255,255,0.78);background:rgba(0,0,0,0.55);padding:5px 8px;border-radius:4px;max-width:96vw;white-space:pre-wrap;pointer-events:none;letter-spacing:0;", document.body.appendChild(s)), s.textContent = r
+    }
+    whyEl.classList.add("visible"), whyEl.setAttribute("aria-hidden", "false"), captureFocus(whyEl)
+}
+
+function hideWhy() {
+    whyEl && whyEl.classList.contains("visible") && (whyEl.classList.remove("visible"), whyEl.setAttribute("aria-hidden", "true"), restoreFocus())
+}
+/* The why panel opens by swiping up only — on a touch screen, or with two
+   fingers on a trackpad. There is no key for it. */
+whyEl && whyEl.addEventListener("click", () => hideWhy());

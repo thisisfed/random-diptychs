@@ -6,8 +6,19 @@
   <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
   <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
   <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
-  <meta name="theme-color" content="#ffffff">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta name="theme-color" content="#111111">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+
+  <!-- Preconnect to Google Analytics origin. If the visitor accepts the
+       consent banner, loadAnalytics() (in app.js) injects the gtag.js
+       script — without this hint, that incurs a fresh DNS lookup + TLS
+       handshake (~200-400ms on a fresh visit). The preconnect runs
+       during initial HTML parse, in parallel with everything else,
+       so the GA load lands on a warm connection. If the visitor
+       declines, the preconnect is harmless: TCP+TLS were negotiated
+       but no data is sent. crossorigin is required for the connection
+       to be reused by the gtag script's CORS-credentialed fetches. -->
+  <link rel="preconnect" href="https://www.googletagmanager.com" crossorigin>
   <!-- iOS Safari auto-detects phone numbers / email addresses / dates
        in body text and wraps them in its own blue-underlined link
        elements, ignoring the surrounding author styling. The contact
@@ -16,192 +27,56 @@
        removes that whole class of forced-blue artifact. -->
   <meta name="format-detection" content="telephone=no, date=no, address=no, email=no">
 
-  <!-- ═══════════════════════════════════════════════
-       THEME — SUNRISE / SUNSET
-
-       Sets `html.night` BEFORE first paint so the splash
-       doesn't flash white when the user is on a black
-       site (or vice versa). Sunrise/sunset are computed
-       from a longitude derived from the timezone offset
-       and a latitude estimated from the IANA zone region
-       — no geolocation prompt, no third-party calls. The
-       same logic re-runs every minute to flip the theme
-       live as the threshold is crossed.
-  ═══════════════════════════════════════════════ -->
-  <script>
-    (function () {
-      function standardOffsetMin() {
-        /* getTimezoneOffset on a current date reflects whatever DST is in
-           effect right now, which is wrong for estimating geographic
-           longitude — BST visitors would be placed at 15°E instead of 0°,
-           shifting sunset an hour earlier. The STANDARD (non-DST) offset
-           for any zone is reliably the larger of January's and July's
-           offsets, since DST always advances the clock (= more negative
-           offset). This holds in both hemispheres. */
-        var y   = new Date().getFullYear();
-        var jan = new Date(y, 0, 1).getTimezoneOffset();
-        var jul = new Date(y, 6, 1).getTimezoneOffset();
-        return Math.max(jan, jul);
-      }
-
-      function estimateLatLng() {
-        /* Longitude from the STANDARD timezone offset: each hour west of
-           UTC ≈ 15° west. Using getTimezoneOffset() on a current Date
-           would fold DST into the result and place BST visitors at the
-           wrong longitude — see standardOffsetMin above. */
-        var lng = -standardOffsetMin() / 4;
-        var lat = 40;
-        try {
-          var tz = Intl.DateTimeFormat().resolvedOptions().timeZone || '';
-          if      (/^Europe\//.test(tz))    lat = 50;
-          else if (/^Asia\//.test(tz))      lat = 30;
-          else if (/^Africa\//.test(tz))    lat = 5;
-          else if (/^Australia\//.test(tz)) lat = -30;
-          else if (/^Pacific\//.test(tz))   lat = -15;
-          else if (/^Antarctica\//.test(tz)) lat = -75;
-          /* Southern-hemisphere Americas — without this they'd inherit the
-             40°N default and have sunrise/sunset offset by a season. */
-          else if (/^America\/(Argent|Sao_Paulo|Santiago|Buenos|Asunc|Caracas|La_Paz|Lima|Bogota|Guayaquil|Quito|Cayenne|Paramaribo|Montevideo|Punta_Arenas|Fortaleza|Recife|Manaus|Rio_Branco|Belem|Bahia)/.test(tz)) lat = -20;
-        } catch (e) {}
-        return { lat: lat, lng: lng };
-      }
-
-      function computeSun(date, lat, lng) {
-        /* Standard solar-calculator formulas. -0.83° altitude is the civil
-           sunrise/sunset definition (atmospheric refraction + sun's disc).
-           Returns sunrise/sunset as Unix-ms numbers; polar regions return
-           a flag instead of times. */
-        var rad = Math.PI / 180;
-        var jd  = date.getTime() / 86400000 + 2440587.5;
-        /* Math.round, not floor: Julian Dates roll over at noon UTC, so
-           before noon UTC `jd - 2451545.0` has a fractional part that
-           floor discards — picking yesterday's n. That gave London at
-           09:00 BST (08:00 UTC) the previous day's sunset and stuck the
-           theme in night through the entire morning. Rounding to the
-           nearest integer gives the correct day-number for whichever
-           UTC day contains the current moment. */
-        var n   = Math.round(jd - 2451545.0 + 0.0008);
-        var J   = n - lng / 360;
-        var M   = (357.5291 + 0.98560028 * J) % 360;
-        var C   = 1.9148 * Math.sin(M * rad)
-                + 0.0200 * Math.sin(2 * M * rad)
-                + 0.0003 * Math.sin(3 * M * rad);
-        var lam = (M + C + 180 + 102.9372) % 360;
-        var Jt  = 2451545.0 + J
-                + 0.0053 * Math.sin(M * rad)
-                - 0.0069 * Math.sin(2 * lam * rad);
-        var del = Math.asin(Math.sin(lam * rad) * Math.sin(23.44 * rad));
-        /* -6° = civil twilight. The traditional sunrise/sunset altitude
-           of -0.83° (sun's disc tangent to horizon, accounting for
-           atmospheric refraction) is technically correct but visually
-           wrong for this site: at -0.83° the algorithm flips to night
-           the moment the sun's disc disappears, but there's still
-           plenty of natural light — sky is bright, "the sun is out"
-           from a user's perspective. -6° is the civil-twilight threshold,
-           the point at which the sky is dim enough that artificial
-           light becomes necessary. Extends the "day" window by roughly
-           30 minutes on each side of geometric sunrise/sunset, which
-           matches the visual feel of the daylight period. */
-        var co  = (Math.sin(-6 * rad) - Math.sin(lat * rad) * Math.sin(del))
-                / (Math.cos(lat * rad) * Math.cos(del));
-        if (co < -1) return { polar: 'day' };
-        if (co >  1) return { polar: 'night' };
-        var w = Math.acos(co) / rad;
-        return {
-          sunrise: (Jt - w / 360 - 2440587.5) * 86400000,
-          sunset:  (Jt + w / 360 - 2440587.5) * 86400000
-        };
-      }
-
-      function isNight(sun) {
-        if (sun.polar === 'day')   return false;
-        if (sun.polar === 'night') return true;
-        var now = Date.now();
-        return now < sun.sunrise || now >= sun.sunset;
-      }
-
-      var coords = estimateLatLng();
-      var meta   = null;
-
-      function apply() {
-        var sun   = computeSun(new Date(), coords.lat, coords.lng);
-        var night = isNight(sun);
-        document.documentElement.classList.toggle('night', night);
-        /* Update theme-color so iOS/Android status-bar matches the page.
-           Meta lookup is deferred until the tag has been parsed. */
-        if (!meta) meta = document.querySelector('meta[name="theme-color"]');
-        if (meta) meta.setAttribute('content', night ? '#000000' : '#ffffff');
-      }
-
-      apply();
-
-      /* Enable CSS transitions only after first paint so the initial
-         render lands in the correct palette without a fade-from-wrong. */
-      if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', function () {
-          document.documentElement.classList.add('theme-ready');
-        }, { once: true });
-      } else {
-        document.documentElement.classList.add('theme-ready');
-      }
-
-      /* Re-evaluate every minute so the transition fires live when the
-         user is on the page at sunset/sunrise. Recomputing each tick also
-         handles midnight rollover for long sessions without extra logic.
-         Skip the work while the tab is backgrounded (browsers throttle
-         setInterval there anyway, but this keeps the contract explicit)
-         and run apply() immediately when the tab returns so the theme
-         catches up after a long background. */
-      setInterval(function () {
-        if (document.visibilityState === 'visible') apply();
-      }, 60000);
-      document.addEventListener('visibilitychange', function () {
-        if (document.visibilityState === 'visible') apply();
-      });
-    })();
-  </script>
+  <!-- Always black, white type. There is no day or night theme, and
+       nothing on the site depends on where or when the visitor is. -->
 
   <!-- ═══════════════════════════════════════════════
        SEO — scoped to this subdomain only.
   ═══════════════════════════════════════════════ -->
-  <title>Federico Ferrari – Random Diptychs</title>
-  <meta name="description" content="Random Diptychs — an interactive pairing project by London-based fashion and editorial photographer Federico Ferrari. A fresh diptych on every click, drawn from work for Prada, AnOther Magazine, Grazia, Il Sole 24 Ore and Max Mara.">
-  <meta name="keywords" content="Random Diptychs, Federico Ferrari, photography pairings, fashion photography, editorial photography, interactive portfolio, diptych, photographer London">
-  <meta name="author" content="Federico Ferrari">
+  <meta name="msvalidate.01" content="D254DCCAF45B78E26F1ED34207202DCA" />
+  <title>Federico R. T. Ferrari – Random Diptychs</title>
+  <meta name="description" content="Random Diptychs — an interactive pairing project by London-based fashion and editorial photographer Federico R. T. Ferrari. A fresh diptych on every click, drawn from work for Prada, AnOther Magazine, Grazia, Il Sole 24 Ore and Max Mara.">
+  <meta name="keywords" content="Random Diptychs, Federico R. T. Ferrari, Federico Ferrari, photography pairings, fashion photography, editorial photography, interactive portfolio, diptych, photographer London">
+  <meta name="author" content="Federico R. T. Ferrari">
   <meta name="robots" content="index, follow">
   <link rel="canonical" href="https://random.thisisfed.xyz/">
 
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://random.thisisfed.xyz/">
-  <meta property="og:title" content="Federico Ferrari – Random Diptychs">
-  <meta property="og:description" content="An interactive pairing project from fashion and editorial photographer Federico Ferrari. A fresh diptych on every click.">
+  <meta property="og:title" content="Federico R. T. Ferrari – Random Diptychs">
+  <meta property="og:description" content="An interactive pairing project from fashion and editorial photographer Federico R. T. Ferrari. A fresh diptych on every click.">
   <meta property="og:image" content="https://random.thisisfed.xyz/federicoferrari-rd.jpg">
   <meta property="og:image:width" content="1200">
   <meta property="og:image:height" content="630">
   <meta property="og:image:alt" content="A diptych: an empty circular sign frame against pale blue sky, and a builder's bag stenciled with the numbers 1 through 5.">
   <meta property="og:locale" content="en_GB">
-  <meta property="og:site_name" content="Federico Ferrari — Random Diptychs">
+  <meta property="og:site_name" content="Federico R. T. Ferrari — Random Diptychs">
 
   <meta name="twitter:card" content="summary_large_image">
-  <meta name="twitter:title" content="Federico Ferrari – Random Diptychs">
-  <meta name="twitter:description" content="An interactive pairing project from fashion and editorial photographer Federico Ferrari. A fresh diptych on every click.">
+  <meta name="twitter:title" content="Federico R. T. Ferrari – Random Diptychs">
+  <meta name="twitter:description" content="An interactive pairing project from fashion and editorial photographer Federico R. T. Ferrari. A fresh diptych on every click.">
   <meta name="twitter:image" content="https://random.thisisfed.xyz/federicoferrari-rd.jpg">
 
   <script type="application/ld+json">
   {
     "@context": "https://schema.org",
     "@type": "WebSite",
-    "name": "Federico Ferrari — Random Diptychs",
+    "name": "Federico R. T. Ferrari — Random Diptychs",
     "url": "https://random.thisisfed.xyz/",
-    "description": "An interactive pairing project from fashion and editorial photographer Federico Ferrari. A fresh diptych on every click.",
+    "description": "An interactive pairing project from fashion and editorial photographer Federico R. T. Ferrari. A fresh diptych on every click.",
     "inLanguage": "en-GB",
     "author": {
       "@type": "Person",
-      "name": "Federico Ferrari",
+      "name": "Federico R. T. Ferrari",
       "jobTitle": "Photographer",
-      "email": "ciao@thisisfed.xyz",
-      "telephone": "+44 (0) 7547 02 63 00",
-      "image": "https://random.thisisfed.xyz/federicoferrari-rd.jpg"
+      "description": "London-based fashion and editorial photographer with work for Prada, AnOther Magazine, Grazia, Il Sole 24 Ore and Max Mara.",
+      "url": "https://thisisfed.xyz/",
+      "image": "https://random.thisisfed.xyz/federicoferrari-rd.jpg",
+      "sameAs": [
+        "https://www.anothermag.com/user/FedFerrari",
+        "https://models.com/people/federico-ferrari",
+        "https://www.awwwards.com/sites/federico-ferrari"
+      ]
     }
   }
   </script>
@@ -211,10 +86,10 @@
 
        Sets `html.has-sig-cache` BEFORE first paint when the
        signature cache (written by previous visits via app.js's
-       pagehide handler) holds at least one entry. The CSS then
-       hides the splash's "Loading…" line via display:none, so
-       it never appears even for a frame on warm reloads where
-       analysis will be skipped.
+       pagehide handler) holds at least one entry. It no longer
+       hides the splash's counter line: that now counts from 0 to
+       the number of pairs on every visit. The class is still what the preload
+       block below reads to choose its route.
 
        Why inline + synchronous: by the time app.js (deferred)
        runs, the splash has already painted with whatever the
@@ -230,27 +105,37 @@
        honest behaviour when we can't determine whether the
        reload will be fast.
   ═══════════════════════════════════════════════ -->
-  <!-- Single source of truth for the signature-cache schema version.
-       Both the inline detector below and app.js's SIG_CACHE_VERSION
-       constant read from this global, so bumping the algorithm only
-       requires changing the number in one place. -->
-  <script>window.SIG_CACHE_VERSION = 1;</script>
-
   <script>
     (function () {
       try {
+        /* Preferred path: a tiny sidecar key written alongside ff_signatures
+           by writeSignatureCache(). Parsing the full signature blob here —
+           ~150 entries with palette and Sobel fields — is tens of
+           milliseconds of synchronous main-thread work on the critical path
+           before first paint, to answer a yes/no question. */
+        var meta = localStorage.getItem('ff_sig_meta');
+        if (meta) {
+          var m = JSON.parse(meta);
+          if (m && m.v === 4 && m.n > 0) {
+            document.documentElement.classList.add('has-sig-cache');
+          }
+          return;
+        }
+        /* Fallback for anyone whose last visit predates ff_sig_meta. Costs
+           the old full parse exactly once; their next pagehide writes the
+           meta key and this branch never runs again. */
         var raw = localStorage.getItem('ff_signatures');
         if (!raw) return;
         var parsed = JSON.parse(raw);
-        if (!parsed || parsed.v !== window.SIG_CACHE_VERSION) return;
+        /* Keep this version constant in sync with SIG_CACHE_VERSION
+           in app.js. If app.js bumps the version (analyzeImage
+           algorithm change, or signature schema change like adding
+           the aspect field in v2, or the Sobel structural fields in
+           v3), the stored signatures are stale and the loading line
+           SHOULD appear — fresh analysis is about to run for every
+           image. */
+        if (!parsed || parsed.v !== 4) return;
         if (!parsed.sigs || typeof parsed.sigs !== 'object') return;
-        /* Any cached entries at all → this isn't a first visit;
-           the load loop will skip most/all analyseImage calls; the
-           splash will dismiss in essentially one frame. No loading
-           line needed. If the user has added new images since the
-           cache was written, those still get analysed — but in the
-           300-500ms range, not the 5-second range — and showing
-           "Loading…" for that brief window would just be noise. */
         if (Object.keys(parsed.sigs).length > 0) {
           document.documentElement.classList.add('has-sig-cache');
         }
@@ -258,26 +143,226 @@
     })();
   </script>
 
-  <link rel="stylesheet" href="styles.css">
-  <script src="app.js" defer></script>
+
+  <!-- ═══════════════════════════════════════════════
+       OPENING-PAIR POOL
+
+       Written by build-pool.mjs: the top-scoring pairs from the
+       catalogue, in score order, plus the aspect ratio of every
+       image that appears in one and the favourites list. Same
+       pairs, same order, same scoring function the runtime uses —
+       computed at build time so the accelerator below can choose
+       an opening pair during HTML parse instead of waiting three
+       round trips for app.js to work it out.
+
+       The choice itself is still made here, at random, on every
+       visit. Nothing about which pair a visitor opens on is
+       decided in advance.
+
+       Re-run build-pool.mjs after adding images or captions. Until
+       then this stays null and the cold path falls back to the old
+       behaviour, which still works — just slower to first paint.
+  ═══════════════════════════════════════════════ -->
+  <script>/* BUILD:pool:START */window.__pool={"v":2,"pairs":"7,31 64,140 31,127 6,114 40,103 108,126 112,148 40,98 95,103 103,187 176,187 31,112 40,150 103,138 103,152 103,126 112,129 51,109 127,148 40,131 14,189 126,127 44,54 30,148 6,108 31,72 117,198 121,151 127,153 64,121 29,213 75,103 155,199 112,187 29,36 14,80 66,168 131,152 112,203 40,178 75,127 6,127 30,117 127,152 117,199 86,182 6,150 117,129 136,150 117,151 112,199 14,216 117,147 117,127 109,151 14,67 14,138 148,151 14,114 126,148 45,117 18,67 18,138 18,187 105,112 113,120 8,15 54,148 7,153 129,131 80,117 14,37 42,184 30,40 103,105 103,153 44,127 188,210 80,121 29,37 127,155 23,149 85,129 81,148 40,53 40,127 105,176 150,152 51,121 7,40 72,148 43,117 105,127 114,202 97,155 85,151 13,112 29,64 23,111 67,111 111,138 70,148 147,187 6,131 5,117 109,162 187,209 112,130 23,29 29,143 29,219 69,204 40,112 131,187 12,168 14,103 18,57 80,155 80,199 57,150 69,114 6,151 138,148 155,215 54,109 182,196 105,131 30,182 117,144 71,148 6,51 114,121 69,121 114,148 140,213 183,199 129,148 40,187 122,140 85,127 53,160 127,131 13,202 37,171 8,113 8,143 13,29 29,159 30,216 37,93 37,202 40,147 140,146 125,195 13,14 30,44 42,59 72,217 17,117 95,150 108,155 14,57 14,187 66,148 33,44 5,182 64,196 107,114 51,112 211,214 129,216 114,117 6,199 28,213 147,182 14,168 98,153 60,100 9,125 41,120 116,147 125,211 65,148 120,143 68,117 109,129 117,161 106,117 150,153 108,112 14,219 2,114 54,112 98,155 127,217 35,204 130,204 164,204 204,207 51,75 40,72 14,127 32,125 6,54 114,122 29,148 44,95 5,62 55,100 29,31 121,202 51,117 98,126 177,205 15,120 112,166 131,203 29,44 37,127 37,198 121,164 110,117 67,127 90,111 127,138 127,187 13,114 15,184 21,184 54,67 54,138 77,160 95,187 6,71 148,201 6,106 14,23 14,90 14,143 69,140 44,129 148,150 108,117 37,114 37,145 6,110 14,148 149,182 15,29 29,62 29,113 29,211 36,119 40,44 54,117 6,162 129,136 14,89 14,65 28,143 37,199 15,21 42,77 54,156 150,156 54,75 6,68 26,213 18,65 19,213 37,43 94,213 121,155 109,150 4,148 47,177 6,30 109,121 134,140 148,198 80,148 14,15 14,49 29,80 99,117 6,209 5,22 18,44 44,111 85,121 87,196 134,146 105,148 8,117 144,217 148,149 89,100 155,183 103,183 152,209 12,179 105,150 106,112 14,213 114,196 81,202 30,105 44,131 28,90 29,84 37,91 40,180 55,148 61,127 84,85 84,112 100,117 100,159 107,189 148,180 150,174 10,46 10,58 46,58 15,18 62,144 111,187 6,129 56,183 131,155 14,159 14,52 80,93 80,202 40,100 117,162 145,148 6,126 152,187 41,196 54,97 54,98 55,90 113,196 8,23 8,49 8,67 8,138 8,219 50,76 55,76 73,153 109,204 121,204 167,168 29,87 155,161 14,179 103,155 205,208 54,81 148,199 16,117 117,150 13,148 117,186 42,54 13,121 25,117 108,148 72,85 56,148 6,12 116,214 106,155 7,148 24,150 14,87 40,95 5,216 18,89 44,112 96,132 149,159 161,211 30,39 67,68 68,138 68,187 69,148 8,48 14,44 6,80 101,199 44,150 8,42 17,114 17,145 17,204 37,204 42,206 90,100 160,182 67,147 39,126 6,35 11,40 148,162 92,117 40,177 14,55 28,48 29,114 40,67 40,138 148,218 13,196 15,149 44,198 31,150 8,22 8,41 8,87 30,168 37,196 114,140 2,121 6,121 7,33 15,42 21,42 31,44 33,209 53,77 56,86 67,97 67,98 97,138 98,138 151,215 6,171 167,217 23,120 114,199 105,209 117,140 110,148 3,79 81,151 14,48 14,113 14,188 14,210 13,107 20,28 55,61 151,199 37,107 45,216 57,127 66,202 147,216 10,78 46,78 58,78 80,85 148,191 148,182 7,155 119,160 41,147 148,200 5,211 36,196 44,75 44,108 44,147 35,117 29,202 43,114 64,100 66,179 84,193 100,213 171,202 80,81 42,53 147,148 128,148 38,140 121,150 117,130 117,178 14,28 57,117 40,129 35,69 35,130 35,164 35,207","bests":{"1":"36 148 44 64 116","2":"114 121 202 145 198","3":"79 160 211 148 85","4":"148 97 98 39 67","5":"117 182 62 22 216","6":"114 108 127 150 131","7":"31 153 40 148 33","8":"15 113 143 117 23","9":"125 182 117 155 170","10":"46 58 78 203 148","11":"40 42 181 159 6","12":"168 179 6 148 52","13":"112 202 29 14 114","14":"189 80 216 67 138","15":"8 120 184 29 21","16":"117 182 155 85 6","17":"117 114 145 204 136","18":"67 138 187 57 65","19":"213 37 122 185 64","20":"28 5 29 61 193","21":"184 15 42 54 59","22":"5 8 196 29 149","23":"149 111 29 14 8","24":"150 6 152 187 112","25":"117 125 196 162 36","26":"213 64 27 148 146","27":"122 185 26 213 180","28":"213 143 90 48 20","29":"213 36 37 64 23","30":"148 117 40 182 216","31":"7 127 112 72 29","32":"125 34 86 96 157","33":"44 7 209 15 127","34":"81 155 32 125 157","35":"204 6 117 69 130","36":"29 119 196 125 14","37":"14 29 171 93 202","38":"140 21 59 120 8","39":"30 126 4 33 54","40":"103 98 150 131 178","41":"120 196 8 147 143","42":"184 59 77 54 8","43":"117 37 114 13 80","44":"54 127 30 33 95","45":"117 216 37 57 190","46":"10 58 78 117 148","47":"177 103 119 34 148","48":"8 28 14 100 29","49":"14 8 28 100 120","50":"76 213 148 146 90","51":"109 121 6 112 75","52":"14 12 66 129 121","53":"40 160 77 42 15","54":"44 148 109 112 6","55":"100 148 90 76 14","56":"183 148 86 182 6","57":"18 150 14 127 117","58":"10 46 78 182 148","59":"42 15 21 23 38","60":"100 14 18 188 148","61":"127 55 182 190 136","62":"5 29 144 8 214","63":"29 121 204 64 72","64":"140 121 29 196 100","65":"148 14 18 68 126","66":"168 148 202 179 114","67":"14 18 111 127 54","68":"117 6 67 138 187","69":"204 114 121 140 148","70":"148 23 67 138 111","71":"148 6 199 105 17","72":"31 148 217 40 85","73":"153 148 15 117 149","75":"103 127 51 54 44","76":"50 55 54 176 158","77":"160 42 53 15 21","78":"10 46 58 203 149","79":"3 88 101 125 157","80":"14 117 121 155 199","81":"148 202 54 151 80","82":"21 23 143 42 15","83":"79 3 88 117 62","84":"29 85 112 193 155","85":"129 151 127 121 84","86":"182 56 15 160 211","87":"196 29 14 8 5","88":"79 117 6 62 160","89":"14 100 18 75 55","90":"111 14 28 55 100","91":"37 13 148 102 17","92":"117 213 122 185 37","93":"37 80 114 202 148","94":"213 64 37 122 185","95":"103 150 44 187 40","96":"132 117 6 115 182","97":"155 54 67 138 4","98":"40 153 155 126 54","99":"117 6 216 45 148","100":"60 55 89 117 159","101":"199 125 205 127 106","102":"91 17 37 13 69","103":"40 95 187 138 152","104":"125 135 20 148 103","105":"112 103 176 127 131","106":"117 6 112 155 191","107":"114 189 13 37 67","108":"126 6 155 112 117","109":"51 151 162 54 129","110":"117 6 148 155 125","111":"23 67 138 90 44","112":"148 31 129 187 203","113":"120 8 29 196 14","114":"6 14 202 69 121","115":"182 86 96 125 157","116":"147 214 153 14 30","117":"198 30 199 129 151","118":"117 148 37 80 155","119":"36 160 182 13 4","120":"113 41 143 15 23","121":"151 64 80 51 114","122":"140 114 117 6 19","123":"114 145 198 204 75","124":"23 67 138 70 111","125":"195 9 211 32 205","126":"108 103 127 148 98","127":"31 148 126 153 75","128":"148 218 29 175 186","129":"112 117 131 85 148","130":"112 204 117 35 69","131":"40 152 129 6 187","132":"96 208 125 157 117","133":"200 204 2 6 123","134":"140 146 64 122 185","135":"150 104 157 101 155","136":"150 129 44 17 37","137":"179 33 67 138 114","138":"103 14 18 111 148","139":"190 170 20 60 84","140":"64 213 122 146 69","141":"87 159 22 219 142","142":"159 6 87 205 117","143":"29 8 120 14 28","144":"117 217 62 143 182","145":"37 148 17 114 69","146":"140 134 204 64 122","147":"117 187 40 182 116","148":"112 127 30 151 126","149":"23 182 148 159 15","150":"40 6 136 152 57","151":"121 117 109 148 85","152":"103 131 127 150 209","153":"127 7 103 98 150","154":"22 42 11 87 159","155":"199 127 97 80 215","156":"54 150 23 67 138","157":"117 182 125 6 132","158":"76 100 148 60 180","159":"29 100 14 149 142","160":"53 77 182 119 183","161":"117 155 211 62 86","162":"109 6 117 148 121","163":"120 42 21 143 15","164":"204 121 35 69 130","165":"9 169 196 86 32","166":"112 117 40 144 155","167":"168 217 179 129 37","168":"66 12 14 167 30","169":"182 165 125 157 62","170":"193 5 100 66 9","171":"37 6 202 80 114","172":"213 129 122 185 37","173":"3 88 161 77 211","174":"150 50 55 126 28","175":"37 122 185 29 148","176":"187 105 67 138 42","177":"205 47 40 150 87","178":"40 117 6 148 155","179":"12 14 66 167 137","180":"40 148 72 162 19","181":"148 42 41 11 21","182":"86 196 30 5 147","183":"199 155 103 56 160","184":"42 15 21 23 148","185":"19 134 140 175 186","186":"117 148 37 122 185","187":"103 176 112 18 147","188":"210 14 117 55 100","189":"14 107 29 111 8","190":"61 139 45 147 5","191":"148 40 106 155 216","192":"29 37 122 185 175","193":"84 168 170 213 20","195":"125 34 86 96 157","196":"182 64 87 114 41","197":"187 6 22 87 182","198":"117 37 148 44 64","199":"155 117 112 80 183","200":"148 17 37 133 44","201":"148 23 21 42 209","202":"114 13 37 121 81","203":"112 131 44 37 91","204":"69 35 130 164 207","205":"177 208 125 112 101","206":"42 21 143 23 15","207":"204 35 69 130 164","208":"205 132 115 150 182","209":"187 6 152 33 105","210":"188 14 120 100 140","211":"214 125 29 161 5","212":"148 153 214 73 10","213":"29 140 28 26 19","214":"211 116 62 190 182","215":"155 151 117 152 126","216":"14 30 129 5 45","217":"72 127 144 167 29","218":"148 141 129 162 36","219":"29 14 8 120 59","220":"66 12 79 160 211"},"aspects":{"1":0.75,"2":0.75,"3":0.75,"4":0.75,"5":0.75,"6":0.75,"7":0.75,"8":0.75,"9":0.75,"10":0.75,"11":0.75,"12":0.75,"13":0.75,"14":0.75,"15":0.75,"16":0.75,"17":0.75,"18":0.75,"19":0.75,"20":0.75,"21":0.75,"22":0.75,"23":0.75,"24":0.75,"25":0.75,"26":0.75,"27":0.75,"28":0.75,"29":0.75,"30":0.75,"31":0.75,"32":0.75,"33":0.75,"34":0.75,"35":0.75,"36":0.75,"37":0.75,"38":0.75,"39":0.75,"40":0.75,"41":0.75,"42":0.75,"43":0.75,"44":0.75,"45":0.75,"46":0.75,"47":0.75,"48":0.75,"49":0.75,"50":0.75,"51":0.75,"52":0.75,"53":0.75,"54":0.75,"55":0.75,"56":0.75,"57":0.75,"58":0.75,"59":0.75,"60":0.75,"61":0.75,"62":0.75,"63":0.75,"64":0.75,"65":0.75,"66":0.75,"67":0.75,"68":0.75,"69":0.75,"70":0.75,"71":0.75,"72":0.75,"73":0.75,"75":0.75,"76":0.75,"77":0.75,"78":0.75,"79":0.75,"80":0.75,"81":0.75,"82":0.75,"83":0.75,"84":0.75,"85":0.75,"86":0.75,"87":0.75,"88":0.75,"89":0.75,"90":0.75,"91":0.75,"92":0.75,"93":0.75,"94":0.75,"95":0.75,"96":0.75,"97":0.75,"98":0.75,"99":0.75,"100":0.75,"101":0.75,"102":0.75,"103":0.75,"104":0.75,"105":0.75,"106":0.75,"107":0.75,"108":0.75,"109":0.75,"110":0.75,"111":0.75,"112":0.75,"113":0.75,"114":0.75,"115":0.75,"116":0.75,"117":0.75,"118":0.75,"119":0.75,"120":0.75,"121":0.75,"122":0.75,"123":0.75,"124":0.75,"125":0.75,"126":0.75,"127":0.75,"128":0.75,"129":0.75,"130":0.75,"131":0.75,"132":0.75,"133":0.75,"134":0.75,"135":0.75,"136":0.75,"137":0.75,"138":0.749,"139":0.75,"140":0.75,"141":0.75,"142":0.75,"143":0.75,"144":0.75,"145":0.75,"146":0.75,"147":0.75,"148":0.75,"149":0.75,"150":0.75,"151":0.75,"152":0.75,"153":0.75,"154":0.75,"155":0.75,"156":0.75,"157":0.75,"158":0.75,"159":0.75,"160":0.75,"161":0.75,"162":0.75,"163":0.75,"164":0.75,"165":0.75,"166":0.75,"167":0.75,"168":0.75,"169":0.75,"170":0.75,"171":0.75,"172":0.75,"173":0.75,"174":0.75,"175":0.75,"176":0.75,"177":0.75,"178":0.75,"179":0.75,"180":0.75,"181":0.75,"182":0.75,"183":0.75,"184":0.75,"185":0.75,"186":0.75,"187":0.75,"188":0.75,"189":0.75,"190":0.75,"191":0.75,"192":0.75,"193":0.75,"195":0.75,"196":0.75,"197":0.75,"198":0.751,"199":0.75,"200":0.75,"201":0.75,"202":0.75,"203":0.75,"204":0.75,"205":0.75,"206":0.75,"207":0.751,"208":0.75,"209":0.75,"210":0.75,"211":0.75,"212":0.75,"213":0.75,"214":0.75,"215":0.749,"216":0.75,"217":0.751,"218":0.749,"219":0.751,"220":0.751},"fav":[11,14,17,51,58,64,69,75,81,109,112,114,117,122,124],"count":1179,"n":241,"items":"1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 75 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96 97 98 99 100 101 102 103 104 105 106 107 108 109 110 111 112 113 114 115 116 117 118 119 120 121 122 123 124 125 126 127 128 129 130 131 132 133 134 135 136 137 138 139 140 141 142 143 144 145 146 147 148 149 150 151 152 153 154 155 156 157 158 159 160 161 162 163 164 165 166 167 168 169 170 171 172 173 174 175 176 177 178 179 180 181 182 183 184 185 186 187 188 189 190 191 192 193 195 196 197 198 199 200 201 202 203 204 205 206 207 208 209 210 211 212 213 214 215 216 217 218 219 220 v1 v2 v3 v4 v5 v6 v7 v8 v9 v10 v11 v12 v13 v14 v15 v17 v18 v19 v20 v21 v22 v23 v24"};/* BUILD:pool:END */</script>
+
+  <!-- ═══════════════════════════════════════════════
+       FIRST-PAINT ACCELERATOR
+
+       Nothing about the opening diptych can be discovered by the
+       browser's preload scanner: the markup ships with empty srcsets
+       and app.js fills them in only after it has worked out which
+       pair to show. This block starts that work during HTML parse
+       instead, taking a different route depending on what the visitor
+       already has cached.
+
+       COLD (no html.has-sig-cache):
+       app.js will fetch signatures.json — which carries the image
+       list AND every colour signature, so it replaces both the
+       HEAD-probe discovery pass and the first eight analyses. Warming
+       that one request here removes it from the head of the serial
+       chain. If a previous visit found no such file (ff_boot_missing),
+       fall back to warming the eight 256px AVIFs that loadOne() will
+       ask for, since without signatures.json the opening pair is
+       always two of the first eight images.
+
+       WARM (html.has-sig-cache):
+       app.js opens on a specific known pair — the one the previous
+       session had already prepared and stored in ff_next_pair, or the
+       pair named in the URL hash on a shared link. Both are real
+       preloads: imagesrcset/imagesizes mirror what preparePanel will
+       set on the <img>, so the browser picks the identical
+       candidate and the <img> gets a cache hit rather than a second
+       download. If the sizes strings ever drift apart you get two
+       downloads instead of one, so SZ below must match SIZES in
+       app.js and the sizes expression must match preparePanel's.
+
+       Everything here is best-effort and wrapped: a miss costs one
+       404 or one unused preload, never a broken page.
+  ═══════════════════════════════════════════════ -->
+  <script>
+    (function () {
+      var SZ = [600, 1000, 1500];   // keep in sync with SIZES in app.js
+      var IMAGE_VH = 75;            // keep in sync with --image-height above
+      function srcsetFor(n, fmt) {
+        var out = [];
+        for (var i = 0; i < SZ.length; i++) {
+          out.push('images/' + fmt + '/ff' + n + '-' + SZ[i] + '.' + fmt + ' ' + SZ[i] + 'w');
+        }
+        return out.join(', ');
+      }
+      function isSafari() {
+        var ua = navigator.userAgent || '', v = navigator.vendor || '';
+        return v === 'Apple Computer, Inc.' || (/Safari/i.test(ua) && !/Chrome|Chromium|CriOS|FxiOS|Edg|OPR|Android/i.test(ua));
+      }
+      /* The width Safari will show this frame at — the same calculation as
+         safariRung() in app.js, which uses the number stored below so the
+         preload and the <img> are always the same file. */
+      function rungFor(aspect) {
+        var need = Math.min(0.5 * window.innerWidth, window.innerHeight * IMAGE_VH / 100 * aspect) * (window.devicePixelRatio || 1);
+        for (var i = 0; i < SZ.length; i++) if (SZ[i] >= need) return SZ[i];
+        return SZ[SZ.length - 1];
+      }
+      function preloadPair(n, aspect) {
+        var l = document.createElement('link');
+        l.rel = 'preload';
+        l.as = 'image';
+        l.setAttribute('fetchpriority', 'high');
+        /* Safari is unreliable with imagesrcset preloads and with AVIF decode
+           on the critical path. Preload one JPEG there, at the width app.js
+           will ask for, so the opening pair is a cache hit instead of a
+           second download. This used to be a fixed 1000 while the <img> chose
+           from a srcset, and on Retina it chose the 1500. */
+        if (isSafari()) {
+          var w = rungFor(aspect);
+          (window.__preloadRung = window.__preloadRung || {})[n] = w;
+          l.type = 'image/jpeg';
+          l.href = 'images/jpg/ff' + n + '-' + w + '.jpg';
+        } else {
+          l.type = 'image/avif';
+          l.setAttribute('imagesrcset', srcsetFor(n, 'avif'));
+          l.setAttribute('imagesizes', 'min(50vw, ' + (IMAGE_VH * aspect).toFixed(1) + 'vh)');
+        }
+        document.head.appendChild(l);
+      }
+      /* Cold-visit opening pair, drawn here from window.__pool.
+
+         The three routes and their odds mirror what app.js did on a cold boot
+         before the pool existed, so the spread of opening pairs is unchanged:
+
+           50%  a random favourite, paired with one of its five best partners
+           25%  a random image, paired with its single best partner
+           25%  the top-scoring pool, quality-biased toward the front
+
+         The middle route is what lets every image in the catalogue open the
+         site, not only the ~160 with a top-500 partner. A ring of recent
+         openings in localStorage is re-rolled against so consecutive visits
+         don't land on the same pair.
+
+         app.js reads window.__openingPair and opens on it, which is what makes
+         the preload below a cache hit rather than a wasted download. */
+      var OPEN_RING = 'ff_open_ring', RING_MAX = 12, REROLLS = 8;
+      function randOf(a) { return a[Math.floor(Math.random() * a.length)]; }
+      function drawPair(pool, pairs, bestKeys) {
+        var r = Math.random(), n, list;
+        if (r < 0.5 && pool.fav && pool.fav.length) {
+          /* Favourite route: random among that image's best partners. */
+          n = randOf(pool.fav);
+          list = String(pool.bests[n] || '').split(' ').filter(Boolean);
+          if (list.length) return [String(n), randOf(list)];
+        }
+        if (r < 0.75 && bestKeys.length) {
+          /* Wide route: any image at all, paired with its strongest partner. */
+          n = randOf(bestKeys);
+          list = String(pool.bests[n] || '').split(' ').filter(Boolean);
+          if (list.length) return [n, list[0]];
+        }
+        var c = pairs[Math.floor(Math.pow(Math.random(), 1.2) * pairs.length)];
+        return c ? c.split(',') : null;
+      }
+      function chooseOpeningPair(pool) {
+        var pairs = String(pool.pairs || '').split(' ').filter(Boolean),
+            bestKeys = pool.bests ? Object.keys(pool.bests) : [];
+        if (!pairs.length && !bestKeys.length) return null;
+        var ring = [];
+        try { ring = JSON.parse(localStorage.getItem(OPEN_RING) || '[]') || []; } catch (e) {}
+        var chosen = null;
+        for (var i = 0; i <= REROLLS; i++) {
+          var p = drawPair(pool, pairs, bestKeys);
+          if (!p || p[0] === p[1]) continue;
+          var key = p.join(',');
+          if (i === REROLLS || ring.indexOf(key) < 0) { chosen = p; break; }
+        }
+        if (!chosen) return null;
+        try {
+          ring.unshift(chosen.join(','));
+          localStorage.setItem(OPEN_RING, JSON.stringify(ring.slice(0, RING_MAX)));
+        } catch (e) {}
+        return chosen;
+      }
+      try {
+        if (!document.documentElement.classList.contains('has-sig-cache')) {
+          var pool = window.__pool, opening = pool && pool.pairs ? chooseOpeningPair(pool) : null;
+          if (opening) {
+            window.__openingPair = opening;
+            for (var p = 0; p < 2; p++) {
+              var asp = pool.aspects && pool.aspects[opening[p]];
+              if (asp > 0) preloadPair(opening[p], asp);
+            }
+          }
+          if (localStorage.getItem('ff_boot_missing') === '1') {
+            if (!opening) for (var i = 1; i <= 8; i++) {
+              fetch('images/avif/ff' + i + '-256.avif').catch(function () {});
+            }
+          } else {
+            /* Still warmed, but no longer at the head of the chain: the two
+               images above are already downloading in parallel with it. */
+            fetch('captions.json').catch(function(){});
+            /* signatures.json is only read when the pool has no item list;
+               with one, app.js takes signatures from captions.json and this
+               was a wasted download competing with the opening pair. */
+            if (!(window.__pool && window.__pool.items)) fetch('signatures.json').catch(function () {});
+          }
+          return;
+        }
+        var asp = JSON.parse(localStorage.getItem('ff_aspects') || '{}');
+        var pair = null;
+        var h = location.hash.match(/^#(v\d+|\d+),(v\d+|\d+)$/i);
+        if (h && h[1].toLowerCase() !== h[2].toLowerCase()) {
+          pair = [h[1], h[2]];
+        } else {
+          var np = JSON.parse(localStorage.getItem('ff_next_pair') || 'null');
+          if (np && np.length === 2) pair = np;
+        }
+        if (!pair) return;
+        for (var k = 0; k < 2; k++) {
+          var id = String(pair[k]);
+          if (/^v\d+$/i.test(id)) {
+            var pl = document.createElement('link');
+            pl.rel = 'preload';
+            pl.as = 'video';
+            pl.href = 'videos/ff' + id.slice(1) + '.mp4';
+            document.head.appendChild(pl);
+          } else if (asp[id] > 0) {
+            preloadPair(id, asp[id]);
+          }
+        }
+      } catch (e) { /* storage blocked or no navigation entry — skip */ }
+    })();
+  </script>
+
+  <!-- styles.min.css inlined to remove the render-blocking request and shorten
+       the critical-path chain. To regenerate after editing styles.css: re-minify,
+       then replace everything between the two BUILD markers with the new contents. -->
+  <style>/* BUILD:styles.min.css:START */:root{--bg:#111;--fg:#fff;--accent:lime;--image-height:75dvh;--panel-gap:calc(1em / 2.618);--overlay-pad:1.5em;--fade-duration:.8s;--fade-out-duration:.2s;--fade-curve:cubic-bezier(.25, 1, .5, 1)}@media (max-width:1000px){:root{--overlay-pad:1.75em}}@media (prefers-reduced-motion:reduce){:root{--fade-duration:.2s;--fade-out-duration:.1s}}html{scrollbar-width:none;overscroll-behavior-x:contain;height:100%;overflow-y:scroll}html::-webkit-scrollbar{display:none}body{background:var(--bg);height:100%;color:var(--fg);text-transform:uppercase;word-spacing:.333em;margin:0;font:max(18px,1.8vw)/1em system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Noto Sans,Ubuntu,Cantarell,Helvetica Neue,sans-serif;overflow:hidden}h1{font:inherit;margin:0}a{color:var(--accent);text-decoration:none}a:hover{color:var(--fg)}::selection{background:var(--accent);color:var(--bg)}*{-webkit-tap-highlight-color:transparent}:is(.inner:focus,.inner:focus-visible){outline:0}.line{display:block}#diptych{cursor:pointer;-webkit-touch-callout:none;-webkit-user-select:none;user-select:none;touch-action:manipulation;width:100vw;height:100dvh;display:flex}#diptych *{touch-action:manipulation;-webkit-touch-callout:none;-webkit-user-select:none;user-select:none;-webkit-user-drag:none}html.gated #diptych{visibility:hidden}.panel{background:var(--bg);flex:50%;height:100dvh;position:relative;overflow:hidden}.panel .layer{box-sizing:border-box;opacity:0;pointer-events:none;transition:opacity var(--fade-out-duration) var(--fade-curve);align-items:center;display:flex;position:absolute;top:0;bottom:0;left:0;right:0}.panel.left .layer{padding-right:calc(var(--panel-gap) / 2);justify-content:flex-end}.panel.right .layer{padding-left:calc(var(--panel-gap) / 2);justify-content:flex-start}.panel .layer.loaded{opacity:1;transition:opacity var(--fade-duration) var(--fade-curve)}html.has-interlude .panel .layer{transition:none}.panel .layer img,.panel .layer video{width:auto;max-width:50vw;height:auto;max-height:var(--image-height);object-fit:contain;display:block}.panel .layer video{object-fit:cover}.panel .layer:not(.loaded) video{display:none}#splash,.interlude,#first-hint,#share-toast,#rotate-prompt{box-sizing:border-box;text-align:center;height:100dvh;padding:env(safe-area-inset-top) var(--overlay-pad) max(env(safe-area-inset-top), env(safe-area-inset-bottom));background:var(--bg);color:var(--fg);justify-content:center;align-items:center;display:flex;position:fixed;top:0;bottom:0;left:0;right:0}#splash .inner,.interlude .inner,#click-hint{box-sizing:border-box;width:100vw;padding:0 5px}#splash{z-index:300;transition:opacity .3s var(--fade-curve)}#splash.hidden{opacity:0;pointer-events:none}.interlude{z-index:50;cursor:pointer;opacity:0;pointer-events:none;transition:opacity var(--fade-out-duration) var(--fade-curve);padding-left:0;padding-right:0}.interlude.visible{opacity:1;pointer-events:auto;transition:opacity var(--fade-duration) var(--fade-curve)}.interlude a{color:var(--fg)}:is(.interlude a:hover,.interlude a:focus-visible){color:var(--accent)}.interlude a:focus-visible{outline:2px solid var(--accent);outline-offset:4px}#consent{display:none}#first-hint{z-index:60;pointer-events:none;opacity:0;transition:opacity var(--fade-duration) var(--fade-curve)}#first-hint.visible{opacity:1}#first-hint.leaving{opacity:0;transition:opacity var(--fade-out-duration) var(--fade-curve)}#first-hint .line+.line{margin-top:1em}#click-hint{z-index:55;pointer-events:none;text-align:center;opacity:0;transition:opacity var(--fade-duration) var(--fade-curve);position:fixed;bottom:10px;left:0}#click-hint.visible{opacity:1}@media (max-width:360px){#click-hint{font-size:15px}}#share-toast{z-index:200;background:var(--bg);color:var(--fg);opacity:0;pointer-events:none;transition:opacity .25s var(--fade-curve)}#share-toast.visible{opacity:1;transition:none}#rotate-prompt{z-index:400;display:none}@media (hover:none) and (pointer:coarse) and (orientation:landscape) and (max-height:600px){#rotate-prompt{display:flex}}/* BUILD:styles.min.css:END */</style>
+  <script src="app.js?v=191" defer></script>
 </head>
 <body>
 
 <div id="splash">
   <div class="inner">
     <h1>
-      <span class="line">Federico Ferrari</span>
-      <!-- Subtitle is static — JS updates it to the real pair total
-           after discovery (TARGET = min(TOP_PAIRS_POOL, n×(n-1)/2) × 2)
-           but if discovery turns out to match the placeholder, no
-           update is needed. Change the "500" here if you change
-           TOP_PAIRS_POOL so the first paint isn't visibly wrong. -->
-      <span class="line subtitle">1000 Random Diptychs</span>
-      <!-- Loading progress. Starts as plain "Loading…" with no
-           percentage — the rAF loop in start() appends "X%" only once
-           displayPct has climbed above 0, so a warm-cache visit never
-           shows the counter frozen at 0% during discovery. -->
-      <span class="line loading">Loading…</span>
+      <span class="line">Federico R. T. Ferrari<br><span class="subtitle" data-count="1179"><span class="loading">0 / 1179</span> Random Diptychs</span></span>
+
     </h1>
   </div>
 </div>
@@ -285,84 +370,86 @@
 <div id="diptych">
   <div class="panel left">
     <div class="layer">
-      <picture>
-        <source type="image/avif" srcset="" sizes="50vw">
-        <img alt="" sizes="50vw">
-      </picture>
+      <img alt="" width="1000" height="1250" sizes="50vw" decoding="async" fetchpriority="high">
     </div>
     <div class="layer">
-      <picture>
-        <source type="image/avif" srcset="" sizes="50vw">
-        <img alt="" sizes="50vw">
-      </picture>
+      <img alt="" width="1000" height="1250" sizes="50vw" decoding="async">
     </div>
   </div>
   <div class="panel right">
     <div class="layer">
-      <picture>
-        <source type="image/avif" srcset="" sizes="50vw">
-        <img alt="" sizes="50vw">
-      </picture>
+      <img alt="" width="1000" height="1250" sizes="50vw" decoding="async" fetchpriority="high">
     </div>
     <div class="layer">
-      <picture>
-        <source type="image/avif" srcset="" sizes="50vw">
-        <img alt="" sizes="50vw">
-      </picture>
+      <img alt="" width="1000" height="1250" sizes="50vw" decoding="async">
     </div>
   </div>
 </div>
 
+<!-- First-pair hint. Shown ONCE, over the very first diptych: "tap anywhere"
+     on touch, "click anywhere" on pointer (text set by showFirstPairHint in
+     app.js). Lime (the site accent), fades in fast, holds ~1s, fades out and
+     is removed — and dismissed early the moment the visitor advances. Never
+     reappears. pointer-events:none so the tap/click it invites passes through
+     to the diptych. -->
+<div id="first-hint" aria-hidden="true"></div>
+
+<!-- "click click click" — appears with the first pair, at the foot of the
+     screen, above the analytics banner when that is showing. Filled and
+     positioned by showClickHint() in app.js, removed on the first click. -->
+<div id="click-hint" aria-hidden="true"></div>
+
 <div id="contact" class="interlude" aria-hidden="true">
   <div class="inner">
     <a class="line" id="contact-email" rel="nofollow"></a>
-    <a class="line" id="contact-phone" rel="nofollow"></a>
   </div>
 </div>
 
 <div id="share" class="interlude" aria-hidden="true">
   <div class="inner">
-    <!-- Punctuated as a single sentence broken across two lines, not
-         two independent statements. The comma and lowercase "once"
-         signal that line 2 continues line 1's thought — visually two
-         lines for typographic rhythm, grammatically one. -->
-    <span class="line">No back button, once a pair is gone, it's gone</span>
-    <!-- Visual gap separating the "rule of the gallery" lines above
-         from the gesture instruction below. Matches the &nbsp; spacer
-         pattern used on the #welcome card so the two intro-style
-         interludes share typographic rhythm. -->
-    <!-- Plain span, not an anchor — the instruction is informational,
-         not the trigger. Sharing happens via the S key (desktop) or
-         a long-press on the diptych (mobile); both have their own
-         handlers (see KEY/SHARE shortcuts further down). The label is
-         set dynamically at page init based on whether the device is
-         touch-primary: "Long press to share your favourite" on
-         phones/tablets, "Press S to share your favourite" on pointer
-         devices. Clicks on this span fall through to the .interlude
-         background-dismiss path. -->
-    <span class="line" id="share-trigger">Press S to share your favourite</span>
+    <!-- The no-back rule lives here. The opening card now carries the why
+         text for the first pair rather than any instructions, so this
+         interlude — shown every session, by pair 5 at the latest — is the
+         one reliable place the gallery states there is no going back. Two
+         short sentences: the mechanism, then the consequence. -->
+    <span class="line">No back button</span>
+    <!-- Why-panel hint. The "why this pair" panel (see WHY THIS PAIR? in
+         app.js) opens on a swipe up: on the diptych on touch, or with
+         two fingers on a trackpad. There is no key for it. setShareTriggerLabel() in app.js sets this line's
+         text — one wording, "Swipe up…", everywhere — and
+         shows it on both; the #why-hint CSS keeps it hidden until that `show` class is
+         added. This is the one place the otherwise-undiscoverable panel is
+         gently surfaced: a single line on a single-use card, not persistent
+         UI chrome. The text below is a placeholder, overwritten at init. -->
   </div>
 </div>
 
 <div id="welcome" class="interlude" aria-hidden="true">
   <div class="inner">
-    <span class="line">An evolving concept entirely shot on iPhone</span>
-    <span class="line">© 2026, All rights reserved</span>
+    <span class="line">Evolving concept on iPhone</span>
   </div>
 </div>
 
-<div id="privacy" aria-hidden="true">
+<!-- "Why this pair?" panel — opened by swiping up (touch, or two
+     fingers on a trackpad). Inherits the .interlude visual treatment (full-screen card,
+     centred type, black bg, asymmetric 0.8s/0.2s fade) but opts
+     out of the main .interlude click-dismiss flow (which coordinates
+     a next-pair load via interludePreload — wrong here, since the
+     pair behind the panel stays put). The opt-out is handled exactly
+     like #consent's: an `if (el.id === 'why') return` near the top of
+     the .interlude forEach click handler in app.js, plus a local
+     click handler attached in the WHY THIS PAIR? section that just
+     removes .visible. See that section for the full lifecycle and
+     the prose-synthesis logic. Text is set per-press from the current
+     pair's signatures — both spans start empty. -->
+<div id="why" class="interlude" aria-hidden="true">
   <div class="inner">
-    <p class="privacy-text">This site uses Google Analytics with anonymised IP addresses to understand how the diptychs are explored. No personal data, no cross-site tracking, no advertising profiles. Your choice is remembered locally on your device.</p>
-    <p class="privacy-actions">
-      <a id="privacy-accept" role="button">Accept</a> / <a id="privacy-decline" role="button">Decline</a>
-    </p>
+    <span class="line" id="why-line-2"></span>
   </div>
 </div>
 
 <div id="consent" class="interlude" aria-hidden="true">
   <div class="inner">
-    <span class="line">Analytics</span>
     <span class="line"><a id="consent-accept" role="button">Accept</a> / <a id="consent-decline" role="button">Decline</a>, <a id="consent-why" role="button">Why?</a></span>
   </div>
 </div>
@@ -386,6 +473,10 @@
     <span class="line">to portrait</span>
   </div>
 </div>
+
+
+
+
 
 
 <script type="text/javascript" src="/unprotected/back_to_spaceship.js?hash=4975d460e508829e8fb64d3962bc44ad35f3a95a"></script>

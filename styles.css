@@ -1,266 +1,87 @@
-/* Theme tokens. Day = white/black; night = black/white; lime stays
-   lime in both because it reads cleanly on either background and is
-   the site's signature accent. The `night` class flips them; the
-   `theme-ready` class enables transitions only AFTER the first paint
-   so the initial render lands in the correct palette without a fade. */
+/* random.thisisfed.xyz */
+
 :root {
-  --bg: #fff;
-  --fg: #000;
-  --accent: lime;
-
-  /* Two durations and two curves, used asymmetrically to give the
-     transition decisive character without the perception artifacts
-     that come from symmetric or near-symmetric crossfades.
-
-     The fundamental problem: when images appear at different sizes
-     and positions per pair, ANY visible overlap between outgoing and
-     incoming reads as a "ghost" — old image at one location while
-     new one materialises at another. The previous tuning (easeOutCubic
-     over 0.65s for outgoing) left the old image at ~73% opacity at
-     t=100ms; the previous incoming (easeInOutQuart) spent its first
-     ~200ms barely visible, during which the still-mostly-present
-     outgoing was the dominant thing on screen — visible ghost.
-
-     The fix is two-axis asymmetry: outgoing leaves on a much shorter
-     duration (0.25s) so it's gone before the eye can register it as
-     "lingering," and both curves are pure ease-out (easeOutQuart) so
-     neither has a slow-start "hold" phase. The shape is symmetric
-     but the time is not. Mathematically the combined opacity stays
-     above ~0.62 throughout the transition — no dim beat — because
-     the incoming ramps fast enough on its own ease-out to cover the
-     hole the outgoing leaves behind.
-
-     One tradeoff worth knowing: dropping easeInOutQuint from the
-     incoming side loses some of the "three-phase entrance" feel I
-     designed in earlier. The new incoming is smoother and less
-     theatrical, but lands cleanly without ghosting. Anticipation
-     curves and crossfades-with-random-positions are basically
-     incompatible — pick one. Ghost-free was the request. */
-  --fade-duration:     0.8s;
-  --fade-out-duration: 0.2s;
-  --fade-curve:     cubic-bezier(0.25, 1, 0.5, 1);  /* easeOutQuart — incoming */
-  --fade-out-curve: cubic-bezier(0.25, 1, 0.5, 1);  /* easeOutQuart — outgoing */
-}
-html.night {
-  --bg: #000;
+  --bg: #111;
   --fg: #fff;
+  --accent: lime;
+  /* Tallest a photograph can be. IMAGE_VH in app.js and in index.html must match. */
+  --image-height: 75dvh;
+  /* The gap at the seam between the two panels: 1em / phi squared. */
+  --panel-gap: calc(1em / 2.618);
+  --overlay-pad: 1.5em;
+  --fade-duration: 0.8s;
+  --fade-out-duration: 0.2s;
+  --fade-curve: cubic-bezier(0.25, 1, 0.5, 1);
 }
-/* Theme transitions — fade colors when sunrise/sunset flips the
-   palette, applied AFTER first paint so the initial render doesn't
-   animate from the wrong colors.
-
-   Each element that already has its own opacity transition must
-   restate it here, because the `transition` shorthand replaces the
-   full transition list (not just the color parts) and `html.theme-ready X`
-   has higher specificity than `X` alone. Without this, the splash,
-   interludes, and privacy slide would snap in/out instead of fading.
-
-   Asymmetric fade direction (interludes): the appear and disappear
-   directions use different durations. To preserve that under the
-   `html.theme-ready` cascade, we split into TWO rules — one for the
-   base state (.interlude alone, disappear destination) using
-   --fade-out-duration, and one for the visible state (interlude.visible,
-   appear destination) using --fade-duration. The visible variant's
-   specificity (0,3,1) beats the base (0,2,1), so each direction picks
-   up the right duration. Without this split, both directions were
-   inheriting --fade-duration from a single shared rule (the old bug:
-   intended fast disappear became slow). */
-html.theme-ready body,
-html.theme-ready .panel {
-  transition: background-color 1.2s ease, color 1.2s ease;
+@media (max-width: 1000px) {
+  :root { --overlay-pad: 1.75em; }
 }
-html.theme-ready #splash {
-  /* Splash only fades out (never back in), and the JS removes the
-     element at SPLASH_FADE_MS + 50 = 350ms — keep this duration in
-     sync with that constant. */
-  transition: opacity 0.3s var(--fade-curve),
-              background-color 1.2s ease, color 1.2s ease;
-}
-html.theme-ready .interlude {
-  /* Disappear destination — fast (0.2s). */
-  transition: opacity var(--fade-out-duration) var(--fade-out-curve),
-              background-color 1.2s ease, color 1.2s ease;
-}
-html.theme-ready .interlude.visible {
-  /* Appear destination — slow (0.8s). Higher specificity than the
-     base `.interlude` rule above, so it wins for the visible state. */
-  transition: opacity var(--fade-duration) var(--fade-curve),
-              background-color 1.2s ease, color 1.2s ease;
-}
-html.theme-ready #privacy {
-  transition: opacity 0.4s ease,
-              background-color 1.2s ease, color 1.2s ease;
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --fade-duration: 0.2s;
+    --fade-out-duration: 0.1s;
+  }
 }
 
-html, body {
+/* Page and type: one size, uppercase, everywhere. */
+html {
+  height: 100%;
+  overflow-y: scroll;
+  scrollbar-width: none;
+  overscroll-behavior-x: contain;
+}
+html::-webkit-scrollbar { display: none; }
+body {
   margin: 0;
-  padding: 0;
   height: 100%;
   overflow: hidden;
-}
-body {
-  font-family: system-ui, sans-serif;
-  font-size: 1.8vw;
-  line-height: 1em;
   background: var(--bg);
   color: var(--fg);
+  font: max(18px, 1.8vw) / 1em system-ui, sans-serif;
+  text-transform: uppercase;
+  word-spacing: 0.333em;
 }
-h1 { font-size: inherit; font-weight: inherit; margin: 0; color: var(--fg); }
-
-/* Default link scheme: lime accent, fg on hover.
-   Contact-slide links override this (see #contact a below). */
-a { color: var(--accent); text-decoration: none; }
-a:hover { color: var(--fg) !important; }
-
-/* Programmatic focus targets — every overlay's `.inner` is focused
-   by the JS focus-management code (captureFocus / restoreFocus) so
-   screen readers announce the overlay when it opens. They're only
-   reachable programmatically (tabindex="-1"), never by Tab, so the
-   default browser focus ring is just noise. Interactive children
-   inside the .inner blocks keep their own :focus-visible styling
-   untouched (see `.interlude a:focus-visible` below). */
-.inner:focus,
-.inner:focus-visible {
-  outline: none;
-  box-shadow: none;
+h1 {
+  margin: 0;
+  font: inherit;
 }
-
-/* Tap highlight — iOS Safari and Android Chrome paint a translucent
-   blue/grey rectangle over any tapped element by default. On every
-   gate card and on the diptych itself this reads as a flashing blue
-   border around the centred text (or around the photo) on every tap
-   to dismiss / advance. Killing it across all tappable surfaces
-   restores the "nothing but the photograph reacts" feel. */
-#splash, #splash *,
-.interlude, .interlude *,
-#privacy, #privacy *,
-#diptych, #diptych * {
-  -webkit-tap-highlight-color: transparent;
+a {
+  color: var(--accent);
+  text-decoration: none;
 }
-
-/* Text-selection colour — browsers default to a system blue
-   highlight, which on the gate cards reads as a blue rectangle
-   "around" the selected word the moment a user accidentally
-   double-taps or long-presses text. Theming it to the site's own
-   palette keeps the visual language consistent if a selection
-   does happen, and removes the last common source of unexpected
-   blue. The diptych itself disables selection entirely (see the
-   user-select rules further down), so this only ever applies to
-   the overlay text. */
+a:hover { color: var(--fg); }
 ::selection {
   background: var(--accent);
   color: var(--bg);
 }
+* { -webkit-tap-highlight-color: transparent; }
+.inner:focus,
+.inner:focus-visible { outline: 0; }
+.line { display: block; }
 
-#diptych, .interlude, #privacy { cursor: pointer; }
 
-/* Initial gate. Hides the diptych from first paint until the last
-   gate card (welcome, or analytics on first-time visits) starts
-   fading out. Without this, during the cross-fade between gate
-   cards — splash → welcome, welcome → analytics — both cards sit
-   at partial opacity simultaneously; each has its own opaque
-   background but two stacked 50%-opaque layers only block 75% of
-   what's behind, leaving the first diptych pair faintly visible
-   through the transition. The class is added in HTML so it's
-   effective from the very first paint, and removed once by
-   liftGate() at the moment the final dismiss begins, so the
-   diptych is smoothly revealed underneath as the last card fades.
-   visibility:hidden, not display:none — keeps the layer fade-in
-   transitions running in the background so the layers are at
-   opacity 1 when the gate lifts, no popping. */
-html.gated #diptych { visibility: hidden; }
-
-/* Welcome card inherits the global --fade-duration (0.8s) and
-   --fade-curve (easeOutQuart) — same fade as every other interlude
-   and as image transitions. No CSS override needed; the .interlude
-   transition rule covers it. The two lines centre naturally — no
-   min-height padding — so the text sits at the actual vertical
-   middle of the viewport rather than being anchored to the top of
-   a 4em box. The trade-off is a small ~1em vertical shift in the
-   splash→welcome transition, which is brief and far less jarring
-   than text floating high on the screen. */
-
-/* Splash: full-screen white card with the title and the gallery
-   count on top, and a smooth "Loading… X%" counter that fills
-   0→100 over the duration of image preloading. There's no click
-   or keyboard skip — the splash dismisses on its own when loading
-   completes, or when the SPLASH_MAX_WAIT_MS safety cap fires. */
-#splash {
-  position: fixed;
-  inset: 0;
-  z-index: 300;
-  /* Same iPhone centering treatment as .interlude — see the
-     comment block on .interlude for why. Without this, the splash
-     text doesn't sit at the same vertical position on iPhone as
-     the consent card that follows (or the welcome interlude later
-     in the session), creating a visible jump on those transitions. */
-  height: 100dvh;
-  box-sizing: border-box;
-  padding-top: env(safe-area-inset-top);
-  padding-bottom: env(safe-area-inset-bottom);
-  background: var(--bg);
-  color: var(--fg);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  text-align: center;
-  /* Same curve as the image/interlude transitions so the whole
-     site shares one easing language. Duration tracks SPLASH_FADE_MS
-     in the script — change in both places if retiming. Dropped from
-     1.8s to 0.3s because the ceremonial-feeling longer fade is
-     pleasant on first load but reads as latency on return visits
-     where the cache is already warm.
-
-     Note: the html.theme-ready #splash rule at the top of this file
-     restates this transition with the same duration. By the time the
-     splash fades, .theme-ready is always set (DOMContentLoaded fires
-     well before loading completes), so the theme-ready version is
-     the one that actually runs. Both must stay in sync. */
-  transition: opacity 0.3s var(--fade-curve);
-}
-#splash.hidden {
-  opacity: 0;
-  pointer-events: none;
-}
-#splash .line  { display: block; }
-/* Visual gap between the gallery count and the loading line, so
-   "Loading… X%" reads as a separate piece of information rather
-   than another title sub-line. 1em ≈ one full line of breathing
-   room at the splash's font-size. */
-#splash .line.loading { margin-top: 1em; }
-
-/* On warm-cache reloads, the inline detector in <head> sets
-   html.has-sig-cache when the signature cache has entries, telling
-   us app.js's load loop will skip analysis and the splash will
-   dismiss in essentially one frame. Hiding the loading line via
-   display:none (not visibility:hidden) means it's removed from
-   layout entirely, so the title + subtitle become the only block
-   to centre and the existing flex centering on #splash places them
-   cleanly in the middle of the viewport with no further work. */
-html.has-sig-cache #splash .line.loading { display: none; }
-
-/* Diptych: two 50vw panels side by side. Each panel is a flex
-   container that pins its child layer to the panel's CENTERLINE
-   edge — left panel's image hugs its right edge (= the viewport
-   centerline), right panel's image hugs its left edge. Both
-   images vertically centered. Result: the two images touch in
-   the middle of the screen, always.
-
-   This layout used to be done in JS (computing pixel sizes and
-   writing vw/dvh values per pair load) but that fought against
-   window resizes — the percentages were derived from a snapshot
-   of the viewport at load time and didn't recompute when the
-   browser rerendered. Pure CSS means the browser recomputes on
-   every layout pass for free. */
+/* The diptych */
 #diptych {
   display: flex;
   width: 100vw;
-  height: 100vh;
+  height: 100dvh;
+  cursor: pointer;
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  user-select: none;
+  touch-action: manipulation;
 }
+#diptych * {
+  touch-action: manipulation;
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-user-drag: none;
+}
+html.gated #diptych { visibility: hidden; }
 .panel {
   flex: 1 1 50%;
-  width: 50vw;
-  height: 100vh;
+  height: 100dvh;
   position: relative;
   overflow: hidden;
   background: var(--bg);
@@ -268,418 +89,146 @@ html.has-sig-cache #splash .line.loading { display: none; }
 .panel .layer {
   position: absolute;
   inset: 0;
-  /* Layer is a flex container — image hugs the panel's centerline
-     edge horizontally, sits vertically centered. The justify-content
-     differs per side (set below). */
+  box-sizing: border-box;
   display: flex;
   align-items: center;
   opacity: 0;
-  transition: opacity var(--fade-out-duration) var(--fade-out-curve);
   pointer-events: none;
+  transition: opacity var(--fade-out-duration) var(--fade-curve);
 }
-.panel.left  .layer { justify-content: flex-end;   }  /* image's right edge at centerline */
-.panel.right .layer { justify-content: flex-start; }  /* image's left  edge at centerline */
+/* Photographs pushed toward the seam; the gap is split between the two sides. */
+.panel.left .layer {
+  justify-content: flex-end;
+  padding-right: calc(var(--panel-gap) / 2);
+}
+.panel.right .layer {
+  justify-content: flex-start;
+  padding-left: calc(var(--panel-gap) / 2);
+}
 .panel .layer.loaded {
   opacity: 1;
   transition: opacity var(--fade-duration) var(--fade-curve);
 }
-
-/* While an interlude is on screen, the diptych behind it must not
-   crossfade — otherwise the next pair flashes through the still-
-   appearing or still-disappearing interlude. app.js sets
-   html.has-interlude on showInterlude() and clears it on
-   hideInterlude(). With this rule, .loaded class changes that happen
-   under the cover of an interlude snap-swap with no transition, so
-   the user only ever sees one diptych at a time: the old one before
-   the interlude appears, then the new one after the interlude
-   dismisses. The crossfade isn't lost — it's just deferred to the
-   interlude's own fade-out, which IS the visible reveal. */
 html.has-interlude .panel .layer { transition: none; }
-
-/* The image (or video) inside a layer. Constraints only — actual
-   size is whatever the browser computes within these constraints,
-   preserving the image's natural aspect ratio:
-     - max long side: 50dvh (vertical viewport, dynamic so mobile
-       Safari accounts for browser chrome correctly)
-     - never wider than its panel (50vw)
-     - never taller than 50dvh
-   object-fit:contain handles the case where neither constraint is
-   binding (image takes its natural displayed size up to those caps).
-
-   The image keeps its native aspect ratio because we DON'T set both
-   width AND height to fixed values — only max-* and one auto. The
-   browser picks whichever dimension hits its cap first. */
 .panel .layer img,
 .panel .layer video {
-  max-width:  50vw;
-  max-height: 50dvh;
-  /* On a landscape image the height cap (50dvh) bites first and the
-     width follows by aspect; on a portrait image the width cap (50vw)
-     bites first. Setting both as max-* lets the browser pick the
-     right one per image. */
-  width:  auto;
-  height: auto;
-  object-fit: contain;
   display: block;
-}
-/* Reset UA-stylesheet contributions that apply to <video> but not
-   <img>. iOS Safari has historically applied subtle default styling
-   to video elements (background colour, micro border-radius, minute
-   internal padding) that doesn't apply to images. Zeroing these
-   ensures the video's rendering box matches the image's exactly, so
-   object-fit: contain resolves to the same pixel dimensions on both
-   element types and the centerline alignment holds. */
-.panel .layer video {
-  margin: 0;
-  padding: 0;
-  border: 0;
-  outline: 0;
-  border-radius: 0;
-  background: transparent;
-  vertical-align: top;
-}
-/* Previously the left and right panels pinned their images to the
-   centerline via object-position (100% 50% on the left, 0% 50% on the
-   right) so the two photos met edge-to-edge down the middle. That
-   layout was replaced by random per-image placement (see the var()
-   references on .panel .layer img above and randomizeLayerLayout in
-   app.js), so the pinning rules — and the matching .panel.right video
-   1px overshoot that compensated for iOS Safari's video letterbox
-   slack at the centerline — were removed. object-position now defaults
-   to center, which is correct for a freely-positioned image whose
-   bounding box equals the image's intended display size. */
-
-/* The previous landscape phone override (orientation:landscape +
-   max-height:600px) forced top:0 and height:100vh so the diptych
-   filled the screen on a phone held sideways. Random positioning
-   makes that override actively wrong — it would freeze every image
-   at the top, overriding the per-pair JS-set --img-top. The 50vw
-   cap inside randomizeLayerLayout already keeps the box inside the
-   panel on any aspect ratio, so small-landscape phones still get a
-   usable image without the override; the trade-off is that the
-   minimum 30vh size becomes ~30vw on very short viewports, which
-   is the same constraint everywhere else and the right behaviour
-   given the new layout rules. */
-
-/* Interlude slides: full-screen white cards shown roughly every
-   CONTACT_MIN..CONTACT_MAX clicks. Three variants — contact, share,
-   welcome — appear in random order with no-repeat. Welcome is the
-   only one that auto-dismisses (it's informational, not interactive);
-   the other two require a deliberate dismiss. */
-.interlude {
-  position: fixed;
-  inset: 0;
-  /* iPhone vertical centering fix. Two things go wrong on iOS
-     without these:
-
-     1. `inset: 0` should track the visual viewport on modern iOS,
-        but on older iOS and inside in-app browsers (Instagram,
-        Twitter, etc.) the fixed box can drift behind the address
-        bar. 100dvh explicitly tracks the dynamic visual viewport
-        so the element resizes as Safari's chrome shows/hides.
-
-     2. iPhones with notch + home indicator have asymmetric safe
-        areas (top inset > bottom inset). Centering in the full
-        viewport places content closer to the top safe edge than
-        the bottom, reading as visually off-centre. Padding the
-        safe-area insets shifts the flex centre into the visually
-        balanced safe zone. box-sizing: border-box keeps the
-        element's overall size at 100dvh including the padding,
-        so the background still fills edge-to-edge — only the
-        centered content is inset. */
-  height: 100dvh;
-  box-sizing: border-box;
-  padding-top: env(safe-area-inset-top);
-  padding-bottom: env(safe-area-inset-bottom);
-  background: var(--bg);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  text-align: center;
-  z-index: 50;
-  opacity: 0;
-  pointer-events: none;
-  /* DISAPPEAR direction (the base rule is the destination when
-     .visible is removed). Uses --fade-out-duration / --fade-out-curve
-     — same 0.2s easeOutQuart as the image-outgoing direction. Things
-     leaving the screen are fast and decisive across the whole site.
-
-     Note: this transition is ALSO restated in the html.theme-ready
-     .interlude rule near the top of this file — that's deliberate.
-     Without the restatement, the theme-ready rule's higher specificity
-     would override this with --fade-duration, breaking the asymmetric
-     fast-disappear design. */
-  transition: opacity var(--fade-out-duration) var(--fade-out-curve);
-}
-.interlude.visible {
-  opacity: 1;
-  pointer-events: auto;
-  /* APPEAR direction (this rule is the destination when .visible
-     is added). Uses --fade-duration / --fade-curve — same 0.8s
-     easeOutQuart as the image-incoming direction. Things arriving
-     take their time across the whole site.
-
-     This makes the interlude transition a perfect mirror of the
-     image transition: same tokens, same curve, same asymmetric
-     pair. The site now has ONE transition vocabulary — "appear
-     slow, disappear fast" — applied uniformly to every animated
-     element. The diptych crossfade that would otherwise be visible
-     through the slow fade-in is handled by html.has-interlude (see
-     below): while an interlude is on screen, diptych layer
-     transitions are suppressed so the next pair snap-swaps
-     silently behind the cover.
-
-     Restated in html.theme-ready .interlude.visible at the top of
-     this file for the same specificity reason as the base rule. */
-  transition: opacity var(--fade-duration) var(--fade-curve);
-}
-.interlude .line  { display: block; }
-.interlude a       { color: var(--fg); }
-.interlude a:hover { color: var(--accent) !important; }
-/* Keyboard focus — the default browser ring is hard to see in
-   night mode against black, and unreliable across browsers in
-   day mode too. Use :focus-visible so mouse clicks don't trigger
-   it, and reuse the hover color so the visual vocabulary stays
-   consistent with what hover already teaches. */
-.interlude a:focus-visible {
-  color: var(--accent) !important;
-  outline: 2px solid var(--accent);
-  outline-offset: 4px;
-}
-
-/* Privacy slide: appears when the user clicks "Why?" on the consent
-   card. Same visual treatment as the contact slide — full white,
-   click outside the buttons to dismiss back to the consent card.
-   Buttons inside complete the consent flow (Accept / Decline)
-   without re-showing the consent card.
-   Font-size and line-height inherit from body for uniformity. */
-#privacy {
-  position: fixed;
-  inset: 0;
-  /* Same iPhone centering treatment as .interlude / #splash — see
-     the comment block on .interlude for why. Without these,
-     #privacy centers in the full layout viewport and drifts off
-     the visual centre on iPhones with notch + home indicator,
-     making it the only card that doesn't sit where every other
-     card does. */
-  height: 100dvh;
-  box-sizing: border-box;
-  padding-top: env(safe-area-inset-top);
-  padding-bottom: env(safe-area-inset-bottom);
-  background: var(--bg);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  text-align: center;
-  z-index: 250;
-  opacity: 0;
-  pointer-events: none;
-  transition: opacity 0.4s ease;
-}
-#privacy.visible {
-  opacity: 1;
-  pointer-events: auto;
-}
-#privacy .inner {
-  max-width: 600px;
-  padding: 0 30px;
-}
-#privacy .privacy-text {
-  margin: 0 0 1em 0;
-  color: var(--fg);
-}
-#privacy .privacy-actions {
-  margin: 0;
-}
-/* Privacy modal action links — Accept / Decline. Styled to match
-   the consent card's anchors exactly (color: var(--fg), lime on
-   hover) so the two surfaces read as the same UI control. Both
-   sides of the consent flow now use <a role="button"> rather than
-   a mix of anchor and <button>, eliminating browser default
-   differences (padding, font-rendering, focus rings) between the
-   two places the user sees "Accept / Decline". The !important on
-   the hover rule defeats the site-global `a:hover { color: var(--fg)
-   !important }` declaration, same defence the .interlude a:hover
-   rule uses. */
-#privacy .privacy-actions a {
-  color: var(--fg);
-  cursor: pointer;
-}
-@media (hover: hover) {
-  #privacy .privacy-actions a:hover { color: var(--accent) !important; }
-}
-
-/* Bottom banner styling used to live here for the consent prompt;
-   removed when consent was converted to an interlude-style card so
-   it sits in the centre of the screen like every other text page. */
-
-@media (max-width: 1000px) {
-  body { font-size: 18px; }
-}
-
-/* ─────────── DIPTYCH NATIVE GESTURE OVERRIDES ───────────
-   iOS Safari and Android Chrome both hijack long-press on
-   images: iOS shows a "Save Image / Share Photo" callout,
-   Android shows a "Save image" prompt. Both steal the touch
-   sequence before our 550ms timer can fire, and worse, both
-   eat the user-gesture activation that navigator.clipboard
-   .writeText needs to succeed. The result: long-press on
-   mobile silently failing.
-
-   Disabling user-select + touch-callout + user-drag at the
-   diptych root removes those native behaviours so the
-   gesture reaches our touchstart/touchend handlers cleanly. */
-#diptych,
-#diptych * {
-  -webkit-touch-callout: none;
-  -webkit-user-select: none;
-  user-select: none;
-}
-#diptych img,
-#diptych video {
-  -webkit-user-drag: none;
-}
-
-/* ─────────── SHARE TOAST ───────────
-   Brief "Link copied" overlay shown when the user shares the
-   current pair via the S key (desktop) or a long-press
-   (mobile). Full-screen dim plus large centred text — has to
-   be legible against any photo content, which the diptych can
-   swing from white-on-white to night interiors. pointer-events
-   disabled so taps fall through to the diptych underneath; the
-   auto-dismiss is fast enough that a stray tap mid-toast isn't
-   a real risk. */
-#share-toast {
-  position: fixed;
-  inset: 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  background: rgba(0, 0, 0, 0.4);
-  opacity: 0;
-  pointer-events: none;
-  z-index: 200;
-  /* Asymmetric: this rule is the destination when .visible is
-     REMOVED, so its transition controls the fade-out — 100ms ease.
-     The .visible rule below sets transition:0s so adding the class
-     snaps the toast on instantly. Result is a lightning-flash
-     rhythm: instant appearance, brief hold (set in app.js), 100ms
-     decay. Previously a symmetric 120ms ease in both directions
-     felt like a soft pop rather than a strike. */
-  transition: opacity 100ms ease;
-}
-#share-toast.visible {
-  opacity: 1;
-  /* No transition — adding .visible flips opacity instantly.
-     See the comment on the base rule for why asymmetric. */
-  transition: opacity 0s;
-}
-#share-toast-text {
-  /* No font overrides — inherit body's system-ui/sans-serif at
-     the site's natural body size (1.8vw, capped at 18px on
-     narrow viewports). The accent token is already 'lime'
-     (see :root --accent), so a single property covers it. */
-  color: var(--accent);
-}
-
-/* ─────────── ANALYTICS CONSENT BANNER ───────────
-   Non-blocking strip pinned 10px above the bottom safe edge,
-   centred horizontally. Inherits the .interlude visibility state
-   machine (.visible toggles opacity, aria-hidden for screen readers)
-   but resets all of .interlude's full-screen positioning so the
-   banner is small and lets the diptych breathe behind it. No
-   background — text inherits the body palette and reads against
-   whatever the diptych happens to show underneath; the trade-off
-   is occasional reduced legibility against busy photos, in
-   exchange for keeping the site's minimal aesthetic intact at the
-   bottom edge. See the ANALYTICS CONSENT BANNER section in app.js
-   for the JS flow. */
-#consent {
-  /* Reset the .interlude full-screen positioning. inset: 0 expands
-     to top/right/bottom/left = 0 — undo all four explicitly so the
-     box collapses to content size. */
-  inset: auto;
-  top: auto;
-  right: auto;
-  left: 50%;
-  /* Sit 10px above the bottom edge, with safe-area honoured on
-     devices with a home indicator (iPhones). max() picks the larger
-     so the banner never falls behind the home indicator strip. */
-  bottom: max(10px, env(safe-area-inset-bottom));
-  transform: translateX(-50%);
-  /* Override .interlude's flex centering — the banner is small
-     enough that its two text lines don't need layout help. */
-  display: block;
-  height: auto;
   width: auto;
-  max-width: calc(100vw - 20px);
-  /* Zero padding overrides .interlude's safe-area insets, which
-     are meaningful only for full-screen overlays; for a small
-     bottom strip the bottom: max(...) above already handles the
-     safe area. */
-  padding: 0;
-  box-sizing: border-box;
-  background: transparent;
-  color: var(--fg);
-  text-align: center;
+  height: auto;
+  max-width: 50vw;
+  max-height: var(--image-height);
+  object-fit: contain;
 }
-/* Faster fade for the banner than the full-card interludes — small
-   surface area, no ceremony. Match both the visible and base states
-   so appear and disappear feel symmetric. No background-color
-   transition since background is permanently transparent. */
-#consent,
-#consent.visible,
-html.theme-ready #consent,
-html.theme-ready #consent.visible {
-  transition: opacity 0.2s var(--fade-curve), color 1.2s ease;
-}
-/* Font-size and line-height are inherited from body (1.8vw, capped
-   to 18px on narrow viewports; line-height 1em) so the banner
-   reads as part of the site rather than as a separate UI surface.
-   Two .line spans stack via the .interlude .line { display: block }
-   rule above — no override needed here. */
+.panel .layer video { object-fit: cover; }
+.panel .layer:not(.loaded) video { display: none; }
 
-/* ─────────── ROTATE PROMPT ───────────
-   The diptych is designed for portrait viewing on phones — the two
-   panels each get the full visible height, and image sizing scales
-   to the panel width. In landscape on a phone, the panels collapse
-   to short wide strips, the safe-area dvh math gets cramped, and
-   the size variation that works on portrait stops reading. Easier
-   to ask the visitor to rotate than to design a second layout that
-   never quite works as well.
-
-   Visibility is controlled purely by media query — no JS, no class
-   toggling, no event listener for orientation change. Rotating the
-   device flips the CSS evaluation and the prompt
-   appears/disappears automatically.
-
-   Trigger conditions (all must be true):
-   - hover:none + pointer:coarse → touch primary device (no Mac
-     trackpad, no Surface stylus, just a finger)
-   - orientation:landscape → device held horizontally
-   - max-height:600px → small viewport on the short axis, which
-     excludes tablets (iPad mini is ~768px tall in landscape, iPad
-     Pro ~834px) so they can use landscape if they prefer
-
-   z-index above everything else (400 > splash:300 > privacy:250 >
-   share-toast:200 > interludes:50) so the prompt covers the entire
-   experience including any mid-load splash. */
+/* Full-screen cards: splash, interludes, first hint, share toast, rotate prompt.
+   Top and bottom padding match so the centre stays true on a notched phone. */
+#splash,
+.interlude,
+#first-hint,
+#share-toast,
 #rotate-prompt {
   position: fixed;
   inset: 0;
   height: 100dvh;
   box-sizing: border-box;
-  padding-top: env(safe-area-inset-top);
-  padding-bottom: env(safe-area-inset-bottom);
-  background: var(--bg);
-  color: var(--fg);
-  display: none;
+  display: flex;
   align-items: center;
   justify-content: center;
   text-align: center;
-  z-index: 400;
+  padding: env(safe-area-inset-top) var(--overlay-pad) max(env(safe-area-inset-top), env(safe-area-inset-bottom));
+  background: var(--bg);
+  color: var(--fg);
 }
-#rotate-prompt .line { display: block; }
+/* Text strips run the full width with a 5px gutter. */
+#splash .inner,
+.interlude .inner,
+#click-hint {
+  box-sizing: border-box;
+  width: 100vw;
+  padding: 0 5px;
+}
+
+#splash {
+  z-index: 300;
+  transition: opacity 0.3s var(--fade-curve);
+}
+#splash.hidden {
+  opacity: 0;
+  pointer-events: none;
+}
+
+.interlude {
+  z-index: 50;
+  padding-left: 0;
+  padding-right: 0;
+  cursor: pointer;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity var(--fade-out-duration) var(--fade-curve);
+}
+.interlude.visible {
+  opacity: 1;
+  pointer-events: auto;
+  transition: opacity var(--fade-duration) var(--fade-curve);
+}
+.interlude a { color: var(--fg); }
+.interlude a:hover,
+.interlude a:focus-visible { color: var(--accent); }
+.interlude a:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 4px;
+}
+#consent { display: none; }
+
+#first-hint {
+  z-index: 60;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity var(--fade-duration) var(--fade-curve);
+}
+#first-hint.visible { opacity: 1; }
+#first-hint.leaving {
+  opacity: 0;
+  transition: opacity var(--fade-out-duration) var(--fade-curve);
+}
+#first-hint .line + .line { margin-top: 1em; }
+
+#click-hint {
+  position: fixed;
+  left: 0;
+  bottom: 10px;
+  z-index: 55;
+  pointer-events: none;
+  text-align: center;
+  opacity: 0;
+  transition: opacity var(--fade-duration) var(--fade-curve);
+}
+#click-hint.visible { opacity: 1; }
+/* One line on any screen: on a 320px phone the two halves would otherwise
+   wrap, and a hint in two ragged lines reads worse than a slightly smaller
+   one. Only the hint shrinks; everything else keeps the site's one size. */
+@media (max-width: 360px) {
+  #click-hint { font-size: 15px; }
+}
+#share-toast {
+  z-index: 200;
+  background: var(--bg);
+  color: var(--fg);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.25s var(--fade-curve);
+}
+#share-toast.visible {
+  opacity: 1;
+  transition: none;
+}
+
+#rotate-prompt {
+  z-index: 400;
+  display: none;
+}
 @media (hover: none) and (pointer: coarse) and (orientation: landscape) and (max-height: 600px) {
   #rotate-prompt { display: flex; }
 }

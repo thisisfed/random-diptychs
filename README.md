@@ -4,79 +4,53 @@ A personal photography experiment by **Federico Ferrari**. Every click pulls two
 
 Live at **[random.thisisfed.xyz](https://random.thisisfed.xyz/)**.
 
-There's no menu, no grid, no back button. Tap or press anywhere; once a pair is gone, it's gone.
+There's no menu, no grid, no back button. Tap or press anywhere; once a pair is gone, it's gone. Swipe up on a pair to be told why it was chosen.
 
 ---
 
 ## How it works
 
-The site is three files served statically: `index.html`, `styles.css`, `app.js`. No build step, no framework, no dependencies. Photography is the only thing on screen; everything else is engineered to disappear.
+The site is static: `index.html`, `app.js`, `captions.json`, with `styles.css` kept as the readable source for the stylesheet that ships minified inside `index.html`. No build step, no framework, no dependencies. Photography is the only thing on screen; everything else is engineered to disappear.
 
-A few decisions worth knowing about.
+Pairing runs on three layers, in the order they were built.
 
-### Pair scoring
+### 1. Measurement
 
-Pairings aren't random. On first load every image is downsampled to a 128×128 canvas, then summarised by three signals:
+Every image is downsampled to a 256-wide canvas and summarised: a **7-bin lightness histogram**, a **centre-weighted 4-colour palette** carrying both HSL and OKLab coordinates, average saturation, density, mean lightness, edge energy, vertical balance, and the centre of visual weight. OKLab drives colour similarity because Euclidean distance there tracks how the eye reads colour difference; HSL drives hue-family detection (two reds are "the same family" even at different lightnesses). Signatures are computed once and stored in `captions.json`, so returning visitors skip the analysis entirely.
 
-- a **7-bin lightness histogram** (tonal shape)
-- a **filtered 4-colour palette**, weighted toward the centre of the frame (where the subject usually lives), with desaturated and near-extreme tones excluded
-- the image's **average saturation**
+`pairScore(a, b)` rewards palette contrast (the dominant signal, raised to a power so moderate similarity loses ground fast), density contrast gated by palette, lightness contrast, and smaller terms for edge-energy and balance differences. It penalises hue-family repetition, joint desaturation, two busy frames, two empty frames. Pairs under a palette-contrast floor are rejected outright — unless the captions give a strong enough reason (see below), which is how CLOSED ends up beside OPEN 7 DAYS.
 
-Palette entries carry both HSL and OKLab coordinates. HSL drives the merge heuristic during palette construction and the hue-family detection in repetition catching (two reds are "the same family" even at different lightnesses). OKLab — a perceptually uniform colour space — drives the actual similarity scoring, since Euclidean distance in OKLab tracks how the eye reads colour difference. HSL gets this wrong in both directions: a soft pink and a deep red read as "close" because hue agrees, and two greys at different lightnesses read as "far" despite both being grey.
+### 2. Captions
 
-`pairScore(a, b)` rewards pairs with:
+`captions.json` holds a hand-written caption for every frame: subject, one telling detail, light, surface, category, scale, distance, mood, shape, structure, plus flags for sky (and its hour), hands, logos, plants picked or growing. The scorer reads them. It rewards the same subject seen in a different world (gated by how different the context really is), words that answer each other — opposed, shared, or echoed — scale jumps, hands in both frames, matching structure or accent colours; it suppresses the same subject in the same context, and caps pairs whose depth or crowding clash.
 
-- **palette contrast** (different dominant colours) — the dominant signal, raised to a power so moderate similarity loses ground faster than strong contrast
-- **density contrast** (full-vs-empty composition), gated by palette contrast — so editorial "full vs negative space" pairings surface without false positives from two-blue-but-busy/calm pairs
-- **lightness contrast** (one bright, one dim) — an independent reward for the up-and-down editorial dimension, ungated
-- **tonal cohesion** as a faint tiebreaker
+The captions also feed the **why panel** (swipe up on touch, two-finger swipe on a trackpad): one line describing the two frames, one naming the reason they were paired. The reasons are rules over the same data — "Skies hours apart", "Size lies", "One says the opposite", "Nothing pairs better" for the pairs that top each other's rankings — with punctuation stripped and screen order respected.
 
-…minus penalties for:
+### 3. Editorial layer
 
-- **predominant-colour repetition** by hue family (catches "two blues" even at very different lightness)
-- **blank-canvas repetition** — both images dominated by the same low-saturation tone (pale sky + grey wall)
-- **joint desaturation** — pair where neither side carries colour
-- **joint fullness** — both images busy; the eye wants somewhere to rest
-- **joint emptiness** — both images near-empty; minimal-on-minimal feels samey
+Measurement can't see whether a photograph is good, so the last word is manual, near the top of `app.js`:
 
-Of the N×(N−1)/2 possible pairs, the top 150 are kept. Each click draws from that pool with a quality bias (`Math.random() ** 2`), so the very best pairings dominate without ever showing the same one twice in close succession.
+- `EXCLUDE_IMAGES` — frames pulled from circulation. They appear in no pair, no pool, no count; the file and caption stay, so restoring one is deleting a line and rebuilding the pool.
+- Tags, derived from each caption (`deriveTags`) with `IMAGE_TAGS` as a per-frame override. `BAN_TAG_PAIRS` rejects subject collisions that never look intentional (bathroom × food); `BOOST_TAG_PAIRS` nudges families that keep producing strong pairs (lamp × lamp, stairs × stairs, object × street); `TYPE_TYPE_PENALTY` suppresses two found-type frames unless their words actually spark.
+- `PAIR_BAN` / `PAIR_BOOST` — single pairs by id, for known disasters and known gems.
 
-A per-image **guarantee branch** runs ~45% of clicks: instead of drawing from the global top-N, it picks a stale image (one not seen for a while) and pairs it with its highest-scoring partner. This keeps the rotation honest — an image with one popular partner doesn't get starved when the partner is in the recent-block window.
+`window.__score('7','31')` in the console gives any pair's score under the full stack.
 
-**Favorites** override the algorithm's instincts for a small list of hand-picked photos. The scorer sometimes "correctly" deprioritises images that are hard to pair — palette-narrow, very desaturated, very dark — even when those are images the photographer genuinely loves. Adding an image number to `FAVORITE_IMAGES` boosts its staleness weight inside the guarantee branch by a configurable factor (default 4×), so it surfaces meaningfully more often without changing how partners are selected. It's a long-term rotation tilt, not a "show this next" override.
+### Selection
 
-The **first pair** of every session also leads with a favorite: one random favorite image, paired with its highest-scoring non-video partner. This ensures the gallery opens with curated work whatever the algorithm's current state. Falls back to normal selection if no favorites are loadable.
+All ~29,000 combinations are scored; the top `TOP_PAIRS_POOL` (800) plus each image's five best partners form the reachable set — currently the figure the splash counts to. Each click either serves a stale image with its best available partner (`GUARANTEE_RATE`, half the time) or draws from the top pairs with a quality bias. Images seen in the last 40 clicks are held out; favourites are 2.5× likelier; which frame lands left is a coin flip; videos have their own rate, higher in the first clicks.
 
-### Theme
+The strongest 500 photo pairs are also **baked into `index.html`** between `BUILD:pool` markers, along with the reachable count. The inline head script draws the opening pair from them and starts preloading before `app.js` exists, avoiding repeats across visits via a small localStorage ring. Run `__buildPool()` in the console after changing captions or scoring: it downloads a fresh `index.html` with the pool, the splash figures, and the counter kept in step.
 
-`html.night` is set **before first paint** by inline script in the `<head>`. Sunrise and sunset are computed from a longitude derived from the timezone offset (no geolocation prompt, no third-party call) and a latitude estimated from the IANA zone region. The theme re-evaluates every minute so the palette flips live at the threshold; gated behind `document.visibilityState === 'visible'` so a backgrounded tab is free.
+### Theme and loading
 
-The threshold is **civil twilight (−6° sun altitude)** rather than geometric sunrise/sunset (−0.83°) — at −0.83° the algorithm would flip to night while the sky is still bright. Civil twilight matches the visual feel of "the sun is out" by extending the day window by ~30 minutes on each side.
+Always near-black (`#111111`), white type, one font size everywhere. There is no day/night theme and nothing depends on where or when the visitor is.
 
-### Loading
-
-Image discovery is parallel batched `HEAD` probes (no manifest needed). The splash shows a smooth `Loading… X%` counter that animates 0→100 over real load progress — capped at 60%/s so even a warm cache shows a legible climb instead of a 0→100 flicker. Every image's display variant is fetched during the splash, so once the gate lifts, every diptych in the session is already cached and decode is sub-ms.
-
-Videos are **not** preloaded. They're registered with a neutral colour signature so they stay eligible for pair scoring, but their MP4 bytes only fetch when a pair containing them is selected. The first pair is forced to images-only via `pickPair(arr, { allowVideos: false })`, since a 2–4 s video fetch behind the consent card would leave the gate stuck.
-
-For accurate video colour pairing, drop a **poster JPG** next to each video — `ff{n}-poster.jpg` alongside `ff{n}.mp4`. The site analyses the poster with the same colour pipeline as the photos (centre-weighted palette, OKLab, density, etc.), so videos pair on real colour rather than a neutral signature. Generate them with ffmpeg:
-
-```bash
-for f in videos/ff*.mp4; do
-  N="${f%.mp4}"
-  ffmpeg -ss 1 -i "$f" -frames:v 1 -q:v 3 "${N}-poster.jpg"
-done
-```
-
-Pick the timestamp (`-ss 1`) that best represents the video. The poster is loaded by the splash like any image and is opt-in per video: videos without posters fall back to runtime frame extraction, then to the neutral signature on failure. Adding posters is the recommended way to get videos pairing correctly, especially because runtime extraction is unreliable on iOS Safari (offscreen videos often won't load, and `canvas.drawImage` can return black frames before play has been called).
+The splash counts pairs — `0 / 1179` up to the full figure — climbing fast then creeping, and only finishing once the first pair is actually on screen behind it. Signatures come from the cache on return visits; scoring is deferred until after the first swap whenever the opening pair is already known.
 
 ### Shareable pairs
 
-Every diptych has a URL. `history.replaceState` fires inside `loadDiptych` on every advance, so `location.href` is always the canonical address of what's on screen. Desktop: press **S** to copy. Mobile: **long-press** the diptych. The S key uses `navigator.clipboard.writeText` with a `legacyCopy()` fallback for older browsers; the long-press uses `navigator.share` for the native share sheet on iOS/Android.
-
-### Interludes
-
-Every 4–7 clicks an interlude card appears: **contact**, **share**, or **welcome** — each shown **at most once per session**. After all three have appeared the gallery becomes a pure sequence of diptychs. The first interlude is always the share card if still unseen, so the user learns the share gesture before they have any way to discover it.
+Every diptych has a URL (`#42,v12`), kept canonical via `history.replaceState`. Desktop: press **S** to copy. Mobile: long-press for the native share sheet.
 
 ---
 
@@ -84,93 +58,48 @@ Every 4–7 clicks an interlude card appears: **contact**, **share**, or **welco
 
 ```
 .
-├── index.html              # gate cards, diptych container, head-script theme
-├── styles.css              # tokens, transitions, overlay treatment
-├── app.js                  # everything else
-├── images/
-│   ├── jpg/                # ff{N}.jpg (canonical) and ff{N}-{w}.jpg variants
-│   └── avif/               # ff{N}.avif and ff{N}-{w}.avif variants
-└── videos/
-    ├── ff{N}.mp4
-    └── ff{N}-poster.jpg    # representative frame, for colour analysis (optional but recommended)
+├── index.html        # splash, cards, inlined stylesheet, baked opening pool
+├── app.js            # everything else
+├── captions.json     # caption + colour signature for every frame
+├── styles.css        # readable source of the inlined stylesheet
+├── tools/            # add-photo panel + wasm AVIF encoder (loads only when asked)
+├── images/           # not in git — ff{N}.jpg/avif at 600/1000/1500 + full
+└── videos/           # not in git — ff{N}.mp4 + ff{N}-poster.jpg
 ```
 
-Images are discovered by probing `images/jpg/ff{1}.jpg`, `ff{2}.jpg`, … in parallel batches of 20 until a batch returns nothing AND a probe two batches ahead also 404s (handles small gaps in numbering without committing to wasted requests). Videos are discovered the same way in their own namespace — `ff1.mp4` is a different asset than `ff1.jpg`, addressed as `v1` in share URLs (`#5,v12`).
+Images are discovered by probing `images/jpg/ff{N}.jpg` in parallel batches; videos likewise in their own namespace, addressed as `v{N}`. Each image ships at three widths in JPG and AVIF plus a full size capped at 2400px; the browser picks via `srcset`. Posters give videos real colour signatures — without one, a video pairs on a neutral fallback.
 
-Each image needs variants at three widths — 600, 1000, 1500 — in both formats:
+## Adding a photograph
 
-```
-images/jpg/ff42-600.jpg
-images/jpg/ff42-1000.jpg
-images/jpg/ff42-1500.jpg
-images/avif/ff42-600.avif
-…
-```
+On the live site, run `__addPhoto()` in the console. A panel opens over the page: drop a JPG, take the suggested number, paste the caption prompt into Claude with the photo attached, paste the reply back, press **Make the zip**. The zip contains every image size in both formats, `captions.json` with the new entry, and `index.html` with the pool rebuilt to include it — unzip into the site folder and upload. Everything runs in the browser; nothing is uploaded anywhere.
 
-The browser picks the smallest variant ≥ `50vw × devicePixelRatio` via `srcset` + `sizes="50vw"`. A retina laptop reaches for `1000`; a 3× DPR phone gets `600` and looks fine because AVIF compresses gracefully when slightly under target.
-
----
+Tags derive from the caption automatically, so a new photo joins the editorial layer the moment it is captioned. A frame without a caption is scored by colour alone, which is how bad pairs come back.
 
 ## Configuration
 
-All knobs live at the top of `app.js`. The defaults are tuned for ~150 images; adjust to taste.
+All knobs live at the top of `app.js`. The ones that matter most:
 
-| Const | Default | What it does |
+| Constant | Value | Meaning |
 |---|---|---|
-| `TOP_PAIRS_POOL` | `150` | Best-N pairs eligible for selection. Hard floor on quality — pairs ranked worse never appear. For a pool of ~110 items, this is the top ~3% of all possible pairs and yields 300 distinct diptychs. |
-| `RECENT_CLICKS_BLOCK` | `25` | An image can't reappear for this many clicks after being shown. With ~100 images, ~50 are locked at any time. |
-| `CONTACT_MIN` / `CONTACT_MAX` | `4` / `7` | Range for the random interlude cadence. |
-| `GUARANTEE_RATE` | `0.45` | Probability a click draws from the per-image staleness pool rather than the global top-N. ~1 in 2. |
-| `VIDEO_RATE` | `0.35` | Per-click probability of a video pair, once the minimum gap has elapsed. |
-| `VIDEO_MIN_GAP` | `1` | Photo-only clicks required between videos. |
-| `COLOR_SAMPLE_SIZE` | `128` | Side length of the downsampled analysis canvas. |
-| `PALETTE_SIZE` / `HIST_BINS` | `4` / `7` | Colour summary dimensions. |
-| `TONAL_WEIGHT`, `PALETTE_WEIGHT`, `DENSITY_WEIGHT`, `LIGHTNESS_WEIGHT`, `SAT_WEIGHT` | `0.05`, `0.45`, `0.35`, `0.20`, `0.05` | Pair-score reward weights. |
-| `PALETTE_CONTRAST_POWER` | `2.0` | Exponent applied to palette contrast — concentrates reward at the top of the range. At 2.0, a pair with 0.5 contrast keeps only 25% of full reward, 0.3 keeps 9%. Set 1.0 to disable; 1.5 is a gentler intermediate; 3.0 is very aggressive. |
-| `MIN_PALETTE_CONTRAST` | `0.25` | Hard floor — pairs below this palette-contrast threshold are excluded from selection entirely (forced score of −10). Catches white-on-white and similar-palette pairs that the graduated reward only deprioritises. Raise to 0.30+ for stricter contrast; lower to 0.20 if too many subtle pairs are filtered; 0 disables. |
-| `REPETITION_PENALTY` | `1.1` | How hard to punish two-of-the-same-hue pairs. |
-| `JOINT_DESAT_PENALTY` / `JOINT_DESAT_THRESHOLD` | `0.5` / `0.30` | Penalty for pairs where neither side has colour life, and the avgSat threshold below which the penalty engages. |
-| `JOINT_FULL_PENALTY` / `JOINT_FULL_THRESHOLD` | `0.45` / `0.55` | Penalty for pairs where BOTH images are busy, and the density threshold above which "busy" starts. |
-| `JOINT_EMPTY_PENALTY` / `JOINT_EMPTY_THRESHOLD` | `0.30` / `0.35` | Penalty for pairs where BOTH images are near-empty, and the density threshold below which "empty" starts. |
-| `FALLBACK_TRUST_PENALTY` | `0.40` | Penalty applied to any pair where one side lacks a real colour signature (a video without a poster image — see "Loading" above). Keeps fallback-signed videos out of the global top-N pool until a poster is generated; they still rotate via the per-image guarantee branch. Set to 0 to disable. |
-| `SIBLING_GROUPS` | `[['97','98']]` | Near-duplicate images that should block each other's slot in `recent`. |
-| `FAVORITE_IMAGES` / `FAVORITE_BOOST` | 15 image numbers / `4.0` | Image numbers to give extra rotation priority. Their staleness is multiplied by the boost inside the per-image guarantee branch, so they cycle back roughly `BOOST×` more often than non-favorites would on the algorithm's judgement alone. |
-| `PROGRESS_RATE_PER_SEC` | `60` | Max climb rate of the `Loading… X%` counter. |
-| `SPLASH_MAX_WAIT_MS` | `30000` | Safety cap; splash fades even if loading hasn't completed. |
+| `TOP_PAIRS_POOL` | `800` | Ranked pairs eligible for selection, before per-image bests are added. |
+| `GUARANTEE_RATE` | `0.5` | Probability a click serves a stale image with its best partner instead of a top pair. |
+| `QUALITY_BIAS_POWER` | `1.2` | Skew toward the top of the ranking when drawing. |
+| `RECENT_CLICKS_BLOCK` | `40` | Clicks an image is held out after being shown. |
+| `MIN_PALETTE_CONTRAST` | `0.25` | Colour floor; below it a pair needs a caption reason ≥ `WORD_OVERRIDE` to survive. |
+| `FAVORITE_IMAGES` / `FAVORITE_BOOST` | 16 ids / `2.5` | Frames drawn more often. |
+| `EXCLUDE_IMAGES` | 3 ids | Frames pulled from circulation. |
+| `VIDEO_RATE` | `0.35` | Chance a draw reaches for a video pair, after the early-session rate. |
 
----
+Caption-term weights (`TEXT_OPPOSITION_BONUS`, `RHYME_BONUS`, `COLLISION_PENALTY`, …) sit alongside, each with a comment saying why its value is what it is.
 
 ## Browser support
 
-Targets the last two versions of Chrome, Safari, Firefox, and Edge. iOS Safari 15.4+ for `:focus-visible`; older versions get the fallback `:focus` reset (no lime keyboard ring, but no UA blue ring either). The Web Share API is used where available with a `legacyCopy` execCommand fallback. AVIF is the preferred format with JPG as a universal fallback via `<picture>`.
-
-A handful of touchy things that get explicit defences in CSS or JS:
-
-- **iOS tap-highlight blue** — neutralised with `-webkit-tap-highlight-color: transparent` on every tappable surface
-- **iOS phone-number auto-styling** — disabled with `<meta name="format-detection" content="telephone=no, …">`
-- **iOS image long-press save callout** — blocked with `-webkit-touch-callout: none` on the diptych
-- **iOS muted-autoplay** — videos get `muted` + `playsinline` set both as attribute and JS property because iOS resets the property on `src` change
-- **iOS Safari background page suspension** — `img.decode()` is raced against a 5 s timeout so a screen-lock mid-load can't wedge the gallery permanently
-- **iOS Safari `<video>` vs `<img>` alignment** — iOS gives video its own native composite layer, which rounds sub-pixel transforms differently from images. Vertical centering uses `top: 25vh` (resolved at layout, no transform) so both elements land on the same pixel row. iOS Safari also leaves a sub-pixel column of letterbox slack at the leading edge of `<video>` with `object-fit: contain`; the right-panel video is shifted 1px past the centerline so the slack lands inside the panel's `overflow: hidden` clip rather than on the centerline.
-
----
+Safari (macOS and iOS), Chrome, Firefox, current versions. AVIF with JPG fallback per `<picture>`; the Safari preload path pins an explicit srcset rung so the preloaded bytes are the bytes used.
 
 ## Deploying
 
-The site is fully static. Drop the three files plus the `images/` and `videos/` directories onto any host that serves them — Cloudflare Pages, Netlify, GitHub Pages, S3+CloudFront, plain nginx. There's no server-side component. Make sure:
-
-- The host serves `image/avif` with the correct content-type (most do by default in 2025)
-- The host supports `HEAD` requests on static files (almost universal; the only common exception is some misconfigured object storage)
-- HTTP/2 is enabled — discovery fires 20 parallel `HEAD` requests per batch and benefits from multiplexing
-
-Google Analytics is loaded conditionally after consent (`G-J2Q38DS42K` — change in `app.js` if you fork). The consent card complies with GDPR's "explicit, deliberate choice" requirement; the decision is stored in `localStorage` under the key `ff-analytics-consent`.
-
----
+Any static host. Upload the files, keep `images/` and `videos/` alongside; there is nothing to build and no server code.
 
 ## Credits
 
-Photography © Federico Ferrari, 2026. All rights reserved.
-
-Code is the photographer's own; comments throughout the source explain the reasoning behind every non-obvious decision. Contributions and bug reports welcome.
-
-Contact: **ciao@thisisfed.xyz** · [thisisfed.xyz](https://thisisfed.xyz)
+Photography, film, and direction: Federico Ferrari. Engineering built conversationally with Claude (Anthropic).
